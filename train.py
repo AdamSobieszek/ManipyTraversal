@@ -1,7 +1,7 @@
 import argparse
 import torch
 from lib import *
-from models.gan_load import build_biggan, build_proggan, build_stylegan2, build_sngan
+from models.gan_load import build_biggan, build_proggan, build_stylegan2,build_stylegan2mps, build_sngan
 from torch import nn
 
 def main():
@@ -71,11 +71,14 @@ def main():
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
     parser.add_argument('--batch-size', type=int, default=32, help="set batch size")
+    parser.add_argument('--accumulate-grad-steps', type=int, default=10, help="set number of steps to accumulate gradients")
+    parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
     parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
     parser.add_argument('--lambda-reg', type=float, default=1.00, help="regression loss weight")
-    parser.add_argument('--lambda-pde', type=float, default=1.00, help="regression loss weight")
-    parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
+    parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
+    parser.add_argument('--log-freq', default=20, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
+    parser.add_argument('--new-experiment', action='store_true', help='set to True to start a new experiment')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
 
     # === Device ===================================================================================================== #
@@ -90,7 +93,7 @@ def main():
     args = parser.parse_args()
 
     # Create output dir and save current arguments
-    exp_dir = create_exp_dir(args)
+    exp_dir = create_exp_dir(args, new_experiment=args.new_experiment)
 
     # Device selection (CUDA > MPS > CPU)
     cuda_available = torch.cuda.is_available()
@@ -139,7 +142,12 @@ def main():
         G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]])
     # === StyleGAN ===
     elif args.gan_type == 'StyleGAN2':
-        G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
+        if use_mps:
+            G = build_stylegan2mps(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
+                            resolution=args.stylegan2_resolution,
+                            shift_in_w_space=args.shift_in_w_space)
+        else:   
+            G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
                             resolution=args.stylegan2_resolution,
                             shift_in_w_space=args.shift_in_w_space)
     # === Spectrally Normalised GAN (SNGAN) ===

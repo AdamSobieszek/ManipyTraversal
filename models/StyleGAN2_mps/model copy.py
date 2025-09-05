@@ -383,14 +383,14 @@ class Generator(nn.Module):
 
     def mean_latent(self, n_latent):
         latent_in = torch.randn(
-            n_latent, self.style_dim, device=self.input.input.device
+            n_latent, self.w_dim, device=self.input.input.device
         )
-        latent = self.style(latent_in).mean(0, keepdim=True)
+        latent = self.mapping(latent_in).mean(0, keepdim=True)
 
         return latent
 
-    def get_latent(self, input):
-        return self.style(input)
+    def get_latent(self, z, truncation_psi=1):
+        return self.mapping(z, truncation_psi=truncation_psi)
 
     def forward(self, styles, return_latents=False, inject_index=None, truncation=1, truncation_latent=None,
                 input_is_latent=False, noise=None, randomize_noise=False):

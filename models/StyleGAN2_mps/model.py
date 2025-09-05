@@ -544,6 +544,28 @@ class Generator(torch.nn.Module):
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
+    def make_noise(self):
+        device = self.device
+
+        noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
+
+        for i in range(3, self.log_size + 1):
+            for _ in range(2):
+                noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
+
+        return noises
+
+    def mean_latent(self, n_latent, truncation_psi=1):
+        latent_in = torch.randn(
+            n_latent, self.w_dim, device=self.device
+        )
+        latent = self.mapping(latent_in, truncation_psi=truncation_psi).mean(0, keepdim=True)
+
+        return latent
+
+    def get_latent(self, z, truncation_psi=1):
+        return self.mapping(z, None, truncation_psi=truncation_psi)[:,0]
+        
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
         img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)

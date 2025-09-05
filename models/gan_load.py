@@ -7,7 +7,6 @@ from models.ProgGAN.model import Generator as ProgGANGenerator
 from models.SNGAN.sn_gen_resnet import SN_RES_GEN_CONFIGS, make_resnet_generator
 from models.SNGAN.distribution import NormalDistribution
 
-from models.StyleGAN2.model import Generator as StyleGAN2Generator
 
 
 ########################################################################################################################
@@ -140,9 +139,9 @@ class StyleGAN2MPSWrapper(nn.Module):
         self.G = G
         self.shift_in_w_space = shift_in_w_space
         self.dim_z = 512
-        self.dim_w = self.G.style_dim if self.shift_in_w_space else self.dim_z
+        self.dim_w = self.dim_z
 
-    def get_w(self, z):
+    def get_w(self, z, truncation_psi=1):
         """Return batch of w latent codes given a batch of z latent codes.
 
         Args:
@@ -152,7 +151,7 @@ class StyleGAN2MPSWrapper(nn.Module):
             w (torch.Tensor) : W-space latent code of size [batch_size, 512]
 
         """
-        return self.G.get_latent(z)
+        return self.G.get_latent(z, truncation_psi=truncation_psi)
 
     def forward(self, z, shift=None):
         """StyleGAN2 generator forward function.
@@ -169,7 +168,14 @@ class StyleGAN2MPSWrapper(nn.Module):
         if self.shift_in_w_space:
             #if latent_is_w:
                 # Input latent code is in W-space
-            return self.G.synthesis(torch.cat([z if shift is None else z + shift]), None)
+            if not isinstance(z, torch.Tensor):
+                z = torch.cat([z if shift is None else z + shift])
+            if not isinstance(shift, torch.Tensor):
+                shift = torch.cat([shift])
+            z = z if shift is None else z + shift
+            if z.dim() == 2:
+                z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
+            return self.G.synthesis(z, None)
             #else:
                 # Input latent code is in Z-space -- get w code first
                 #w = self.G.get_latent(z)
@@ -181,6 +187,7 @@ class StyleGAN2MPSWrapper(nn.Module):
 
 def build_stylegan2mps(pretrained_gan_weights, resolution, shift_in_w_space=False):
     # Build StyleGAN2 generator model
+    from models.StyleGAN2_mps.model import Generator as StyleGAN2Generator
     G = StyleGAN2Generator(512, 0, 512, resolution, 3)
     # Load pre-trained weights
     G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu'))['g_ema'],  strict=False)
@@ -201,7 +208,7 @@ class StyleGAN2Wrapper(nn.Module):
         self.dim_z = 512
         self.dim_w = self.G.style_dim if self.shift_in_w_space else self.dim_z
 
-    def get_w(self, z):
+    def get_w(self, z, truncation_psi=1):
         """Return batch of w latent codes given a batch of z latent codes.
 
         Args:
@@ -211,7 +218,7 @@ class StyleGAN2Wrapper(nn.Module):
             w (torch.Tensor) : W-space latent code of size [batch_size, 512]
 
         """
-        return self.G.get_latent(z)
+        return self.G.get_latent(z, truncation_psi=truncation_psi)
 
     def forward(self, z, shift=None):
         """StyleGAN2 generator forward function.
@@ -240,6 +247,7 @@ class StyleGAN2Wrapper(nn.Module):
 
 def build_stylegan2(pretrained_gan_weights, resolution, shift_in_w_space=False):
     # Build StyleGAN2 generator model
+    from models.StyleGAN2.model import Generator as StyleGAN2Generator
     G = StyleGAN2Generator(resolution, 512, 8)
     # Load pre-trained weights
     G.load_state_dict(torch.load(pretrained_gan_weights)['g_ema'], strict=False)

@@ -353,7 +353,8 @@ class Generator(nn.Module):
 
         return latent
 
-    def get_latent(self, input):
+    def get_latent(self, input, truncation_psi=1):
+        # TODO: add truncation
         return self.style(input)
 
     def forward(self, styles, return_latents=False, inject_index=None, truncation=1, truncation_latent=None,

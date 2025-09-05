@@ -6,6 +6,7 @@ import argparse
 import numpy as np
 import torch
 import math
+import time
 from scipy.stats import truncnorm
 from PIL import Image, ImageDraw
 
@@ -16,14 +17,18 @@ class TrainingStatTracker(object):
             'accuracy_index': [],
             'classification_loss': [],
             'wave_loss': [],
-            'total_loss': []
+            'total_loss': [],
+            'support_sets_lr': [],
+            'reconstructor_lr': []
         }
 
-    def update(self, accuracy_index, classification_loss, wave_loss, total_loss):
+    def update(self, accuracy_index, classification_loss, wave_loss, total_loss, support_sets_lr, reconstructor_lr):
         self.stat_tracker['accuracy_index'].append(float(accuracy_index))
         self.stat_tracker['classification_loss'].append(float(classification_loss))
         self.stat_tracker['wave_loss'].append(float(wave_loss))
         self.stat_tracker['total_loss'].append(float(total_loss))
+        self.stat_tracker['support_sets_lr'].append(float(support_sets_lr))
+        self.stat_tracker['reconstructor_lr'].append(float(reconstructor_lr))
 
     def get_means(self):
         stat_means = dict()
@@ -53,7 +58,7 @@ def sample_z(batch_size, dim_z, truncation=None):
         return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
 
 
-def create_exp_dir(args):
+def create_exp_dir(args, new_experiment=False):
     """Create output directory for current experiment under experiments/wip/ and save given the arguments (json) and
     the given command (bash script).
 
@@ -86,6 +91,8 @@ def create_exp_dir(args):
 
     # Create output directory (wip)
     wip_dir = osp.join("experiments", "wip", exp_dir)
+    if os.path.exists(wip_dir) and new_experiment:
+        wip_dir = osp.join("experiments", "wip", exp_dir + f"__{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(wip_dir, exist_ok=True)
     # Save args namespace object in json format
     with open(osp.join(wip_dir, 'args.json'), 'w') as args_json_file:
