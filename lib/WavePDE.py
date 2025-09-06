@@ -25,7 +25,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, n_in: int, n_out: int):
+    def __init__(self, n_in: int, n_out: int, final_activation: nn.Module = nn.Tanh()):
         super().__init__()
         self.layer_x = nn.Linear(n_in, n_in)
         self.activation1 = nn.Tanh()
@@ -61,6 +61,7 @@ class WavePDE(nn.Module):
         lambda_pde: float = 1.0,
         lambda_jvp: float = 0.0,
         lambda_ic: float = 0.0,
+        final_activation: nn.Module = nn.Identity(),
     ):
         super().__init__()
         self.num_support_sets = num_support_sets
@@ -68,9 +69,9 @@ class WavePDE(nn.Module):
         self.support_vectors_dim = support_vectors_dim
         self.n_laplace_probes = int(n_laplace_probes)
 
-        self.c = nn.Parameter(torch.ones(num_support_sets, 1))
+        self.c = nn.Parameter(torch.full((num_support_sets, 1), 1/self.num_support_timesteps))
         self.MLP_SET = nn.ModuleList(
-            [MLP(n_in=support_vectors_dim, n_out=1) for _ in range(num_support_sets)]
+            [MLP(n_in=support_vectors_dim, n_out=1, final_activation=final_activation) for _ in range(num_support_sets)]
         )
         self.proj = generator_projection if generator_projection is not None else nn.Identity()
 
@@ -135,18 +136,20 @@ class WavePDE(nn.Module):
         return u_t, u_tt
 
     # ---------- One PDE step ----------
-    def _per_step(self, mlp: nn.Module, z: torch.Tensor, t: torch.Tensor, c_k: torch.Tensor):
+    def _per_step(self, mlp: nn.Module, z: torch.Tensor, t: torch.Tensor, c_k: torch.Tensor, direction: int = +1):
         z_req = z.detach().requires_grad_(True)
         t_req = t.detach().requires_grad_(True)
 
         u = mlp(z_req, t_req)                                 # [B,1]
         u_z = grad(u.sum(), z_req, create_graph=True)[0]      # [B,D]
+        u_z = self.oems_parametrization(u_z)
+
 
         u_t, u_tt = self._u_t_and_u_tt_forward_mode(mlp, z_req, t_req)  # [B,1] each
         lap = self._laplacian_hutchinson(mlp, z_req, t_req, u_z)        # [B,1]
 
         pde_res = u_tt - (c_k ** 2) * lap                     # [B,1]
-        z_next = (z_req + u_z).detach()
+        z_next = (z_req + direction * u_z).detach()
         return u, u_z, pde_res, z_next
 
     # ---------- Projected JVP ----------
@@ -157,16 +160,25 @@ class WavePDE(nn.Module):
         return jvp_val
 
     def oems_parametrization(self, grad):
-        u = grad / (grad.pow(2).sum(dim=-1, keepdim=True).sqrt() + 1e-8)
-        with torch.no_grad():
-            min_norm, max_norm = 1e-2, 1.0
-            norm_correction = u.norm(dim=-1, keepdim=True)
-            norm_correction = norm_correction.clamp_min(min_norm).clamp_max(max_norm)/norm_correction
-        u = u * norm_correction
+        # Normalize grad to unit norm
+        norm = grad.norm(dim=-1, keepdim=True) + 1e-8
+
+        u = grad / norm
+        # Softly encourage the norm to stay in [min_norm, max_norm] via a smooth function
+        min_norm, max_norm = 1e-4, 10
+        # Use a smooth sigmoid-based scaling to softly push norm into [min_norm, max_norm]
+        # The scale is close to 1 in the interval, smoothly shrinks/grows outside
+        scale = 1/norm
+        # scale = (
+        #     torch.sigmoid(10 * (norm - min_norm)) * torch.sigmoid(10 * (max_norm - norm))
+        #     + (norm < min_norm).float() * (norm / min_norm)
+        #     + (norm > max_norm).float() * (max_norm / norm)
+        # )
+        u = u * scale
         return u
     
     # ---------- Public API ----------
-    def forward(self, index: int, z: torch.Tensor, t: torch.Tensor, generator):
+    def forward(self, index: int, z: torch.Tensor, t: torch.Tensor, generator, direction: int = +1):
         mlp_k = self.MLP_SET[index]
         c_k = self.c[index:index+1]  # [1,1]
         B, D = z.shape
@@ -182,20 +194,22 @@ class WavePDE(nn.Module):
         mse_jvp = None
 
         z_curr = z
-        for i in range(half_range):
+        for i in (range(half_range) if direction == +1 else range(half_range, -1, -1)):
             t_i = torch.full((B, 1), float(i), device=device, dtype=dtype, requires_grad=True)
 
-            u_i, u_z_i, pde_res_i, z_next = self._per_step(mlp_k, z_curr, t_i, c_k)
+            u_i, u_z_i, pde_res_i, z_next = self._per_step(mlp_k, z_curr, t_i, c_k, direction)
             loss_pde_acc = loss_pde_acc + (pde_res_i.pow(2).mean())
-            u_z_i = self.oems_parametrization(u_z_i)
             # IC at i=0
             if i == 0 and self.lambda_ic > 0:
-                mse_ic = (u_z_i.pow(2).sum(dim=1)).mean()
+                mse_ic = -(u_z_i.pow(2).sum(dim=1)).mean()
+            
+            # u_z_i = self.oems_parametrization(u_z_i)
+
             
             if i == target_i:
-                latent1 = (z_curr + u_z_i).detach()
+                latent1 = (z_next).detach()
 
-                t_ip1 = torch.full((B, 1), float(i + 1), device=device, dtype=dtype, requires_grad=True)
+                t_ip1 = torch.full((B, 1), float(i + direction), device=device, dtype=dtype, requires_grad=True)
                 z1 = latent1.detach().requires_grad_(True)
                 u_next = mlp_k(z1, t_ip1)
                 u_z1 = grad(u_next.sum(), z1, create_graph=True)[0]
@@ -221,8 +235,8 @@ class WavePDE(nn.Module):
         loss = self.lambda_ic * mse_ic + self.lambda_pde * (loss_pde_acc / max(1, i)) - self.lambda_jvp * mse_jvp
         return energy, latent1, latent2, loss
 
-    @torch.no_grad()
-    def inference(self, index: int, z: torch.Tensor, t: torch.Tensor, generator=None):
+    @torch.enable_grad()
+    def inference(self, index: int, z: torch.Tensor, t: torch.Tensor, generator=None, direction: int = +1):
         mlp_k = self.MLP_SET[index]
         B = z.size(0)
         t = t if t.dim() == 2 else t.view(B, 1)
@@ -230,4 +244,5 @@ class WavePDE(nn.Module):
         t_req = t.detach().requires_grad_(True)
         u = mlp_k(z_req, t_req)
         u_z = grad(u.sum(), z_req, create_graph=False)[0]
-        return u, u_z
+        u_z = self.oems_parametrization(u_z)
+        return u, direction * u_z

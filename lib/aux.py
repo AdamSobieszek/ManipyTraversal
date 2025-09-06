@@ -11,35 +11,6 @@ from scipy.stats import truncnorm
 from PIL import Image, ImageDraw
 
 
-class TrainingStatTracker(object):
-    def __init__(self):
-        self.stat_tracker = {
-            'accuracy_index': [],
-            'classification_loss': [],
-            'wave_loss': [],
-            'total_loss': [],
-            'support_sets_lr': [],
-            'reconstructor_lr': []
-        }
-
-    def update(self, accuracy_index, classification_loss, wave_loss, total_loss, support_sets_lr, reconstructor_lr):
-        self.stat_tracker['accuracy_index'].append(float(accuracy_index))
-        self.stat_tracker['classification_loss'].append(float(classification_loss))
-        self.stat_tracker['wave_loss'].append(float(wave_loss))
-        self.stat_tracker['total_loss'].append(float(total_loss))
-        self.stat_tracker['support_sets_lr'].append(float(support_sets_lr))
-        self.stat_tracker['reconstructor_lr'].append(float(reconstructor_lr))
-
-    def get_means(self):
-        stat_means = dict()
-        for key, value in self.stat_tracker.items():
-            stat_means.update({key: np.mean(value)})
-        return stat_means
-
-    def flush(self):
-        for key in self.stat_tracker.keys():
-            self.stat_tracker[key] = []
-
 
 def sample_z(batch_size, dim_z, truncation=None):
     """Sample a random latent code from multi-variate standard Gaussian distribution with/without truncation.
@@ -74,6 +45,8 @@ def create_exp_dir(args, new_experiment=False):
         args (argparse.Namespace): the namespace object returned by `parse_args()` for the current run
 
     """
+    if new_experiment:
+        print("Creating new experiment\n"+"-"*30+"\n"*2)
     exp_dir = "{}".format(args.gan_type)
     if args.gan_type == 'StyleGAN2':
         exp_dir += '-{}'.format(args.stylegan2_resolution)
@@ -88,11 +61,11 @@ def create_exp_dir(args, new_experiment=False):
         exp_dir += '{}'.format(biggan_classes)
     exp_dir += "-{}".format(args.reconstructor_type)
     exp_dir += "-K{}-D{}".format(args.num_support_sets, args.num_support_timesteps)
+    if new_experiment:
+        exp_dir += f"__{time.strftime('%Y%m%d_%H%M%S')}"
 
     # Create output directory (wip)
     wip_dir = osp.join("experiments", "wip", exp_dir)
-    if os.path.exists(wip_dir) and new_experiment:
-        wip_dir = osp.join("experiments", "wip", exp_dir + f"__{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(wip_dir, exist_ok=True)
     # Save args namespace object in json format
     with open(osp.join(wip_dir, 'args.json'), 'w') as args_json_file:
@@ -104,6 +77,172 @@ def create_exp_dir(args, new_experiment=False):
         command_file.write(' '.join(sys.argv) + '\n')
 
     return exp_dir
+
+# aux.py
+import sys
+import time
+import numpy as np
+
+class TrainingStatTracker(object):
+    """
+    Tracks metrics at two levels:
+      - micro-step accumulation (within a grad-acc window)
+      - optimizer-step aggregates (emitted once per window)
+
+    Also tracks per-MLP analytics (EMA accuracy, EMA grad-norm, selection counts, confusion),
+    optional histories for heatmaps, and learning rates.
+    """
+
+    def __init__(self, ema_decay: float = 0.9, ema_max_history: int = 200):
+        # Window (micro-step) accumulators
+        self._reset_window()
+
+        # LRs (latest seen per optimizer-step)
+        self.last_support_lr = 0.0
+        self.last_recon_lr = 0.0
+
+        # Timing
+        self.iter_times = np.array([])  # seconds per opt step
+
+        # Per-MLP analytics (set after K is known)
+        self.K = None
+        self.ema_decay = float(ema_decay)
+        self.ema_max_history = int(ema_max_history)
+        self.per_k_ema_acc = None         # [K] float
+        self.per_k_ema_grad = None        # [K] float
+        self.per_k_select_counts = None   # [K] long
+        self.confusion = None             # [K, K] long  (row=true, col=pred)
+        self.ema_history = []             # list of np.array([K]) snapshots
+        self.iter_history = []            # matching optimizer-step indices for heatmap
+
+        # JSON-like store of per-step aggregates (string keys)
+        self.stats_by_step = {}  # {step_idx: dict}
+
+    # ---------- window (micro-steps) ----------
+    def _reset_window(self):
+        self.win_count = 0
+        self.win_sum = {
+            'accuracy_index': 0.0,
+            'classification_loss': 0.0,
+            'wave_loss': 0.0,
+            'total_loss': 0.0,
+            'entropy': 0.0,
+            'step1_norm': 0.0,
+            'step2_norm': 0.0,
+        }
+
+    def add_micro(
+        self,
+        *,
+        acc: float,
+        classification_loss: float,
+        wave_loss: float,
+        total_loss: float,
+        entropy: float = 0.0,
+        step1_norm: float = 0.0,
+        step2_norm: float = 0.0,
+    ):
+        """Accumulate values from a micro-step; all inputs are Python floats."""
+        self.win_count += 1
+        self.win_sum['accuracy_index'] += float(acc)
+        self.win_sum['classification_loss'] += float(classification_loss)
+        self.win_sum['wave_loss'] += float(wave_loss)
+        self.win_sum['total_loss'] += float(total_loss)
+        self.win_sum['entropy'] += float(entropy)
+        self.win_sum['step1_norm'] += float(step1_norm)
+        self.win_sum['step2_norm'] += float(step2_norm)
+
+    def close_window(self):
+        """Return window means and reset micro accumulators."""
+        denom = max(1, self.win_count)
+        means = {k: (v / denom) for k, v in self.win_sum.items()}
+        self._reset_window()
+        return means
+
+    # ---------- per-MLP analytics ----------
+    def init_per_k(self, K: int):
+        """Call once when K is known."""
+        self.K = int(K)
+        self.per_k_ema_acc = np.zeros(self.K, dtype=np.float32)
+        self.per_k_ema_grad = np.zeros(self.K, dtype=np.float32)
+        self.per_k_select_counts = np.zeros(self.K, dtype=np.int64)
+        self.confusion = np.zeros((self.K, self.K), dtype=np.int64)
+        self.ema_history.clear()
+        self.iter_history.clear()
+
+    def update_per_k_after_micro(
+        self,
+        *,
+        true_k: int,
+        preds: np.ndarray,         # shape [B] int64 on CPU
+        batch_size: int,
+        grad_norm_selected_mlp: float | None = None,
+    ):
+        """
+        Update EMA accuracy, selection counts, and confusion for the selected k of THIS micro-step.
+        - Only the selected MLP's grad-norm is meaningful to track.
+        """
+        if self.K is None:
+            return
+        true_k = int(true_k)
+        # acc for this micro-batch against the selected k
+        acc = float((preds == true_k).mean())
+        self.per_k_ema_acc[true_k] = self.per_k_ema_acc[true_k] * self.ema_decay + acc * (1.0 - self.ema_decay)
+        self.per_k_select_counts[true_k] += int(batch_size)
+
+        # confusion row update (count predicted classes)
+        binc = np.bincount(preds, minlength=self.K).astype(np.int64)
+        self.confusion[true_k, :] += binc
+
+        # grad norm EMA (only for the MLP that received grads)
+        if grad_norm_selected_mlp is not None:
+            g = float(grad_norm_selected_mlp)
+            self.per_k_ema_grad[true_k] = self.per_k_ema_grad[true_k] * self.ema_decay + g * (1.0 - self.ema_decay)
+
+    def snapshot_per_k_history(self, step_idx: int):
+        """Keep a thin history (capped) for heatmaps."""
+        if self.K is None:
+            return
+        self.ema_history.append(self.per_k_ema_acc.copy())
+        self.iter_history.append(int(step_idx))
+        if len(self.ema_history) > self.ema_max_history:
+            self.ema_history = self.ema_history[-self.ema_max_history:]
+            self.iter_history = self.iter_history[-self.ema_max_history:]
+
+    # ---------- LRs ----------
+    def set_lrs(self, support_lr: float, recon_lr: float):
+        self.last_support_lr = float(support_lr)
+        self.last_recon_lr = float(recon_lr)
+
+    # ---------- per-step finalize ----------
+    def finalize_step(
+        self,
+        *,
+        step_idx: int,
+        window_means: dict,
+        elapsed_from_start: float,
+        mean_step_time: float,
+        eta_seconds: float,
+    ):
+        """
+        Called once per optimizer step to store a compact dictionary of metrics.
+        """
+        rec = dict(window_means)
+        rec.update({
+            'support_sets_lr': self.last_support_lr,
+            'reconstructor_lr': self.last_recon_lr,
+            'mean_step_time_sec': float(mean_step_time),
+            'elapsed_sec': float(elapsed_from_start),
+            'eta_sec': float(eta_seconds),
+        })
+        self.stats_by_step[int(step_idx)] = rec
+
+    # ---------- time helpers ----------
+    def push_step_time(self, dt_seconds: float):
+        self.iter_times = np.append(self.iter_times, float(dt_seconds))
+
+    def mean_step_time(self) -> float:
+        return float(self.iter_times.mean()) if self.iter_times.size > 0 else 0.0
 
 
 def update_progress(msg, total, progress):
@@ -121,28 +260,17 @@ def update_progress(msg, total, progress):
 
 
 def update_stdout(num_lines):
-    """Update stdout by moving cursor up and erasing line for given number of lines.
-
-    Args:
-        num_lines (int): number of lines
-
-    """
+    """Move cursor up and clear lines in terminal-friendly way."""
     cursor_up = '\x1b[1A'
-    erase_line = '\x1b[1A'
+    erase_line = '\x1b[2K'
     for _ in range(num_lines):
-        print(cursor_up + erase_line)
+        sys.stdout.write(cursor_up + erase_line + '\r')
+    sys.stdout.flush()
 
 
 def sec2dhms(t):
-    """Convert time into days, hours, minutes, and seconds string format.
-
-    Args:
-        t (float): time in seconds
-
-    Returns (string):
-        "<days> days, <hours> hours, <minutes> minutes, and <seconds> seconds"
-
-    """
+    """Convert seconds to 'DD days, HH hours, MM minutes, and SS seconds'."""
+    t = int(t)
     day = t // (24 * 3600)
     t = t % (24 * 3600)
     hour = t // 3600
@@ -151,7 +279,6 @@ def sec2dhms(t):
     t %= 60
     seconds = t
     return "%02d days, %02d hours, %02d minutes, and %02d seconds" % (day, hour, minutes, seconds)
-
 
 def get_wh(img_paths):
     """Get width and height of images in given list of paths. Images are expected to have the same resolution.

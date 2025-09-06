@@ -1,7 +1,7 @@
 gan_type="SNGAN_AnimeFaces"
 num_support_sets=10
-num_support_timesteps=4
-warmup_fraction=0.02
+num_support_timesteps=10
+warmup_fraction=0.01
 accumulate_grad_steps=10
 reconstructor_type="LeNet"
 batch_size=32

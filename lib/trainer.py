@@ -18,6 +18,8 @@ from .aux import sample_z, TrainingStatTracker, update_progress, update_stdout, 
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+VIS_IMAGE_N = 10
+
 class CosineScheduleWithWarmup(_LRScheduler):
     """
     A custom learning rate scheduler that implements a linear warmup followed
@@ -105,24 +107,17 @@ class Trainer(object):
             # Define cross entropy loss (with optional label smoothing)
         self.cross_entropy = nn.CrossEntropyLoss(label_smoothing=self.ce_label_smoothing)
 
-        # Array of iteration times
-        self.iter_times = np.array([])
-
         # Statistics tracker (keeps rolling means printed to stdout)
-        self.stat_tracker = TrainingStatTracker()
+        # (Now also owns per-MLP analytics, step timing, LR snapshots, and JSON-ready step records.)
+        self.stat_tracker = TrainingStatTracker(
+            ema_decay=getattr(self.params, "ema_decay", 0.9),
+            ema_max_history=getattr(self.params, "ema_max_history", 200),
+        )
 
         # ========= Enhanced logging state (set later in train() once K is known) =========
-        self.K = None
-        self.ema_decay = getattr(self.params, "ema_decay", 0.9)  # moving average decay for per-MLP accuracy/grad
-        self.per_k_ema_acc = None     # [K] (CPU)
-        self.per_k_ema_grad = None    # [K] (CPU)
-        self.per_k_select_counts = None  # [K] (CPU, long)
-        self.confusion = None         # [K, K] (CPU, long)
-        self.ema_history = []         # list of np.array(K,)
-        self.iter_history = []        # list of iteration indices
-        self.max_history = getattr(self.params, "ema_max_history", 200)  # cap heatmap history length
+        self.K = None  # just for plotting helpers in this class (heatmap/confusion figs)
 
-    # ------------------------ helpers for TB visuals ------------------------
+
 
     def _to_uint8_images(self, x):
         """
@@ -137,28 +132,32 @@ class Trainer(object):
 
     def _log_image_triplet(self, writer, tag_prefix, x0, x1, x2, iteration, n_vis=8):
         """
-        Logs three grids: original, step1, step2 and their absolute differences.
+        Logs two images: 
+        - One grid with original, step1, step2 stacked vertically (each row is a batch grid).
+        - One grid with abs differences (step1-orig, step2-orig) stacked vertically.
         """
         b = min(n_vis, x0.size(0))
         x0n = self._to_uint8_images(x0[:b])
         x1n = self._to_uint8_images(x1[:b])
         x2n = self._to_uint8_images(x2[:b])
 
+        # Make horizontal grids for each
         grid0 = make_grid(x0n, nrow=b)
         grid1 = make_grid(x1n, nrow=b)
         grid2 = make_grid(x2n, nrow=b)
 
+        # Stack vertically: shape [3*C, H, W] if C=channels
+        stacked_grid = torch.cat([grid0, grid1, grid2], dim=1)  # stack along height
+
         # abs diffs vs original
         diff1 = (x1n - x0n).abs()
-        diff2 = (x2n - x0n).abs()
+        diff2 = (x2n - x1n).abs()
         grid_d1 = make_grid(diff1, nrow=b)
         grid_d2 = make_grid(diff2, nrow=b)
+        stacked_diff_grid = torch.cat([grid_d1, grid_d2], dim=1)  # stack along height
 
-        writer.add_image(f"{tag_prefix}/orig", grid0, iteration)
-        writer.add_image(f"{tag_prefix}/step1", grid1, iteration)
-        writer.add_image(f"{tag_prefix}/step2", grid2, iteration)
-        writer.add_image(f"{tag_prefix}/diff_step1_abs", grid_d1, iteration)
-        writer.add_image(f"{tag_prefix}/diff_step2_abs", grid_d2, iteration)
+        writer.add_image(f"{tag_prefix}/triplet", stacked_grid, iteration)
+        writer.add_image(f"{tag_prefix}/diff_triplet_abs", stacked_diff_grid, iteration)
 
     def _plot_heatmap(self, mat_t_by_k, title, xlabel, ylabel):
         """
@@ -179,11 +178,11 @@ class Trainer(object):
         fig.tight_layout()
         return fig
 
-    def _plot_confusion(self, conf_mat):
+    def _plot_confusion(self, conf_mat_nd):
         """
-        conf_mat: torch.Tensor [K, K] on CPU, rows = true k, cols = predicted k
+        conf_mat_nd: numpy.ndarray [K, K], rows = true k, cols = predicted k
         """
-        cm = conf_mat.float()
+        cm = torch.tensor(conf_mat_nd, dtype=torch.float32)
         row_sums = cm.sum(dim=1, keepdim=True).clamp(min=1.0)
         cm_norm = (cm / row_sums).cpu().numpy()
         fig, ax = plt.subplots(figsize=(6, 5))
@@ -207,233 +206,379 @@ class Trainer(object):
             support_sets.load_state_dict(checkpoint_dict['support_sets'])
             reconstructor.load_state_dict(checkpoint_dict['reconstructor'])
         return starting_iter
-
-    def log_progress(self, iteration, mean_iter_time, elapsed_time, eta):
-        stats = self.stat_tracker.get_means()
-
-        # Update training statistics json file
-        with open(self.stats_json) as f:
-            stats_dict = json.load(f)
-        stats_dict.update({iteration: stats})
+    # ------------------------ helpers for TB visuals ------------------------
+    def _write_stats_json(self):
+        # Update training statistics json file (optimizer-step keyed)
         with open(self.stats_json, 'w') as out:
-            json.dump(stats_dict, out)
+            json.dump(self.stat_tracker.stats_by_step, out)
 
-        # Flush training statistics tracker
-        self.stat_tracker.flush()
-
-        update_progress("  \\__.Training [bs: {}] [iter: {:06d}/{:06d}] ".format(
-            self.params.batch_size, iteration, self.params.max_iter), self.params.max_iter, iteration + 1)
-        if iteration < self.params.max_iter - 1:
+    def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
+        # Stdout progress (now on optimizer-step cadence)
+        stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
+        total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
+        update_progress(
+            "  \\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
+                self.params.batch_size, step_idx, total_opt_steps
+            ),
+            total_opt_steps,
+            step_idx + 1,
+        )
+        if step_idx < total_opt_steps - 1:
             print()
-        print("      \\__Batch accuracy Index      : {:.03f}".format(stats['accuracy_index']))
-        print("      \\__Classification loss       : {:.08f}".format(stats['classification_loss']))
-        print("      \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats['wave_loss']))
-        print("      \\__Total loss                : {:.08f}".format(stats['total_loss']))
+        print("      \\__Batch accuracy Index      : {:.03f}".format(stats.get('accuracy_index', 0.0)))
+        print("      \\__Classification loss       : {:.08f}".format(stats.get('classification_loss', 0.0)))
+        print("      \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get('wave_loss', 0.0)))
+        print("      \\__Total loss                : {:.08f}".format(stats.get('total_loss', 0.0)))
         print("         ===================================================================")
-        print("      \\__Mean iter time            : {:.3f} sec".format(mean_iter_time))
+        print("      \\__Mean opt-step time        : {:.3f} sec".format(mean_step_time))
         print("      \\__Elapsed time              : {}".format(sec2dhms(elapsed_time)))
         print("      \\__ETA                       : {}".format(sec2dhms(eta)))
         print("         ===================================================================")
         update_stdout(10)
 
-    # ---------- Helper: estimate W stats (diag Gaussian) ----------
-    def _estimate_w_diag_stats(self, generator, n_samples: int, batch_size: int):
+    # ---------- Helper: estimate W stats (full Gaussian) ----------
+    @torch.no_grad()
+    def _estimate_w_full_stats(self, generator, n_samples: int, batch_size: int, shrink: float = 0.01, jitter: float = 1e-6):
         """
-        Estimate mean and diagonal variance of the W-space by sampling z -> w.
-        Returns (mu: [D], inv_var: [D]) on self.device.
+        Estimate mean and *full* covariance of W-space by sampling z -> w.
+        Returns (mu: [D], Sigma_inv: [D,D], chol_precision: [D,D]) on self.device.
+
+        - 'shrink' applies Σ <- (1-shrink)Σ + shrink*tr(Σ)/D * I  (Ledoit-Wolf style ridge).
+        - 'jitter' adds tiny εI for numerical stability.
         """
+        device = self.device
         mu = None
-        m2 = None
+        # Second-moment accumulator for online covariance (Welford in matrix form)
+        # We keep running mean and running covariance via batch-wise updates.
+        # See "parallel/online covariance" formula.
+        cov = None
         seen = 0
+
         while seen < n_samples:
             this_bs = min(batch_size, n_samples - seen)
-            z = sample_z(batch_size=this_bs, dim_z=generator.dim_z,
-                        truncation=self.params.z_truncation).to(self.device)
-            with torch.no_grad():
-                w = generator.get_w(z)  # [B, D] (or [B, D'] flattened)
-            if mu is None:
-                D = w.shape[1]
-                mu = torch.zeros(D, device=self.device, dtype=w.dtype)
-                m2 = torch.zeros(D, device=self.device, dtype=w.dtype)
-            seen += this_bs
-            delta = w.mean(dim=0) - mu
-            mu = mu + delta * (this_bs / seen)
-            # second moment accum (Welford)
-            m2 = m2 + ((w - mu).pow(2).sum(dim=0))
-        var = (m2 / max(1, (seen - 1))).clamp_min(1e-8)
-        inv_var = 1.0 / var
-        return mu, inv_var
+            z = sample_z(batch_size=this_bs, dim_z=generator.dim_z, truncation=self.params.z_truncation).to(device)
+            w = generator.get_w(z)  # [B, D]
+            B, D = w.shape
 
-    # ---------- Helper: energy gradient (Gaussian / diag-Gaussian) ----------
-    def _latent_energy_grad(self, latents, use_w, mu=None, inv_var=None):
+            if mu is None:
+                mu = torch.zeros(D, device=device, dtype=w.dtype)
+                cov = torch.zeros(D, D, device=device, dtype=w.dtype)
+
+            # batch stats
+            mu_b = w.mean(dim=0)                                   # [D]
+            Xc = (w - mu_b)                                        # [B, D]
+            cov_b = (Xc.T @ Xc) / max(1, B - 1)                    # [D, D]
+
+            # combine running + batch (online)
+            new_seen = seen + B
+            delta = (mu_b - mu)
+            mu_new = mu + delta * (B / new_seen)
+
+            # covariance merge (Chan–Golub–LeVeque)
+            cov = ( (seen - 1) / max(1, new_seen - 1) ) * cov \
+                + ( (B - 1)   / max(1, new_seen - 1) ) * cov_b \
+                + ( seen * B / max(1, new_seen * (new_seen - 1)) ) * torch.ger(delta, delta)
+
+            mu = mu_new
+            seen = new_seen
+
+        # Final covariance regularization + shrinkage
+        # Ridge toward spherical: α tr(Σ)/D I
+        trace = torch.trace(cov)
+        D = cov.shape[0]
+        cov = (1.0 - shrink) * cov + shrink * (trace / max(1, D)) * torch.eye(D, device=cov.device, dtype=cov.dtype)
+        cov = cov + jitter * torch.eye(D, device=cov.device, dtype=cov.dtype)
+
+        # Invert robustly via Cholesky
+        L = torch.linalg.cholesky(cov)               # Σ = L L^T
+        Sigma_inv = torch.cholesky_inverse(L)        # Σ^{-1}
+        # (optional) store precision Cholesky R s.t. Σ^{-1} = R R^T for fast Mahalanobis
+        # Compute R via chol of precision: numerically stable using solve_triangular
+        # Here we just reuse Sigma_inv's chol:
+        R = torch.linalg.cholesky(Sigma_inv)         # precision factor
+
+        return mu, Sigma_inv, R
+    # ---------- Helper: energy gradient (Gaussian / full-Gaussian) ----------
+    def _latent_energy_grad(self, latents, use_w, mu=None, Sigma_inv=None):
         """
-        Returns ∇E(latent) where E is Gaussian energy.
-        If use_w is False (Z-space): ∇E = z (since E=0.5||z||^2).
-        If use_w is True (W-space):  diag-Gaussian approx => ∇E = (w - mu) * inv_var.
+        Returns ∇E(latent) for Gaussian energy E = 0.5 (x - μ)^T Σ^{-1} (x - μ).
+        - Z-space (prior N(0,I)): ∇E = z.
+        - W-space full Gaussian:  ∇E = (w - μ) Σ^{-1}.
         """
         if not use_w:
             return latents  # z
-        # W-space diag Gaussian approx
-        return (latents - mu[None, :]) * inv_var[None, :]
+        # full precision
+        diff = latents - mu[None, :]                      # [B, D]
+        return diff @ Sigma_inv                           # [B, D]
+    # ---------- Helper: Mahalanobis distance and support penalty ----------
+    def _mahalanobis_sq(self, x, mu, R_precision):  # x: [B,D]
+        diff = x - mu[None, :]
+        y = diff @ R_precision.T                     # y = R (x - mu)
+        return (y * y).sum(dim=-1)                   # [B]
 
-    # ---------- Main method: contrastive pretraining ----------
+    def _support_penalty(self, x, use_w, mu=None, R_precision=None, r2_thresh=None, p=2):
+        """
+        Penalize leaving support: L = E[ ReLU(D^2 - r^2)^p ].
+        - p=1 or 2; r2_thresh is Mahalanobis^2 radius.
+        """
+        if use_w:
+            d2 = self._mahalanobis_sq(x, mu, R_precision)
+        else:
+            d2 = (x).pow(2).sum(dim=-1)
+        exced = (d2 - r2_thresh).clamp_min(0.0)
+        if p == 1:
+            return exced.mean()
+        return (exced * exced).mean()
+
     def contrastive_pretrain_potentials(self, generator, support_sets):
         """
-        Contrastive latent-only pretraining for potentials:
-        - Keeps gradient steps within the latent distribution
-        - Encourages mutual orthogonality and local consistency
-        Uses only generator.get_w if shift_in_w_space=True. No image synthesis.
+        Latent-only contrastive pretraining with *PDE traversal*:
+        - Works in W-space if generator.shift_in_w_space == True (uses only get_w).
+        - For each selected potential k, rolls z from i=0..t using WavePDE._per_step
+        (same discretization & truncation as training), accumulates PDE loss,
+        and applies contrastive terms at the selected step i=t.
         """
-        print("#. Contrastive pretraining of potentials (latent-only)")
+        import time, math
         device = self.device
         support_sets = support_sets.to(device).train()
         generator = generator.to(device).eval()
 
-        # ----------------- Hyperparameters (with sane defaults) -----------------
-        steps          = int(getattr(self.params, "pretrain_steps", 2000))
-        bs             = int(getattr(self.params, "pretrain_batch_size", self.params.batch_size))
-        lr             = float(getattr(self.params, "pretrain_lr", 1e-4))
-        t_rand         = bool(getattr(self.params, "pretrain_time_random", True))
-        cons_sigma     = float(getattr(self.params, "pretrain_consistency_sigma", 0.05))  # local noise std
-        target_norm    = float(getattr(self.params, "pretrain_target_grad_norm", 1.0))
-        lambda_orth    = float(getattr(self.params, "pretrain_lambda_orth", 1.0))
-        lambda_in      = float(getattr(self.params, "pretrain_lambda_in", 1.0))
-        lambda_cons    = float(getattr(self.params, "pretrain_lambda_consistency", 0.2))
-        lambda_norm    = float(getattr(self.params, "pretrain_lambda_norm", 0.0))
-        log_freq       = int(getattr(self.params, "pretrain_log_freq", 100))
-        use_amp        = bool(getattr(self.params, "pretrain_amp", False))
+        # ----------------- Hyperparameters -----------------
+        steps       = int(getattr(self.params, "pretrain_steps", 400))
+        B          = int(getattr(self.params, "pretrain_batch_size", 64))
+        lr          = float(getattr(self.params, "pretrain_lr", 1e-3))
+        t_rand      = bool(getattr(self.params, "pretrain_time_random", True))
+        cons_sigma  = float(getattr(self.params, "pretrain_consistency_sigma", 0.01))
+        target_norm = float(getattr(self.params, "pretrain_target_grad_norm", 0.0))  # (unused by default)
+        # contrastive weights
+        lambda_orth = float(getattr(self.params, "pretrain_lambda_orth", 1.0))
+        lambda_in   = float(getattr(self.params, "pretrain_lambda_in", 2.0))
+        lambda_cons = float(getattr(self.params, "pretrain_lambda_consistency", 2.))
+        lambda_norm = float(getattr(self.params, "pretrain_lambda_norm", 0.1))
+        lambda_sup = float(getattr(self.params, "pretrain_lambda_support", 1.))
+        p_power = int(getattr(self.params, "pretrain_support_power", 2))
+        # PDE/IC weights (default to WavePDE's current settings)
+        lambda_pde  = float(getattr(self.params, "pretrain_lambda_pde",
+                                    getattr(support_sets, "lambda_pde", .1)))
+        lambda_ic   = float(getattr(self.params, "pretrain_lambda_ic",
+                                    getattr(support_sets, "lambda_ic", 0.0)))
 
-        K = self.params.num_support_sets
-        T = self.params.num_support_timesteps
-        eps = 1e-8
+        # how many potentials to hit per iteration (<= K)
+        K           = int(getattr(self.params, "num_support_sets", support_sets.num_support_sets))
+        K_per_step  = int(getattr(self.params, "pretrain_k_per_step", K))  # set <K for speed
 
-        # -------------- Decide latent space and estimate distribution -----------
+        T_all       = int(getattr(self.params, "num_support_timesteps", support_sets.num_support_timesteps))
+        half_range  = max(1, T_all // 2)
+        log_freq    = int(getattr(self.params, "pretrain_log_freq", 100))
+        use_amp     = bool(getattr(self.params, "pretrain_amp", False))
+        eps         = 1e-8
+        # ----------------- Choose latent space & stats -----------------
         use_w = bool(getattr(generator, "shift_in_w_space", False))
-        mu = None
-        inv_var = None
+        mu = Sigma_inv = R_prec = None
+        r2_thresh = None
+
         if use_w:
-            n_stats = int(getattr(self.params, "pretrain_w_stats_samples", 50000))
+            n_stats  = int(getattr(self.params, "pretrain_w_stats_samples", 50000))
             stats_bs = int(getattr(self.params, "pretrain_w_stats_batch", 1024))
-            print(f"   - Estimating W diag-Gaussian stats with {n_stats} samples...")
-            mu, inv_var = self._estimate_w_diag_stats(generator, n_stats, stats_bs)
-            # cache on module for later use if desired
-            support_sets.register_buffer("w_mu", mu)
-            support_sets.register_buffer("w_inv_var", inv_var)
-        else:
-            print("   - Using Z prior N(0,I); no stats needed.")
-
-        # -------------------------- Optimizer -----------------------------------
-        opt = torch.optim.Adam(support_sets.parameters(), lr=lr)
-
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-        # ------------------------ Training loop ---------------------------------
-        t0 = time.time()
+            shrink   = float(getattr(self.params, "pretrain_w_stats_shrink", 0.01))
+            print(f"   - Estimating W full-Gaussian stats with {n_stats} samples...")
+            mu, Sigma_inv, R_prec = self._estimate_w_full_stats(generator, n_stats, stats_bs, shrink=shrink, jitter=1e-6)
         
-        for it in range(1, steps + 1):
-            z = sample_z(batch_size=bs, dim_z=generator.dim_z,
-                        truncation=self.params.z_truncation).to(device)
-
+            # Optional: empirical r^2 from samples for support radius
+            # Re-sample a small set to compute empirical quantile of D^2 (keeps code self-contained).
+            n_q = min(20000, n_stats)
+            d2_vals = []
+            seen = 0
             with torch.no_grad():
-                lat = generator.get_w(z, truncation_psi=self.params.z_truncation) if use_w else z  # [B, D]
+                while seen < n_q:
+                    this_bs = min(stats_bs, n_q - seen)
+                    zq = sample_z(batch_size=this_bs, dim_z=generator.dim_z, truncation=self.params.z_truncation).to(self.device)
+                    wq = generator.get_w(zq)
+                    d2_vals.append(self._mahalanobis_sq(wq, mu, R_prec))
+                    seen += this_bs
+            d2_all = torch.cat(d2_vals, dim=0)
+            q = float(getattr(self.params, "pretrain_support_quantile", 0.99))
+            r2_thresh = torch.quantile(d2_all, q).detach()
+            # register buffers (optional)
+            support_sets.register_buffer("w_mu", mu)
+            support_sets.register_buffer("w_Sigma_inv", Sigma_inv)
+            support_sets.register_buffer("w_R_prec", R_prec)
+            support_sets.register_buffer("w_r2_thresh", r2_thresh)
+        else:
+            print("   - Using Z prior N(0,I); no W stats needed.")
+            
 
-            # Random or fixed time input
+        # ----------------- Optimizer -----------------
+        opt = torch.optim.AdamW(support_sets.parameters(), lr=lr, weight_decay=1e-5)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        autocast = (torch.cuda.amp.autocast if device.type == 'cuda' else torch.autocast)
+
+        # Temporarily turn off JVP inside WavePDE (latent-only here)
+        prev_lambda_jvp = float(getattr(support_sets, "lambda_jvp", 0.0))
+        if hasattr(support_sets, "lambda_jvp"):
+            support_sets.lambda_jvp = 0.0
+
+        t_print = time.time()
+        for it in range(1, steps + 1):
+            # ---- sample batch in chosen latent space ----
+            z = sample_z(batch_size=B, dim_z=generator.dim_z,
+                        truncation=self.params.z_truncation).to(device)
+            with torch.no_grad():
+                lat0 = generator.get_w(z, truncation_psi=self.params.z_truncation) if use_w else z  # [B, D]
+
+            # choose target timestep (shared across selected potentials this iter)
             if t_rand:
-                t_in = torch.randint(0, max(1, T), (bs, 1), device=device, dtype=lat.dtype)
+                t_idx_scalar = int(torch.randint(1, half_range, (1,), device=device).item())
             else:
-                t_in = torch.zeros(bs, 1, device=device, dtype=lat.dtype)
+                t_idx_scalar = 1
 
-            # Energy gradient (out-of-distribution local direction)
-            gradE = self._latent_energy_grad(lat, use_w, mu, inv_var)  # [B, D]
-            gradE_norm = gradE.norm(dim=1, keepdim=True).clamp_min(eps)
+            # energy gradient at *selected* step locations will be computed later per-k
+            # here we keep lat0 for rollouts
+            # select K' potentials (without replacement)
+            if K_per_step < K:
+                k_indices = torch.randperm(K, device=device)[:K_per_step].tolist()
+            else:
+                k_indices = list(range(K))
 
-            # Compute gradients g_k = ∇_lat u^k(lat, t)
-            # We build them in a list to keep each graph separate (memory-friendly)
-            g_list = []
-            g_pert_list = []
-            if cons_sigma > 0:
-                lat_pert = (lat + cons_sigma * torch.randn_like(lat))
+            # accumulators across selected potentials
+            Gk_list   = []  # [B, D] grads at selected step (normalized by OEMS in _per_step)
+            Zk_list   = []  # [B, D] lat locations at selected step (for in-distribution)
+            PDE_list  = []  # scalars per k
+            IC_list   = []  # scalars per k (optional)
+            GP_list   = []  # [B, D] perturbed grads for consistency
+            all_G_list = []  # [B*timesteps, D] all grads
 
             opt.zero_grad(set_to_none=True)
-            
-            # AMP only helps inside forwards; we still need create_graph for backprop through g_k
-            autocast = torch.cuda.amp.autocast if use_amp else torch.autocast
-            with autocast(device_type='cuda', enabled=use_amp):
-                for k in range(K):
-                    mlp = support_sets.MLP_SET[k]
-                    # base grads
-                    lat_req = lat.detach().requires_grad_(True)
-                    t_req   = t_in.detach()  # we don't need grads wrt time in pretrain
-                    u = mlp(lat_req, t_req)           # (B,1)
-                    g = torch.autograd.grad(u.sum(), lat_req, create_graph=True)[0]  # (B,D)
-                    g_list.append(g)
+            with autocast(device_type=device.type, enabled=use_amp):
+                for k in k_indices:
+                    mlp_k = support_sets.MLP_SET[k]
+                    c_k   = support_sets.c[k:k+1]  # [1,1]
 
+                    # Roll from i=0..t_idx_scalar, accumulating PDE; capture g at i=t
+                    z_curr = lat0
+                    pde_acc = 0.0
+                    g_sel = None
+                    z_sel = None
+                    direction = np.random.choice([-1, 1])
+                    denom=0
+                    for i_ind, i in enumerate((range(half_range) if direction == +1 else range(half_range, -1, -1))):
+                        denom += 1
+                        t_i = torch.full((B, 1), float(i), device=device, dtype=lat0.dtype, requires_grad=True)
+
+                        u_i, u_z_i, pde_res_i, z_curr = support_sets._per_step(mlp_k, z_curr, t_i, c_k, direction)
+                        # accumulate PDE residual like forward()
+                        pde_acc = pde_acc + (pde_res_i.pow(2).mean())
+                        # capture at target i
+                        if i_ind == 0:
+                            g_sel = u_z_i
+                            z_sel = z_curr
+                        if lambda_norm > 0:
+                            all_G_list.append(u_z_i)
+
+                    # match forward(): average over number of steps processed (≈ i)
+                    denom = max(1, denom)  # forward uses /max(1,i); i==t_idx_scalar
+                    PDE_list.append(pde_acc / denom)
+
+                    Gk_list.append(g_sel)   # [B, D]
+                    Zk_list.append(z_sel)   # [B, D]
+
+                    # local consistency at selected step
                     if cons_sigma > 0:
-                        latp_req = lat_pert.detach().requires_grad_(True)
-                        up = mlp(latp_req, t_req)
-                        gp = torch.autograd.grad(up.sum(), latp_req, create_graph=True)[0]
-                        g_pert_list.append(gp)
+                        z_pert = (z_sel + cons_sigma * torch.randn_like(z_sel)).detach().requires_grad_(True)
+                        t_i = torch.full((B, 1), float(half_range) if direction == +1 else 0, device=device, dtype=lat0.dtype, requires_grad=True)
+                        u, u_z = support_sets.inference(k, z_pert, t_i, generator=None, direction=-1*direction)
+                        
+                        GP_list.append(u_z)
 
-            # Stack: [B, K, D]
-            G = torch.stack(g_list, dim=1)
+            # Stack across selected k: [B, K', D]
+            G = torch.stack(Gk_list, dim=1)                     # grads at selected step
+            Zs = torch.stack(Zk_list, dim=1)                    # locations at selected step
             G_norm = G.norm(dim=-1, keepdim=True).clamp_min(eps)
             G_unit = G / G_norm
 
-            # ---------- Orthogonality: ||G G^T - I||_F^2 (per batch, mean) ----------
-            # Gram per sample: [B, K, K]
-            Gram = torch.matmul(G_unit, G_unit.transpose(1, 2))
-            I = torch.eye(K, device=device, dtype=Gram.dtype)[None, :, :]
-            off = Gram - I
-            L_orth = (off.pow(2).sum(dim=(1, 2)) / (K * (K - 1) + eps)).mean()
+            # Orthogonality across potentials
+            Kp = G.shape[1]
+            Gram = torch.matmul(G_unit, G_unit.transpose(1, 2))  # [B, K', K']
+            I = torch.eye(Kp, device=device, dtype=Gram.dtype)[None]
+            L_orth = ((Gram - I).pow(2).sum(dim=(1, 2)) / max(1, Kp * (Kp - 1))).mean()
 
-            # ---------- In-distribution: minimize cos^2(g_k, gradE) ----------
-            # Broadcast gradE to [B, K, D]
-            GE = gradE[:, None, :]
-            GE_unit = GE / gradE_norm[:, None, :]
-            cos_g_GE = (G_unit * GE_unit).sum(dim=-1)  # [B, K]
+            # In-distribution alignment at each k's selected location
+            if use_w:
+                GE = (Zs - mu[None, None, :]) @ Sigma_inv   # [B,K',D]
+            else:
+                GE = Zs
+            GE_unit = GE / GE.norm(dim=-1, keepdim=True).clamp_min(eps)
+            cos_g_GE = (G_unit * GE_unit).sum(dim=-1)       # [B,K']
             L_in = (cos_g_GE.pow(2)).mean()
 
-            # ---------- Consistency: local directional stability ----------
+            # Consistency
             if cons_sigma > 0:
-                GP = torch.stack(g_pert_list, dim=1)        # [B, K, D]
+                GP = torch.stack(GP_list, dim=1)                # [B, K', D]
                 GP_unit = GP / GP.norm(dim=-1, keepdim=True).clamp_min(eps)
-                cos_cons = (G_unit * GP_unit).sum(dim=-1)   # [B, K]
+                cos_cons = (G_unit * GP_unit).sum(dim=-1)       # [B, K']
                 L_cons = (1.0 - cos_cons).mean()
             else:
-                L_cons = torch.zeros((), device=device, dtype=lat.dtype)
+                L_cons = torch.zeros((), device=device, dtype=G.dtype)
 
-            # ---------- Norm regularizer (optional) ----------
-            if lambda_norm > 0:
-                L_norm = ((G_norm.squeeze(-1) - target_norm).pow(2)).mean()
+
+            if lambda_sup > 0:
+                # Zs: [B,K',D] -> compute on all K' and average
+                Zs_2D = Zs.reshape(-1, Zs.shape[-1])  # [B*K',D]
+                L_sup = self._support_penalty(Zs_2D, use_w, mu, R_prec, r2_thresh, p=p_power)
             else:
-                L_norm = torch.zeros((), device=device, dtype=lat.dtype)
+                L_sup = torch.zeros((), device=device, dtype=G.dtype)
+
+            # Optional norm target for |g_k|
+            
+            if lambda_norm > 0:
+                all_G_list = torch.stack(all_G_list, dim=0)
+                dim_last = all_G_list.shape[-1]**0.5
+                G_norm_all = all_G_list.norm(dim=-1, keepdim=True).clamp_min(eps)
+                G_norm_mean = G_norm_all.mean(dim=0, keepdim=True)
+                L_norm = ((G_norm_all - G_norm_mean) ** 2).mean()/dim_last
+            else:
+                L_norm = torch.zeros((), device=device, dtype=G.dtype)
+
+            # PDE & IC aggregates
+            L_pde = torch.stack(PDE_list).mean() if len(PDE_list) > 0 else torch.zeros((), device=device)
+            L_ic  = torch.stack(IC_list).mean() if (lambda_ic > 0 and len(IC_list) > 0) else torch.zeros((), device=device)
 
             # Total loss
             loss = (lambda_orth * L_orth
-                    + lambda_in * L_in
-                    + lambda_cons * L_cons
-                    + lambda_norm * L_norm)
+                + lambda_in   * L_in
+                + lambda_cons * L_cons
+                + lambda_norm * L_norm
+                + lambda_pde  * L_pde
+                + lambda_ic   * L_ic
+                + lambda_sup  * L_sup) 
 
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
             # Logging
-            if (it % log_freq) == 0:
-                dt = time.time() - t0
+            if it % log_freq == 0:
+                dt = time.time() - t_print
                 print(f"[pretrain {it:06d}/{steps:06d}] "
-                    f"loss={float(loss):.5f}  L_orth={float(L_orth):.5f} "
-                    f"L_in={float(L_in):.5f}  L_cons={float(L_cons):.5f}  "
-                    f"L_norm={float(L_norm):.5f}  ({dt:.1f}s)")
-                t0 = time.time()
+                    f"loss={float(loss):.5f} | "
+                    f"orth={float(L_orth):.5f} in={float(L_in):.5f} cons={float(L_cons):.5f} "
+                    f"norm={float(L_norm):.5f} pde={float(L_pde):.5f} ic={float(L_ic):.5f} "
+                    f"t={t_idx_scalar}  (dt={dt:.1f}s)"
+                    f"sup={float(L_sup):.5f}"
+                    f"cons={float(L_cons):.5f}"
+                    )
+                t_print = time.time()
+
+        # restore original lambda_jvp
+        if hasattr(support_sets, "lambda_jvp"):
+            support_sets.lambda_jvp = prev_lambda_jvp
 
         print("#. Contrastive pretraining complete.")
-        
-    def train(self, generator, support_sets, reconstructor):
 
+    def train(self, generator, support_sets, reconstructor):
         histograms = False
-        save_images = False
-        save_checkpoints = False
+        save_images = True
+        save_checkpoints = True
         analytics = False
         # Save initial `support_sets` model as `support_sets_init.pt`
         torch.save(support_sets.state_dict(), osp.join(self.models_dir, 'support_sets_init.pt'))
@@ -443,13 +588,9 @@ class Trainer(object):
         support_sets = support_sets.to(self.device).train()
         reconstructor = reconstructor.to(self.device).train()
 
-        # Initialize enhanced logging arrays (on CPU) now that K is known
-        self.K = self.params.num_support_sets
-        cpu = torch.device('cpu')
-        self.per_k_ema_acc = torch.zeros(self.K, dtype=torch.float32, device=cpu)
-        self.per_k_ema_grad = torch.zeros(self.K, dtype=torch.float32, device=cpu)
-        self.per_k_select_counts = torch.zeros(self.K, dtype=torch.long, device=cpu)
-        self.confusion = torch.zeros((self.K, self.K), dtype=torch.long, device=cpu)
+        # Initialize enhanced logging arrays (now owned by stat_tracker) once K is known
+        self.K = int(self.params.num_support_sets)
+        self.stat_tracker.init_per_k(self.K)
 
         # Optimizers
         # Starting iter (maybe resume)
@@ -474,8 +615,8 @@ class Trainer(object):
         win_len = None  # number of micro-steps in the current window (handles last partial window)
 
         # --- create optimizer(s) first ---
-        support_sets_optim = torch.optim.Adam(support_sets.parameters(), lr=self.params.support_set_lr)
-        reconstructor_optim = torch.optim.Adam(reconstructor.parameters(), lr=self.params.reconstructor_lr)
+        support_sets_optim = torch.optim.AdamW(support_sets.parameters(), lr=self.params.support_set_lr, weight_decay=0.0)
+        reconstructor_optim = torch.optim.AdamW(reconstructor.parameters(), lr=self.params.reconstructor_lr)
 
         # --- scheduler should count OPTIMIZER steps, not micro-steps ---
         total_opt_steps = math.ceil(self.params.max_iter / acc_steps)
@@ -488,11 +629,11 @@ class Trainer(object):
         # init schedulers with the right position (if not loading state)
         sched_support = CosineScheduleWithWarmup(
             support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps,
-            last_epoch=opt_step_idx - 1  # so next .step() advances to opt_step_idx
+            last_epoch= - 1  # so next .step() advances to opt_step_idx
         )
         sched_recon = CosineScheduleWithWarmup(
             reconstructor_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps,
-            last_epoch=opt_step_idx - 1
+            last_epoch= - 1
         )
 
         # zero grads ONCE before the loop
@@ -536,6 +677,9 @@ class Trainer(object):
             window_start = ((micro_idx - 1) % acc_steps) == 0
 
             if window_start:
+                imgs_orig = [[] for _ in range(VIS_IMAGE_N)]
+                imgs_step1 = [[] for _ in range(VIS_IMAGE_N)]
+                imgs_step2 = [[] for _ in range(VIS_IMAGE_N)]
                 # how many micro-steps remain including this one?
                 micros_left = self.params.max_iter - iteration + 1
                 win_len = min(acc_steps, micros_left)
@@ -552,14 +696,14 @@ class Trainer(object):
                 if getattr(generator, "shift_in_w_space", False) is True:
                     current_z = generator.get_w(current_z)
 
+                img1 = generator(current_z[:1])
+                for i in range(VIS_IMAGE_N):
+                    imgs_orig[i] = img1
+
                 # 2) draw k indices WITHOUT replacement for this window
                 k_seq = draw_unique_k_sequence(self.K, win_len, self.device)
                 k_ptr = 0
 
-                # Original images
-                if iteration % self.params.log_freq == 0 and save_images:
-                    with torch.no_grad():
-                        img_orig = generator(current_z[:8])
 
             # use the shared z for this micro-step
             z = current_z
@@ -580,6 +724,11 @@ class Trainer(object):
             img_step1 = generator(latent1)
             img_step2 = generator(latent2)
 
+            # Store images for visualization
+            if k < VIS_IMAGE_N:
+                imgs_step1[k] = img_step1[:1]
+                imgs_step2[k] = img_step2[:1]
+
             # Classifier
             predicted_support_sets_indices, _ = reconstructor(img_step1, img_step2)
 
@@ -592,156 +741,158 @@ class Trainer(object):
             loss = loss / acc_steps
             loss.backward()
 
-            # ---- Enhanced analytics (safe device handling) ----
+            # ---- Enhanced analytics (safe device handling) ----            
             with torch.no_grad():
                 logits = predicted_support_sets_indices
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(logits, dim=1)
-                entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=1).mean().detach()
-                k = int(index.item())
-                acc_k = (preds == k).float().mean().detach().to('cpu')
-                self.per_k_ema_acc[k] = self.per_k_ema_acc[k] * self.ema_decay + acc_k * (1.0 - self.ema_decay)
-                self.per_k_select_counts[k] += int(self.params.batch_size)
+                entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=1).mean()
 
-                # Snapshot per-MLP EMA accuracy for heatmap
-                if self.tensorboard and iteration % self.params.log_freq == 0 and analytics:
-                    # Predictions, probs, entropy
-                    # Update per-MLP EMA accuracy and confusion on CPU
+                # Latent step norms
+                delta1 = (latent1 - z).detach()
+                delta2 = (latent2 - latent1).detach()
+                step1_norm = float(delta1.norm(dim=1).mean())
+                step2_norm = float(delta2.norm(dim=1).mean())
 
-                    preds_cpu = preds.detach().to('cpu')
-                    counts = torch.bincount(preds_cpu, minlength=self.K).to(self.confusion.dtype)
-                    self.confusion[k, :].add_(counts)
-
-                    # Per-MLP grad norm EMA (only selected MLP has grads)
-                    mlp_params = list(support_sets.MLP_SET[k].parameters())
+                # Per-MLP selected grad norm (only selected MLP has grads)
+                grad_norm_selected = None
+                if analytics:
+                    mlp_params = list(support_sets.MLP_SET[int(index.item())].parameters())
                     if len(mlp_params) > 0:
                         g2 = 0.0
                         for p in mlp_params:
                             if p.grad is not None:
                                 g2 += float(p.grad.detach().to('cpu').pow(2).sum())
-                        grad_norm = math.sqrt(max(g2, 1e-12))
-                        self.per_k_ema_grad[k] = self.per_k_ema_grad[k] * self.ema_decay + grad_norm * (1.0 - self.ema_decay)
+                        grad_norm_selected = math.sqrt(max(g2, 1e-12))
 
+                # Accumulate micro-step means into the tracker (unscaled totals for readability)
+                self.stat_tracker.add_micro(
+                    acc=float((preds == index.item()).float().mean().item()),
+                    classification_loss=float(classification_loss.item()),
+                    wave_loss=float(loss_wave.item()),
+                    total_loss=float((self.params.lambda_cls * classification_loss + self.params.lambda_pde * loss_wave).item()),
+                    entropy=float(entropy.item()),
+                    step1_norm=step1_norm,
+                    step2_norm=step2_norm,
+                )
 
-
-                    # Global grad norms (CPU)
-                    def module_grad_norm(mod):
-                        tot = 0.0
-                        for p in mod.parameters():
-                            if p.grad is not None:
-                                tot += float(p.grad.detach().to('cpu').pow(2).sum())
-                        return math.sqrt(max(tot, 1e-12))
-
-                    gn_support = module_grad_norm(support_sets)
-                    gn_recon = module_grad_norm(reconstructor)
-
-                    # Latent step norms
-                    delta1 = (latent1 - z).detach()
-                    delta2 = (latent2 - latent1).detach()
-                    step1_norm = delta1.norm(dim=1).mean()
-                    step2_norm = delta2.norm(dim=1).mean()
-                    self.ema_history.append(self.per_k_ema_acc.detach().cpu().numpy().copy())
-                    self.iter_history.append(iteration)
-                    if len(self.ema_history) > self.max_history:
-                        self.ema_history = self.ema_history[-self.max_history:]
-                        self.iter_history = self.iter_history[-self.max_history:]
-
+                # Per-MLP analytics in tracker (CPU numpy)
+                self.stat_tracker.update_per_k_after_micro(
+                    true_k=int(index.item()),
+                    preds=preds.detach().to('cpu').numpy(),
+                    batch_size=int(self.params.batch_size),
+                    grad_norm_selected_mlp=grad_norm_selected if analytics else None,
+                )
+                
             if (micro_idx % acc_steps == 0) or (iteration == self.params.max_iter):
+                # Optimizer step (after acc_steps micro-steps, or at the very end)
                 support_sets_optim.step()
                 reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True)
                 reconstructor_optim.zero_grad(set_to_none=True)
 
+                # LR schedulers step once per optimizer step
                 sched_support.step()
                 sched_recon.step()
                 opt_step_idx += 1
-                # Update statistics tracker
-                self.stat_tracker.update(accuracy_index=(preds == target).to(torch.float32).mean().detach(),
-                                        classification_loss=classification_loss.item(),
-                                        wave_loss=loss_wave.item(),
-                                        total_loss=loss.item(),
-                                        support_sets_lr=sched_support.get_last_lr()[0],
-                                        reconstructor_lr=sched_recon.get_last_lr()[0])
+
+                # Snapshot LRs into tracker
+                self.stat_tracker.set_lrs(
+                    sched_support.get_last_lr()[0],
+                    sched_recon.get_last_lr()[0],
+                )
+
+                # Window means (aggregated over the last acc_steps micro-steps)
+                win_means = self.stat_tracker.close_window()
+
                 # ============================ TensorBoard logging ============================
                 if self.tensorboard:
-                    with torch.no_grad():
-                        # Scalars
-                        means = self.stat_tracker.get_means()
-                        for key, value in means.items():
-                            self.tb_writer.add_scalar(f"train/{key}", value, iteration)
-                        self.tb_writer.add_scalar("train/entropy", float(entropy), iteration)
-                        if analytics:
-                            self.tb_writer.add_scalar("train/grad_norm/support_sets", gn_support, iteration)
-                            self.tb_writer.add_scalar("train/grad_norm/reconstructor", gn_recon, iteration)
-                            self.tb_writer.add_scalar("train/latent_step_norm/step1_mean", float(step1_norm), iteration)
-                            self.tb_writer.add_scalar("train/latent_step_norm/step2_mean", float(step2_norm), iteration)
+                    # Scalars written at optimizer-step cadence
+                    for key, value in win_means.items():
+                        self.tb_writer.add_scalar(f"train/{key}", float(value), opt_step_idx)
+                    self.tb_writer.add_scalar("train/support_sets_lr", self.stat_tracker.last_support_lr, opt_step_idx)
+                    self.tb_writer.add_scalar("train/reconstructor_lr", self.stat_tracker.last_recon_lr, opt_step_idx)
 
-                        # wave speed c stats (support_sets.c: [K,1])
+                    if analytics:
+                        # Wave speed c stats (support_sets.c: [K,1])
                         c_vals = support_sets.c.detach().view(-1).cpu().numpy()
-                        self.tb_writer.add_scalar("train/c_stats/mean", float(c_vals.mean()), iteration)
-                        self.tb_writer.add_scalar("train/c_stats/std", float(c_vals.std()), iteration)
-                        self.tb_writer.add_scalar("train/c_stats/min", float(c_vals.min()), iteration)
-                        self.tb_writer.add_scalar("train/c_stats/max", float(c_vals.max()), iteration)
+                        self.tb_writer.add_scalar("train/c_stats/mean", float(c_vals.mean()), opt_step_idx)
+                        self.tb_writer.add_scalar("train/c_stats/std", float(c_vals.std()), opt_step_idx)
+                        self.tb_writer.add_scalar("train/c_stats/min", float(c_vals.min()), opt_step_idx)
+                        self.tb_writer.add_scalar("train/c_stats/max", float(c_vals.max()), opt_step_idx)
 
-                        # Histograms
+                        # Periodic snapshots for heatmap/confusion
+                        if (micro_idx-1//acc_steps % self.params.log_freq) == 0:
+                            self.stat_tracker.snapshot_per_k_history(opt_step_idx)
+
+                        # Optional histograms
                         if histograms:
-                            self.tb_writer.add_histogram("train/logits", logits.detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("train/probs", probs.detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("train/latent_step_norm/step1", delta1.norm(dim=1).detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("train/latent_step_norm/step2", delta2.norm(dim=1).detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("train/c_values", c_vals, iteration)
+                            self.tb_writer.add_histogram("train/logits", logits.detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("train/probs", probs.detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("train/latent_step_norm/step1",
+                                                         (delta1.norm(dim=1)).detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("train/latent_step_norm/step2",
+                                                         (delta2.norm(dim=1)).detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("per_mlp/ema_accuracy", self.stat_tracker.per_k_ema_acc, opt_step_idx)
+                            self.tb_writer.add_histogram("per_mlp/ema_grad_norm", self.stat_tracker.per_k_ema_grad, opt_step_idx)
+                            self.tb_writer.add_histogram("per_mlp/selection_counts", self.stat_tracker.per_k_select_counts, opt_step_idx)
+                            self.tb_writer.add_histogram("meta/timestep_idx", time_stamp[:, 0].detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("meta/predicted_k", preds.detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("meta/true_k", target.detach().cpu().numpy(), opt_step_idx)
 
-                            # Per-MLP histograms (CPU arrays)
-                            self.tb_writer.add_histogram("per_mlp/ema_accuracy", self.per_k_ema_acc.detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("per_mlp/ema_grad_norm", self.per_k_ema_grad.detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("per_mlp/selection_counts", self.per_k_select_counts.detach().cpu().numpy(), iteration)
+                    # Images & figures (on optimizer-step cadence)
+                    if save_images and ((micro_idx-1)//acc_steps % self.params.log_freq) == 0:
+                        self._log_image_triplet(self.tb_writer, "images", torch.cat(imgs_orig), torch.cat(imgs_step1), torch.cat(imgs_step2),
+                                                opt_step_idx, n_vis=min(VIS_IMAGE_N, self.params.batch_size))
 
-                            # Meta histograms
-                            self.tb_writer.add_histogram("meta/timestep_idx", time_stamp[:, 0].detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("meta/predicted_k", preds.detach().cpu().numpy(), iteration)
-                            self.tb_writer.add_histogram("meta/true_k", target.detach().cpu().numpy(), iteration)
-
-                        # Images & figures
-                        if opt_step_idx % self.params.log_freq == 0 and save_images:
-                            self._log_image_triplet(self.tb_writer, "images", img_orig, img_step1, img_step2, iteration,
-                                                    n_vis=min(8, self.params.batch_size))
-
-                            # Heatmap of per-MLP EMA accuracy over time
-                            if len(self.ema_history) >= 2:
-                                hist_mat = np.stack(self.ema_history, axis=1)  # [K, T_hist]
-                                fig = self._plot_heatmap(hist_mat, title="Per-MLP EMA Accuracy over Time",
-                                                        xlabel="log step (every log_freq iters)",
+                        # Heatmap of per-MLP EMA accuracy over time
+                        if len(self.stat_tracker.ema_history) >= 2:
+                            hist_mat = np.stack(self.stat_tracker.ema_history, axis=1)  # [K, T_hist]
+                            fig = self._plot_heatmap(hist_mat, title="Per-MLP EMA Accuracy over Time",
+                                                        xlabel="optimizer step snapshot",
                                                         ylabel="MLP index k")
-                                self.tb_writer.add_figure("per_mlp/accuracy_heatmap", fig, global_step=iteration)
-                                plt.close(fig)
+                            self.tb_writer.add_figure("per_mlp/accuracy_heatmap", fig, global_step=opt_step_idx)
+                            plt.close(fig)
 
-                            # Confusion matrix
-                            fig_c = self._plot_confusion(self.confusion)  # CPU tensor
-                            self.tb_writer.add_figure("classifier/confusion_matrix", fig_c, global_step=iteration)
-                            plt.close(fig_c)
-
+                        # Confusion matrix (normalized rows)
+                        fig_c = self._plot_confusion(self.stat_tracker.confusion)
+                        self.tb_writer.add_figure("classifier/confusion_matrix", fig_c, global_step=opt_step_idx)
+                        plt.close(fig_c)
                 # ============================ /TensorBoard logging ===========================
 
-                # Timing
-                iter_t = time.time()
-                self.iter_times = np.append(self.iter_times, iter_t - iter_t0)
-                elapsed_time = iter_t - t0
-                mean_iter_time = self.iter_times.mean()
-                eta = elapsed_time * ((self.params.max_iter - iteration) / (iteration - starting_iter + 1))
+                # Timing & ETA (optimizer-step based)
+                step_dt = time.time() - iter_t0
+                self.stat_tracker.push_step_time(step_dt)
+                elapsed_time = time.time() - t0
+                mean_step_time = self.stat_tracker.mean_step_time()
+                total_opt_steps = math.ceil(self.params.max_iter / acc_steps)
+                eta = (total_opt_steps - opt_step_idx) * mean_step_time
 
-                # Log progress in stdout
-                if iteration % self.params.log_freq == 0:
-                    self.log_progress(iteration, mean_iter_time, elapsed_time, eta)
+                # Persist step stats to json + stdout progress
+                self.stat_tracker.finalize_step(
+                    step_idx=opt_step_idx,
+                    window_means=win_means,
+                    elapsed_from_start=elapsed_time,
+                    mean_step_time=mean_step_time,
+                    eta_seconds=eta,
+                )
+                self._write_stats_json()
 
-                # Save checkpoint
-                if iteration % self.params.ckp_freq == 0 and save_checkpoints:
+                if micro_idx % self.params.log_freq == 0:
+                    self.log_progress(opt_step_idx, mean_step_time, elapsed_time, eta)
+
+                # Save checkpoint based on optimizer-step cadence (optional)
+                if save_checkpoints and (opt_step_idx % self.params.ckp_freq == 0):
                     checkpoint_dict = {
-                        'iter': iteration,
+                        'iter': opt_step_idx,
                         'support_sets': support_sets.state_dict(),
-                        'reconstructor': reconstructor.module.state_dict() if self.multi_gpu else reconstructor.state_dict()
+                        'reconstructor': reconstructor.state_dict(),
+                        'support_opt': support_sets_optim.state_dict(),
+                        'recon_opt': reconstructor_optim.state_dict(),
+                        'support_sched': sched_support.state_dict(),
+                        'recon_sched': sched_recon.state_dict(),
                     }
                     torch.save(checkpoint_dict, self.checkpoint)
-        # === End of training loop ===
 
         elapsed_time = time.time() - t0
 

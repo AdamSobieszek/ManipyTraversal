@@ -60,12 +60,12 @@ def main():
     # === Support Sets (S) ======================================================================== #
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=1e-4, help="set learning rate")
+    parser.add_argument('--support-set-lr', type=float, default=5e-4, help="set learning rate")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
-    parser.add_argument('--reconstructor-lr', type=float, default=1e-4,
+    parser.add_argument('--reconstructor-lr', type=float, default=5e-4,
                         help="set learning rate for reconstructor R optimization")
 
     # === Training =================================================================================================== #
@@ -166,9 +166,9 @@ def main():
                     support_vectors_dim=G.dim_z)
 
     # For stylegan remove the last activation layer otherwise the changes are too small
-    if args.gan_type == 'StyleGAN2':
+    if args.gan_type != 'StyleGAN2':
         for i in range(S.num_support_sets):
-            S.MLP_SET[i].activation4 = nn.Identity()
+            S.MLP_SET[i].activation4 = nn.Tanh()
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in S.parameters() if p.requires_grad)))
