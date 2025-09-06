@@ -60,12 +60,12 @@ def main():
     # === Support Sets (S) ======================================================================== #
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=5e-4, help="set learning rate")
+    parser.add_argument('--support-set-lr', type=float, default=2.5e-4, help="set learning rate")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
-    parser.add_argument('--reconstructor-lr', type=float, default=5e-4,
+    parser.add_argument('--reconstructor-lr', type=float, default=2.5e-4,
                         help="set learning rate for reconstructor R optimization")
 
     # === Training =================================================================================================== #
@@ -78,7 +78,7 @@ def main():
     parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
     parser.add_argument('--log-freq', default=20, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
-    parser.add_argument('--new-experiment', action='store_true', help='set to True to start a new experiment')
+    parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
 
     # === Device ===================================================================================================== #

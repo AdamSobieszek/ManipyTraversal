@@ -18,7 +18,7 @@ from .aux import sample_z, TrainingStatTracker, update_progress, update_stdout, 
 
 from torch.optim.lr_scheduler import _LRScheduler
 
-VIS_IMAGE_N = 10
+VIS_IMAGE_N = 15
 
 class CosineScheduleWithWarmup(_LRScheduler):
     """
@@ -196,46 +196,6 @@ class Trainer(object):
         fig.tight_layout()
         return fig
 
-    # -----------------------------------------------------------------------
-
-    def get_starting_iteration(self, support_sets, reconstructor):
-        starting_iter = 1
-        if osp.isfile(self.checkpoint):
-            checkpoint_dict = torch.load(self.checkpoint, map_location=self.device)
-            starting_iter = checkpoint_dict['iter']
-            support_sets.load_state_dict(checkpoint_dict['support_sets'])
-            reconstructor.load_state_dict(checkpoint_dict['reconstructor'])
-        return starting_iter
-    # ------------------------ helpers for TB visuals ------------------------
-    def _write_stats_json(self):
-        # Update training statistics json file (optimizer-step keyed)
-        with open(self.stats_json, 'w') as out:
-            json.dump(self.stat_tracker.stats_by_step, out)
-
-    def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
-        # Stdout progress (now on optimizer-step cadence)
-        stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
-        total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
-        update_progress(
-            "  \\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
-                self.params.batch_size, step_idx, total_opt_steps
-            ),
-            total_opt_steps,
-            step_idx + 1,
-        )
-        if step_idx < total_opt_steps - 1:
-            print()
-        print("      \\__Batch accuracy Index      : {:.03f}".format(stats.get('accuracy_index', 0.0)))
-        print("      \\__Classification loss       : {:.08f}".format(stats.get('classification_loss', 0.0)))
-        print("      \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get('wave_loss', 0.0)))
-        print("      \\__Total loss                : {:.08f}".format(stats.get('total_loss', 0.0)))
-        print("         ===================================================================")
-        print("      \\__Mean opt-step time        : {:.3f} sec".format(mean_step_time))
-        print("      \\__Elapsed time              : {}".format(sec2dhms(elapsed_time)))
-        print("      \\__ETA                       : {}".format(sec2dhms(eta)))
-        print("         ===================================================================")
-        update_stdout(10)
-
     # ---------- Helper: estimate W stats (full Gaussian) ----------
     @torch.no_grad()
     def _estimate_w_full_stats(self, generator, n_samples: int, batch_size: int, shrink: float = 0.01, jitter: float = 1e-6):
@@ -318,17 +278,26 @@ class Trainer(object):
 
     def _support_penalty(self, x, use_w, mu=None, R_precision=None, r2_thresh=None, p=2):
         """
-        Penalize leaving support: L = E[ ReLU(D^2 - r^2)^p ].
-        - p=1 or 2; r2_thresh is Mahalanobis^2 radius.
+        Penalize leaving support:  L = E[ ReLU(D^2 - r^2)^p ].
+        - W-space: D^2 = (x-μ)^T Σ^{-1} (x-μ) = ||R(x-μ)||^2
+        - Z-space: D^2 = ||x||^2
+        - p ∈ {1,2}
         """
         if use_w:
-            d2 = self._mahalanobis_sq(x, mu, R_precision)
+            d2 = self._mahalanobis_sq(x, mu, R_precision)   # [B]
         else:
-            d2 = (x).pow(2).sum(dim=-1)
-        exced = (d2 - r2_thresh).clamp_min(0.0)
+            d2 = (x * x).sum(dim=-1)
+
+        if r2_thresh is None:
+            # Failsafe: if unset, do not penalize
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+
+        # Ensure thresholds match device/dtype
+        r2 = r2_thresh.to(device=x.device, dtype=x.dtype)
+        exced = (d2 - r2).clamp_min(0.0)
         if p == 1:
-            return exced.mean()
-        return (exced * exced).mean()
+            return exced.sum()
+        return (exced).pow(p).sum()
 
     def contrastive_pretrain_potentials(self, generator, support_sets):
         """
@@ -344,22 +313,22 @@ class Trainer(object):
         generator = generator.to(device).eval()
 
         # ----------------- Hyperparameters -----------------
-        steps       = int(getattr(self.params, "pretrain_steps", 400))
-        B          = int(getattr(self.params, "pretrain_batch_size", 64))
+        steps       = int(getattr(self.params, "pretrain_steps", 200))
+        B          = int(getattr(self.params, "pretrain_batch_size", 32))
         lr          = float(getattr(self.params, "pretrain_lr", 1e-3))
         t_rand      = bool(getattr(self.params, "pretrain_time_random", True))
         cons_sigma  = float(getattr(self.params, "pretrain_consistency_sigma", 0.01))
         target_norm = float(getattr(self.params, "pretrain_target_grad_norm", 0.0))  # (unused by default)
         # contrastive weights
         lambda_orth = float(getattr(self.params, "pretrain_lambda_orth", 1.0))
-        lambda_in   = float(getattr(self.params, "pretrain_lambda_in", 2.0))
-        lambda_cons = float(getattr(self.params, "pretrain_lambda_consistency", 2.))
-        lambda_norm = float(getattr(self.params, "pretrain_lambda_norm", 0.1))
-        lambda_sup = float(getattr(self.params, "pretrain_lambda_support", 1.))
+        lambda_in   = float(getattr(self.params, "pretrain_lambda_in", 1.0))
+        lambda_cons = float(getattr(self.params, "pretrain_lambda_consistency", 1.0))
+        lambda_norm = float(getattr(self.params, "pretrain_lambda_norm", .0))
+        lambda_sup = float(getattr(self.params, "pretrain_lambda_support", .0))
         p_power = int(getattr(self.params, "pretrain_support_power", 2))
         # PDE/IC weights (default to WavePDE's current settings)
         lambda_pde  = float(getattr(self.params, "pretrain_lambda_pde",
-                                    getattr(support_sets, "lambda_pde", .1)))
+                                    getattr(support_sets, "lambda_pde", 1.)))
         lambda_ic   = float(getattr(self.params, "pretrain_lambda_ic",
                                     getattr(support_sets, "lambda_ic", 0.0)))
 
@@ -376,37 +345,54 @@ class Trainer(object):
         use_w = bool(getattr(generator, "shift_in_w_space", False))
         mu = Sigma_inv = R_prec = None
         r2_thresh = None
+        q = float(getattr(self.params, "pretrain_support_quantile", 0.9))
 
         if use_w:
             n_stats  = int(getattr(self.params, "pretrain_w_stats_samples", 50000))
             stats_bs = int(getattr(self.params, "pretrain_w_stats_batch", 1024))
             shrink   = float(getattr(self.params, "pretrain_w_stats_shrink", 0.01))
             print(f"   - Estimating W full-Gaussian stats with {n_stats} samples...")
-            mu, Sigma_inv, R_prec = self._estimate_w_full_stats(generator, n_stats, stats_bs, shrink=shrink, jitter=1e-6)
-        
-            # Optional: empirical r^2 from samples for support radius
-            # Re-sample a small set to compute empirical quantile of D^2 (keeps code self-contained).
+            mu, Sigma_inv, R_prec = self._estimate_w_full_stats(generator, n_stats, stats_bs,
+                                                                shrink=shrink, jitter=1e-6)
+
+            # Optional: empirical r^2 quantile in W
             n_q = min(20000, n_stats)
-            d2_vals = []
-            seen = 0
+            d2_vals, seen = [], 0
             with torch.no_grad():
                 while seen < n_q:
                     this_bs = min(stats_bs, n_q - seen)
-                    zq = sample_z(batch_size=this_bs, dim_z=generator.dim_z, truncation=self.params.z_truncation).to(self.device)
+                    zq = sample_z(batch_size=this_bs, dim_z=generator.dim_z,
+                                truncation=self.params.z_truncation).to(self.device)
                     wq = generator.get_w(zq)
-                    d2_vals.append(self._mahalanobis_sq(wq, mu, R_prec))
+                    d2_vals.append(self._mahalanobis_sq(wq, mu, R_prec))   # ||R (w - mu)||^2
                     seen += this_bs
             d2_all = torch.cat(d2_vals, dim=0)
-            q = float(getattr(self.params, "pretrain_support_quantile", 0.99))
             r2_thresh = torch.quantile(d2_all, q).detach()
-            # register buffers (optional)
+
+            # Register buffers (optional)
             support_sets.register_buffer("w_mu", mu)
             support_sets.register_buffer("w_Sigma_inv", Sigma_inv)
             support_sets.register_buffer("w_R_prec", R_prec)
             support_sets.register_buffer("w_r2_thresh", r2_thresh)
         else:
             print("   - Using Z prior N(0,I); no W stats needed.")
-            
+            # For Z ~ N(0,I_d), D^2 = ||z||^2 ~ Chi^2(df=d). Use chi-square quantile.
+            df = int(generator.dim_z)
+
+            t_q = torch.tensor(q, device=device, dtype=torch.float32)
+            df_t = torch.tensor(float(df), device=device, dtype=torch.float32)
+            # Fallback: Wilson–Hilferty approximation
+            normal0 = torch.distributions.Normal(
+                torch.tensor(0.0, device=device, dtype=torch.float32),
+                torch.tensor(1.0, device=device, dtype=torch.float32)
+            )
+            z = normal0.icdf(t_q)  # this is implemented
+            w = 1.0 - 2.0 / (9.0 * df_t) + z * torch.sqrt(2.0 / (9.0 * df_t))
+            # clamp to avoid tiny negative due to numerical noise before cubing
+            w = torch.clamp(w, min=1e-6)
+            r2_thresh = df_t * (w ** 3)/2
+            # Optionally cache as buffer
+            support_sets.register_buffer("z_r2_thresh", r2_thresh)
 
         # ----------------- Optimizer -----------------
         opt = torch.optim.AdamW(support_sets.parameters(), lr=lr, weight_decay=1e-5)
@@ -426,11 +412,7 @@ class Trainer(object):
             with torch.no_grad():
                 lat0 = generator.get_w(z, truncation_psi=self.params.z_truncation) if use_w else z  # [B, D]
 
-            # choose target timestep (shared across selected potentials this iter)
-            if t_rand:
-                t_idx_scalar = int(torch.randint(1, half_range, (1,), device=device).item())
-            else:
-                t_idx_scalar = 1
+
 
             # energy gradient at *selected* step locations will be computed later per-k
             # here we keep lat0 for rollouts
@@ -447,21 +429,20 @@ class Trainer(object):
             IC_list   = []  # scalars per k (optional)
             GP_list   = []  # [B, D] perturbed grads for consistency
             all_G_list = []  # [B*timesteps, D] all grads
-
+            Zk_all_list = []  # [B, D] locations at selected step
             opt.zero_grad(set_to_none=True)
             with autocast(device_type=device.type, enabled=use_amp):
                 for k in k_indices:
                     mlp_k = support_sets.MLP_SET[k]
                     c_k   = support_sets.c[k:k+1]  # [1,1]
 
-                    # Roll from i=0..t_idx_scalar, accumulating PDE; capture g at i=t
                     z_curr = lat0
                     pde_acc = 0.0
                     g_sel = None
                     z_sel = None
                     direction = np.random.choice([-1, 1])
                     denom=0
-                    for i_ind, i in enumerate((range(half_range) if direction == +1 else range(half_range, -1, -1))):
+                    for i_ind, i in enumerate((range(half_range) if direction == +1 else range(0, -half_range, -1))):
                         denom += 1
                         t_i = torch.full((B, 1), float(i), device=device, dtype=lat0.dtype, requires_grad=True)
 
@@ -472,27 +453,33 @@ class Trainer(object):
                         if i_ind == 0:
                             g_sel = u_z_i
                             z_sel = z_curr
-                        if lambda_norm > 0:
+
+                        if lambda_in > 0:
+                            Zk_all_list.append(z_curr)   # [B, D]
+                            
+                        if lambda_norm > 0 or lambda_in > 0:
                             all_G_list.append(u_z_i)
 
                     # match forward(): average over number of steps processed (≈ i)
-                    denom = max(1, denom)  # forward uses /max(1,i); i==t_idx_scalar
+                    denom = max(1, denom)  
                     PDE_list.append(pde_acc / denom)
 
                     Gk_list.append(g_sel)   # [B, D]
                     Zk_list.append(z_sel)   # [B, D]
-
                     # local consistency at selected step
-                    if cons_sigma > 0:
-                        z_pert = (z_sel + cons_sigma * torch.randn_like(z_sel)).detach().requires_grad_(True)
-                        t_i = torch.full((B, 1), float(half_range) if direction == +1 else 0, device=device, dtype=lat0.dtype, requires_grad=True)
-                        u, u_z = support_sets.inference(k, z_pert, t_i, generator=None, direction=-1*direction)
+                    if lambda_cons > 0:
+                        z_pert = (lat0+cons_sigma*torch.randn_like(lat0)).detach().requires_grad_(True)
+                        t_i = torch.full((B, 1), 0 if direction == +1 else 0, device=device, dtype=lat0.dtype, requires_grad=True)
+                        u_i, u_z_i, pde_res_i, z_curr = support_sets._per_step(mlp_k, z_pert, t_i, c_k, -1*direction)
+
                         
-                        GP_list.append(u_z)
+                        GP_list.append(u_z_i)
 
             # Stack across selected k: [B, K', D]
             G = torch.stack(Gk_list, dim=1)                     # grads at selected step
             Zs = torch.stack(Zk_list, dim=1)                    # locations at selected step
+            Z_all = torch.stack(Zk_all_list, dim=0)   
+            all_G = torch.stack(all_G_list, dim=0)                 # locations at selected step
             G_norm = G.norm(dim=-1, keepdim=True).clamp_min(eps)
             G_unit = G / G_norm
 
@@ -504,40 +491,26 @@ class Trainer(object):
 
             # In-distribution alignment at each k's selected location
             if use_w:
-                GE = (Zs - mu[None, None, :]) @ Sigma_inv   # [B,K',D]
+                GE = (Z_all - mu[None, None, :]) @ Sigma_inv   # [B,K',D]
             else:
-                GE = Zs
-            GE_unit = GE / GE.norm(dim=-1, keepdim=True).clamp_min(eps)
-            cos_g_GE = (G_unit * GE_unit).sum(dim=-1)       # [B,K']
+                GE = Z_all
+            all_G_unit = all_G / all_G.norm(dim=-1, keepdim=True).clamp_min(eps)
+            cos_g_GE = (GE * all_G_unit).sum(dim=-1)       # [B,K']
             L_in = (cos_g_GE.pow(2)).mean()
 
             # Consistency
-            if cons_sigma > 0:
+            if lambda_cons > 0:
                 GP = torch.stack(GP_list, dim=1)                # [B, K', D]
-                GP_unit = GP / GP.norm(dim=-1, keepdim=True).clamp_min(eps)
-                cos_cons = (G_unit * GP_unit).sum(dim=-1)       # [B, K']
-                L_cons = (1.0 - cos_cons).mean()
+                # GP_unit = GP / GP.norm(dim=-1, keepdim=True).clamp_min(eps)
+                cos_cons = (GP + G).pow(2).sum(dim=-1)       # [B, K']
+                L_cons = (cos_cons).mean()
             else:
                 L_cons = torch.zeros((), device=device, dtype=G.dtype)
 
 
-            if lambda_sup > 0:
-                # Zs: [B,K',D] -> compute on all K' and average
-                Zs_2D = Zs.reshape(-1, Zs.shape[-1])  # [B*K',D]
-                L_sup = self._support_penalty(Zs_2D, use_w, mu, R_prec, r2_thresh, p=p_power)
-            else:
-                L_sup = torch.zeros((), device=device, dtype=G.dtype)
-
             # Optional norm target for |g_k|
             
-            if lambda_norm > 0:
-                all_G_list = torch.stack(all_G_list, dim=0)
-                dim_last = all_G_list.shape[-1]**0.5
-                G_norm_all = all_G_list.norm(dim=-1, keepdim=True).clamp_min(eps)
-                G_norm_mean = G_norm_all.mean(dim=0, keepdim=True)
-                L_norm = ((G_norm_all - G_norm_mean) ** 2).mean()/dim_last
-            else:
-                L_norm = torch.zeros((), device=device, dtype=G.dtype)
+            L_norm = torch.zeros((), device=device, dtype=G.dtype)
 
             # PDE & IC aggregates
             L_pde = torch.stack(PDE_list).mean() if len(PDE_list) > 0 else torch.zeros((), device=device)
@@ -550,7 +523,7 @@ class Trainer(object):
                 + lambda_norm * L_norm
                 + lambda_pde  * L_pde
                 + lambda_ic   * L_ic
-                + lambda_sup  * L_sup) 
+                ) 
 
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -562,10 +535,9 @@ class Trainer(object):
                 print(f"[pretrain {it:06d}/{steps:06d}] "
                     f"loss={float(loss):.5f} | "
                     f"orth={float(L_orth):.5f} in={float(L_in):.5f} cons={float(L_cons):.5f} "
-                    f"norm={float(L_norm):.5f} pde={float(L_pde):.5f} ic={float(L_ic):.5f} "
-                    f"t={t_idx_scalar}  (dt={dt:.1f}s)"
-                    f"sup={float(L_sup):.5f}"
-                    f"cons={float(L_cons):.5f}"
+                    f"norm={float(L_norm):.5f} pde={float(L_pde):.5f} "
+                    f"cons={float(L_cons):.5f} "
+                    f"(dt={dt:.1f}s)"
                     )
                 t_print = time.time()
 
@@ -575,13 +547,88 @@ class Trainer(object):
 
         print("#. Contrastive pretraining complete.")
 
+
+    # -----------------------------------------------------------------------
+
+    def get_starting_iteration(
+        self,
+        support_sets,
+        reconstructor,
+        support_opt=None,
+        recon_opt=None,
+        support_sched=None,
+        recon_sched=None,
+    ):
+        """
+        Loads all available states from checkpoint:
+        - models (support_sets, reconstructor)
+        - optimizers (support_opt, recon_opt)   [if provided]
+        - schedulers (support_sched, recon_sched) [if provided]
+        Returns the stored optimizer-step index ('iter') or 1 if no checkpoint.
+        """
+        start_iter = 1
+        if osp.isfile(self.checkpoint):
+            ckpt = torch.load(self.checkpoint, map_location=self.device)
+            start_iter = int(ckpt.get('iter', 1))
+
+            # Model weights (allow non-strict to be robust to minor changes)
+            support_sets.load_state_dict(ckpt['support_sets'], strict=False)
+            reconstructor.load_state_dict(ckpt['reconstructor'], strict=False)
+
+            # Optimizers (if both objects and states exist)
+            if support_opt is not None and 'support_opt' in ckpt:
+                support_opt.load_state_dict(ckpt['support_opt'])
+            if recon_opt is not None and 'recon_opt' in ckpt:
+                recon_opt.load_state_dict(ckpt['recon_opt'])
+
+            # Schedulers (if both objects and states exist)
+            if support_sched is not None and 'support_sched' in ckpt:
+                support_sched.load_state_dict(ckpt['support_sched'])
+            if recon_sched is not None and 'recon_sched' in ckpt:
+                recon_sched.load_state_dict(ckpt['recon_sched'])
+
+        return start_iter
+    # ------------------------ helpers for TB visuals ------------------------
+    def _write_stats_json(self):
+        # Update training statistics json file (optimizer-step keyed)
+        with open(self.stats_json, 'w') as out:
+            json.dump(self.stat_tracker.stats_by_step, out)
+
+    def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
+        # Stdout progress (now on optimizer-step cadence)
+        stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
+        total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
+        update_progress(
+            "  \\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
+                self.params.batch_size, step_idx, total_opt_steps
+            ),
+            total_opt_steps,
+            step_idx + 1,
+        )
+        if step_idx < total_opt_steps - 1:
+            print()
+        print("      \\__Batch accuracy Index      : {:.03f}".format(stats.get('accuracy_index', 0.0)))
+        print("      \\__Classification loss       : {:.08f}".format(stats.get('classification_loss', 0.0)))
+        print("      \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get('wave_loss', 0.0)))
+        print("      \\__Total loss                : {:.08f}".format(stats.get('total_loss', 0.0)))
+        print("         ===================================================================")
+        print("      \\__Mean opt-step time        : {:.3f} sec".format(mean_step_time))
+        print("      \\__Elapsed time              : {}".format(sec2dhms(elapsed_time)))
+        print("      \\__ETA                       : {}".format(sec2dhms(eta)))
+        print("         ===================================================================")
+        update_stdout(10)
+
     def train(self, generator, support_sets, reconstructor):
         histograms = False
         save_images = True
         save_checkpoints = True
-        analytics = False
-        # Save initial `support_sets` model as `support_sets_init.pt`
-        torch.save(support_sets.state_dict(), osp.join(self.models_dir, 'support_sets_init.pt'))
+        analytics = True
+        if not osp.isfile(self.checkpoint):
+            self.contrastive_pretrain_potentials(generator, support_sets)
+            # Save initial `support_sets` model as `support_sets_init.pt`
+            torch.save(support_sets.state_dict(), osp.join(self.models_dir, 'support_sets_init.pt'))
+        else:
+            print("#. checkpoint found, skipping contrastive pretraining.")
 
         # Set modes/devices
         generator = generator.to(self.device).eval()
@@ -594,7 +641,7 @@ class Trainer(object):
 
         # Optimizers
         # Starting iter (maybe resume)
-        starting_iter = self.get_starting_iteration(support_sets, reconstructor)
+        
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
         # === before the loop, after K is known ===
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
@@ -613,28 +660,27 @@ class Trainer(object):
         k_seq = None
         k_ptr = 0
         win_len = None  # number of micro-steps in the current window (handles last partial window)
-
         # --- create optimizer(s) first ---
-        support_sets_optim = torch.optim.AdamW(support_sets.parameters(), lr=self.params.support_set_lr, weight_decay=0.0)
-        reconstructor_optim = torch.optim.AdamW(reconstructor.parameters(), lr=self.params.reconstructor_lr)
+        support_sets_optim = torch.optim.AdamW(support_sets.parameters(), lr=self.params.support_set_lr, weight_decay=0.001)
+        reconstructor_optim = torch.optim.Adam(reconstructor.parameters(), lr=self.params.reconstructor_lr)
 
-        # --- scheduler should count OPTIMIZER steps, not micro-steps ---
+        # --- create schedulers ---
         total_opt_steps = math.ceil(self.params.max_iter / acc_steps)
         warmup_steps = math.ceil(self.params.warmup_fraction * total_opt_steps)
+        sched_support = CosineScheduleWithWarmup(support_sets_optim, num_warmup_steps=warmup_steps,
+                                                num_training_steps=total_opt_steps, last_epoch=-1)
+        sched_recon   = CosineScheduleWithWarmup(reconstructor_optim, num_warmup_steps=warmup_steps,
+                                                num_training_steps=total_opt_steps, last_epoch=-1)
 
-        # before the loop
-        completed_micro = starting_iter - 1
-        opt_step_idx = completed_micro // acc_steps   # number of optimizer steps already done
-
-        # init schedulers with the right position (if not loading state)
-        sched_support = CosineScheduleWithWarmup(
-            support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps,
-            last_epoch= - 1  # so next .step() advances to opt_step_idx
+        # --- NOW load everything (models + opts + schedulers) if checkpoint exists ---
+        starting_iter = self.get_starting_iteration(
+            support_sets, reconstructor,
+            # support_opt=support_sets_optim,
+            # recon_opt=reconstructor_optim,
+            # support_sched=sched_support,
+            # recon_sched=sched_recon,
         )
-        sched_recon = CosineScheduleWithWarmup(
-            reconstructor_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps,
-            last_epoch= - 1
-        )
+        starting_iter = starting_iter*acc_steps
 
         # zero grads ONCE before the loop
         support_sets_optim.zero_grad(set_to_none=True)
@@ -674,7 +720,7 @@ class Trainer(object):
             # Sample index k and timestep t
             # ---- start of accumulation window? ----
             # micro_idx counts 1..N over micro-steps
-            window_start = ((micro_idx - 1) % acc_steps) == 0
+            window_start = ((micro_idx - 1) % support_sets.num_support_sets) == 0
 
             if window_start:
                 imgs_orig = [[] for _ in range(VIS_IMAGE_N)]
@@ -682,7 +728,7 @@ class Trainer(object):
                 imgs_step2 = [[] for _ in range(VIS_IMAGE_N)]
                 # how many micro-steps remain including this one?
                 micros_left = self.params.max_iter - iteration + 1
-                win_len = min(acc_steps, micros_left)
+                win_len = min(support_sets.num_support_sets, micros_left)
 
                 # 1) sample z ONCE per window
                 current_z = sample_z(batch_size=self.params.batch_size,
@@ -822,7 +868,7 @@ class Trainer(object):
                         self.tb_writer.add_scalar("train/c_stats/max", float(c_vals.max()), opt_step_idx)
 
                         # Periodic snapshots for heatmap/confusion
-                        if (micro_idx-1//acc_steps % self.params.log_freq) == 0:
+                        if (micro_idx//acc_steps % self.params.log_freq) == 0:
                             self.stat_tracker.snapshot_per_k_history(opt_step_idx)
 
                         # Optional histograms
@@ -841,7 +887,7 @@ class Trainer(object):
                             self.tb_writer.add_histogram("meta/true_k", target.detach().cpu().numpy(), opt_step_idx)
 
                     # Images & figures (on optimizer-step cadence)
-                    if save_images and ((micro_idx-1)//acc_steps % self.params.log_freq) == 0:
+                    if save_images and ((micro_idx)//acc_steps % self.params.log_freq) == 0:
                         self._log_image_triplet(self.tb_writer, "images", torch.cat(imgs_orig), torch.cat(imgs_step1), torch.cat(imgs_step2),
                                                 opt_step_idx, n_vis=min(VIS_IMAGE_N, self.params.batch_size))
 

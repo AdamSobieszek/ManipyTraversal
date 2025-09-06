@@ -1,18 +1,23 @@
 gan_type="SNGAN_AnimeFaces"
-num_support_sets=10
-num_support_timesteps=10
-warmup_fraction=0.01
-accumulate_grad_steps=10
+num_support_sets=45
+num_support_timesteps=6
+warmup_fraction=0.005
+accumulate_grad_steps=15
 reconstructor_type="LeNet"
 batch_size=32
-max_iter=120000
+max_iter=32000
 tensorboard=true
+new_experiment=false
 # ================================
 
 
 tb=""
 if $tensorboard ; then
   tb="--tensorboard"
+fi
+new=""
+if $new_experiment ; then
+  new="--new-experiment"
 fi
 
 python train.py $tb \
@@ -24,8 +29,8 @@ python train.py $tb \
                 --max-iter=${max_iter} \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
-                --log-freq=10 \
+                --log-freq=15 \
                 --ckp-freq=100 \
                 --mps \
                 --no-cuda \
-                --new-experiment
+                $new

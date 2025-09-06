@@ -63,7 +63,16 @@ def create_exp_dir(args, new_experiment=False):
     exp_dir += "-K{}-D{}".format(args.num_support_sets, args.num_support_timesteps)
     if new_experiment:
         exp_dir += f"__{time.strftime('%Y%m%d_%H%M%S')}"
-
+    else:
+        # grep all folders that start with exp_dir
+        exp_dirs = [d for d in os.listdir("experiments/wip") if d.startswith(exp_dir)]
+        # exclude folders that do not contain checkpoint.pt as a file in their recursive folder structure
+        exp_dirs = [d for d in exp_dirs if osp.isfile(osp.join("experiments/wip", d, "models", "checkpoint.pt"))]
+        # sort by last modified time
+        exp_dirs.sort(key=lambda x: os.path.getmtime(osp.join("experiments/wip", x)))
+        #  set exp_dir to the newest folder
+        exp_dir = exp_dirs[-1]
+        print(f"Using existing experiment: {exp_dir}\n"+"-"*30+"\n"*2)
     # Create output directory (wip)
     wip_dir = osp.join("experiments", "wip", exp_dir)
     os.makedirs(wip_dir, exist_ok=True)
