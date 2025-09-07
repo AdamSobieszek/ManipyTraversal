@@ -60,12 +60,12 @@ def main():
     # === Support Sets (S) ======================================================================== #
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=2.5e-4, help="set learning rate")
+    parser.add_argument('--support-set-lr', type=float, default=6e-4, help="set learning rate")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
-    parser.add_argument('--reconstructor-lr', type=float, default=2.5e-4,
+    parser.add_argument('--reconstructor-lr', type=float, default=6e-4,
                         help="set learning rate for reconstructor R optimization")
 
     # === Training =================================================================================================== #
@@ -78,8 +78,13 @@ def main():
     parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
     parser.add_argument('--log-freq', default=20, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
-    parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
+    # === Restart ===================================================================================================== #
+    parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
+    parser.add_argument('--reset_lr', action='store_true', help="reset learning rate")
+    parser.add_argument('--reset_weight_decay', action='store_true', help="reset weight decay")
+    parser.add_argument('--reset_schedulers', action='store_true', help="reset schedulers")
+    parser.add_argument('--reset_start_iter', action='store_true', help="reset start iteration")
 
     # === Device ===================================================================================================== #
     parser.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA during training")
@@ -114,9 +119,12 @@ def main():
 
     # Set default tensor type for CUDA only (no MPS default tensor type exists)
     if use_cuda:
-        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        torch.set_default_device(torch.device('cuda'))
+    elif use_mps:
+        torch.set_default_device(torch.device('mps'))
+        torch.set_default_dtype(torch.float32)
     else:
-        torch.set_default_tensor_type('torch.FloatTensor')
+        torch.set_default_device(torch.device('cpu'))
 
     multi_gpu = use_cuda and (torch.cuda.device_count() > 1)
 

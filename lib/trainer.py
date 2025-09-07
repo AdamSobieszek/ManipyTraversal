@@ -15,34 +15,12 @@ from tensorboard import program
 from torchvision.utils import make_grid
 
 from .aux import sample_z, TrainingStatTracker, update_progress, update_stdout, sec2dhms
+from .aux import CosineScheduleWithWarmup, build_adamw
+from .validity_loss import KLPath
 
-from torch.optim.lr_scheduler import _LRScheduler
 
 VIS_IMAGE_N = 15
 
-class CosineScheduleWithWarmup(_LRScheduler):
-    """
-    A custom learning rate scheduler that implements a linear warmup followed
-    by a cosine decay. This avoids the need for the `transformers` library.
-    """
-    def __init__(self, optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
-        self.num_warmup_steps = num_warmup_steps
-        self.num_training_steps = num_training_steps
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        if self.last_epoch < self.num_warmup_steps:
-            progress = float(self.last_epoch) / float(max(1, self.num_warmup_steps))
-            return [base_lr * progress for base_lr in self.base_lrs]
-        
-        progress = float(self.last_epoch - self.num_warmup_steps) / float(max(1, self.num_training_steps - self.num_warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        
-        return [base_lr * cosine_decay for base_lr in self.base_lrs]
-
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
-    return CosineScheduleWithWarmup(optimizer, num_warmup_steps, num_training_steps, last_epoch)
-    
 
 class DataParallelPassthrough(nn.DataParallel):
     def __getattr__(self, name):
@@ -258,46 +236,6 @@ class Trainer(object):
         R = torch.linalg.cholesky(Sigma_inv)         # precision factor
 
         return mu, Sigma_inv, R
-    # ---------- Helper: energy gradient (Gaussian / full-Gaussian) ----------
-    def _latent_energy_grad(self, latents, use_w, mu=None, Sigma_inv=None):
-        """
-        Returns ∇E(latent) for Gaussian energy E = 0.5 (x - μ)^T Σ^{-1} (x - μ).
-        - Z-space (prior N(0,I)): ∇E = z.
-        - W-space full Gaussian:  ∇E = (w - μ) Σ^{-1}.
-        """
-        if not use_w:
-            return latents  # z
-        # full precision
-        diff = latents - mu[None, :]                      # [B, D]
-        return diff @ Sigma_inv                           # [B, D]
-    # ---------- Helper: Mahalanobis distance and support penalty ----------
-    def _mahalanobis_sq(self, x, mu, R_precision):  # x: [B,D]
-        diff = x - mu[None, :]
-        y = diff @ R_precision.T                     # y = R (x - mu)
-        return (y * y).sum(dim=-1)                   # [B]
-
-    def _support_penalty(self, x, use_w, mu=None, R_precision=None, r2_thresh=None, p=2):
-        """
-        Penalize leaving support:  L = E[ ReLU(D^2 - r^2)^p ].
-        - W-space: D^2 = (x-μ)^T Σ^{-1} (x-μ) = ||R(x-μ)||^2
-        - Z-space: D^2 = ||x||^2
-        - p ∈ {1,2}
-        """
-        if use_w:
-            d2 = self._mahalanobis_sq(x, mu, R_precision)   # [B]
-        else:
-            d2 = (x * x).sum(dim=-1)
-
-        if r2_thresh is None:
-            # Failsafe: if unset, do not penalize
-            return torch.zeros((), device=x.device, dtype=x.dtype)
-
-        # Ensure thresholds match device/dtype
-        r2 = r2_thresh.to(device=x.device, dtype=x.dtype)
-        exced = (d2 - r2).clamp_min(0.0)
-        if p == 1:
-            return exced.sum()
-        return (exced).pow(p).sum()
 
     def contrastive_pretrain_potentials(self, generator, support_sets):
         """
@@ -566,26 +504,38 @@ class Trainer(object):
         - schedulers (support_sched, recon_sched) [if provided]
         Returns the stored optimizer-step index ('iter') or 1 if no checkpoint.
         """
+        def safe_load_state_dict(obj, ckpt, name, strict=True):
+            if obj is not None and name in ckpt:
+                try:
+                    # if strict is an available argument for load_state_dict, use it
+                    if hasattr(obj, 'load_state_dict') and hasattr(obj.load_state_dict, 'strict'):
+                        incompatibilities = obj.load_state_dict(ckpt[name], strict=strict)
+                    else:
+                        incompatibilities = obj.load_state_dict(ckpt[name])
+                    if incompatibilities:
+                        if str(incompatibilities) != "<All keys matched successfully>":
+                            print(f"Warning: {name} loaded state_dict with non-strict mode")
+                            print(f"Incompatibilities: {incompatibilities}")
+                    
+                except Exception as e:
+                    print(f"Error loading state_dict for {name}: {e}")
+
         start_iter = 1
         if osp.isfile(self.checkpoint):
             ckpt = torch.load(self.checkpoint, map_location=self.device)
             start_iter = int(ckpt.get('iter', 1))
 
             # Model weights (allow non-strict to be robust to minor changes)
-            support_sets.load_state_dict(ckpt['support_sets'], strict=False)
-            reconstructor.load_state_dict(ckpt['reconstructor'], strict=False)
+            safe_load_state_dict(support_sets, ckpt, 'support_sets', strict=False)
+            safe_load_state_dict(reconstructor, ckpt, 'reconstructor', strict=False)
 
             # Optimizers (if both objects and states exist)
-            if support_opt is not None and 'support_opt' in ckpt:
-                support_opt.load_state_dict(ckpt['support_opt'])
-            if recon_opt is not None and 'recon_opt' in ckpt:
-                recon_opt.load_state_dict(ckpt['recon_opt'])
+            safe_load_state_dict(support_opt, ckpt, 'support_opt')
+            safe_load_state_dict(recon_opt, ckpt, 'recon_opt')
 
             # Schedulers (if both objects and states exist)
-            if support_sched is not None and 'support_sched' in ckpt:
-                support_sched.load_state_dict(ckpt['support_sched'])
-            if recon_sched is not None and 'recon_sched' in ckpt:
-                recon_sched.load_state_dict(ckpt['recon_sched'])
+            safe_load_state_dict(support_sched, ckpt, 'support_sched')
+            safe_load_state_dict(recon_sched, ckpt, 'recon_sched')
 
         return start_iter
     # ------------------------ helpers for TB visuals ------------------------
@@ -595,31 +545,77 @@ class Trainer(object):
             json.dump(self.stat_tracker.stats_by_step, out)
 
     def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
-        # Stdout progress (now on optimizer-step cadence)
+        if step_idx >1:
+            update_stdout(10)
         stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
         total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
         update_progress(
-            "  \\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
+            "\\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
                 self.params.batch_size, step_idx, total_opt_steps
             ),
             total_opt_steps,
             step_idx + 1,
         )
-        if step_idx < total_opt_steps - 1:
-            print()
-        print("      \\__Batch accuracy Index      : {:.03f}".format(stats.get('accuracy_index', 0.0)))
-        print("      \\__Classification loss       : {:.08f}".format(stats.get('classification_loss', 0.0)))
-        print("      \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get('wave_loss', 0.0)))
-        print("      \\__Total loss                : {:.08f}".format(stats.get('total_loss', 0.0)))
-        print("         ===================================================================")
-        print("      \\__Mean opt-step time        : {:.3f} sec".format(mean_step_time))
-        print("      \\__Elapsed time              : {}".format(sec2dhms(elapsed_time)))
-        print("      \\__ETA                       : {}".format(sec2dhms(eta)))
-        print("         ===================================================================")
-        update_stdout(10)
+        # Stdout progress (now on optimizer-step cadence)
+        print()
+        print("   \\__Batch accuracy Index      : {:.03f}".format(stats.get('accuracy_index', 0.0)))
+        print("   \\__Classification loss       : {:.08f}".format(stats.get('classification_loss', 0.0)))
+        print("   \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get('wave_loss', 0.0)))
+        print("   \\__Total loss                : {:.08f}".format(stats.get('total_loss', 0.0)))
+        print("      ==============================================================")
+        print("   \\__Opt-step time  : {:.3f} sec".format(mean_step_time))
+        print("   \\__Elapsed time   : {}".format(sec2dhms(elapsed_time)[:-6]))
+        print("   \\__ETA            : {}".format(sec2dhms(eta)[:-6]))
+        print("      ==============================================================")
+        
+
+
+    def loss(self, support_sets, generator, reconstructor, index, z, time_stamp, acc_steps):
+        kl_space        = getattr(self.params, "kl_space", "latent")            # "latent" | "image"
+        lambda_kl       = float(getattr(self.params, "lambda_kl", 0.0))         # main weight
+        kl_bandwidth    = getattr(self.params, "kl_bandwidth", None)            # for kde: None/"median"/"scott"/float
+        kl_detach_ref   = bool(getattr(self.params, "kl_detach_reference", True))  # don't backprop through initial set
+
+        energy, latent1, latent2, loss_wave = support_sets(index.item(), z, time_stamp, generator)
+
+        # Images after step 1 and 2
+        img_step1 = generator(latent1)
+        img_step2 = generator(latent2)
+
+
+        # === KL path loss (latent or image space) ===
+        if lambda_kl > 0.0:
+            if kl_space == "latent":
+                initial_samples     = latent1
+                manipulated_samples = latent2
+            elif kl_space == "image":
+                initial_samples     = img_step1
+                manipulated_samples = img_step2
+            else:
+                raise ValueError(f"Unknown kl_space={kl_space}, expected 'latent' or 'image'.")
+
+            kl_loss = self.kl_loss_fn(initial_samples, manipulated_samples)
+        else:
+            kl_loss = torch.tensor(0.0, device=self.device)
+
+
+        # Classifier (unchanged)
+        predicted_support_sets_indices, _ = reconstructor(img_step1, img_step2)
+        target = index.repeat(self.params.batch_size)
+        classification_loss = self.cross_entropy(predicted_support_sets_indices, target)
+
+        # === Total loss (with KL) ===
+        loss = (
+            self.params.lambda_cls * classification_loss
+            + self.params.lambda_pde * loss_wave
+            + lambda_kl * kl_loss
+        )
+        loss = loss / acc_steps
+        loss.backward()
+        return loss, classification_loss, loss_wave, kl_loss, predicted_support_sets_indices, target, latent1, latent2
 
     def train(self, generator, support_sets, reconstructor):
-        histograms = False
+        histograms = True
         save_images = True
         save_checkpoints = True
         analytics = True
@@ -660,27 +656,124 @@ class Trainer(object):
         k_seq = None
         k_ptr = 0
         win_len = None  # number of micro-steps in the current window (handles last partial window)
-        # --- create optimizer(s) first ---
-        support_sets_optim = torch.optim.AdamW(support_sets.parameters(), lr=self.params.support_set_lr, weight_decay=0.001)
-        reconstructor_optim = torch.optim.Adam(reconstructor.parameters(), lr=self.params.reconstructor_lr)
 
-        # --- create schedulers ---
+        # --- hyperparams for wd (with sensible defaults) ---
+        support_set_wd  = float(getattr(self.params, "support_set_wd", 0.05))
+        reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.0001))
+        betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
+        eps = float(getattr(self.params, "adam_eps", 1e-8))
+
+        # --- restart flags (all default False) ---
+        reset_lr          = bool(getattr(self.params, "reset_lr", False))
+        reset_weight_decay = bool(getattr(self.params, "reset_weight_decay", False))
+        reset_schedulers  = bool(getattr(self.params, "reset_schedulers", False))
+        reset_start_iter  = bool(getattr(self.params, "reset_start_iter", False))
+
+        # --- create optimizer(s) with split weight decay ---
+        support_sets_optim = build_adamw(
+            support_sets,
+            lr=self.params.support_set_lr,
+            weight_decay=support_set_wd,
+            extra_no_decay_names=(),                      
+            extra_no_decay_params=(getattr(support_sets, "c", None),),  
+            betas=betas,
+            eps=eps,
+        )
+        reconstructor_optim = build_adamw(
+            reconstructor,
+            lr=self.params.reconstructor_lr,
+            weight_decay=reconstructor_wd,
+            extra_no_decay_names=(),
+            betas=betas,
+            eps=eps,
+        )
+
+        # --- create schedulers (we may re-init them below if needed) ---
         total_opt_steps = math.ceil(self.params.max_iter / acc_steps)
         warmup_steps = math.ceil(self.params.warmup_fraction * total_opt_steps)
-        sched_support = CosineScheduleWithWarmup(support_sets_optim, num_warmup_steps=warmup_steps,
-                                                num_training_steps=total_opt_steps, last_epoch=-1)
-        sched_recon   = CosineScheduleWithWarmup(reconstructor_optim, num_warmup_steps=warmup_steps,
-                                                num_training_steps=total_opt_steps, last_epoch=-1)
-
-        # --- NOW load everything (models + opts + schedulers) if checkpoint exists ---
-        starting_iter = self.get_starting_iteration(
-            support_sets, reconstructor,
-            # support_opt=support_sets_optim,
-            # recon_opt=reconstructor_optim,
-            # support_sched=sched_support,
-            # recon_sched=sched_recon,
+        sched_support = CosineScheduleWithWarmup(
+            support_sets_optim, num_warmup_steps=warmup_steps,
+            num_training_steps=total_opt_steps, last_epoch=-1
         )
-        starting_iter = starting_iter*acc_steps
+        sched_recon = CosineScheduleWithWarmup(
+            reconstructor_optim, num_warmup_steps=warmup_steps,
+            num_training_steps=total_opt_steps, last_epoch=-1
+        )
+
+        # --- load models/opts/schedulers if checkpoint exists ---
+        starting_opt_step = self.get_starting_iteration(
+            support_sets, reconstructor,
+            support_opt=support_sets_optim,
+            recon_opt=reconstructor_optim,
+            support_sched=sched_support,
+            recon_sched=sched_recon,
+        )
+
+        # ===== apply restart logic =====
+        # If only LR is reset: keep optimizer state but overwrite group LRs and
+        # update schedulers' base_lrs so cosine scale uses the new starting LR.
+        if reset_lr:
+            for g in support_sets_optim.param_groups:
+                g["lr"] = float(self.params.support_set_lr)
+            for g in reconstructor_optim.param_groups:
+                g["lr"] = float(self.params.reconstructor_lr)
+            # keep schedule progress unless also resetting schedulers
+            if not reset_schedulers:
+                sched_support.base_lrs = [pg["lr"] for pg in support_sets_optim.param_groups]
+                sched_recon.base_lrs   = [pg["lr"] for pg in reconstructor_optim.param_groups]
+
+        # If WD is reset: rebuild optimizers (this naturally drops moment state,
+        # which is typically what you want when "restarting" WD).
+        if reset_weight_decay:
+            support_sets_optim = build_adamw(
+                support_sets, lr=self.params.support_set_lr, weight_decay=support_set_wd,
+                extra_no_decay_names=("c",), betas=betas, eps=eps
+            )
+            reconstructor_optim = build_adamw(
+                reconstructor, lr=self.params.reconstructor_lr, weight_decay=reconstructor_wd,
+                extra_no_decay_names=(), betas=betas, eps=eps
+            )
+
+
+
+        half_range = self.params.num_support_timesteps // 2
+
+        kl_mode         = getattr(self.params, "kl_mode", "gaussian")           # "gaussian" | "kde"
+        kl_symmetric    = bool(getattr(self.params, "kl_symmetric", True))      # KL(P||Q) + KL(Q||P)
+        kl_bandwidth    = getattr(self.params, "kl_bandwidth", None)            # for kde: None/"median"/"scott"/float
+        kl_detach_ref   = bool(getattr(self.params, "kl_detach_reference", True))  # don't backprop through initial set
+        self.kl_loss_fn = KLPath(
+            mode=kl_mode,
+            symmetric=kl_symmetric,
+            bandwidth=kl_bandwidth,
+            detach_reference=kl_detach_ref,
+        )
+
+        # If schedulers are reset: re-init them from step 0 (warmup restarts).
+        if reset_schedulers or reset_weight_decay:
+            sched_support = CosineScheduleWithWarmup(
+                support_sets_optim, num_warmup_steps=warmup_steps,
+                num_training_steps=total_opt_steps, last_epoch=-1
+            )
+            sched_recon = CosineScheduleWithWarmup(
+                reconstructor_optim, num_warmup_steps=warmup_steps,
+                num_training_steps=total_opt_steps, last_epoch=-1
+            )
+            # also reset the stored opt-step index so logs align
+            if not reset_start_iter:
+                # If you restarted schedulers but didn't explicitly request iteration reset,
+                # we'll keep the iteration unless you *also* restarted WD (fresh start).
+                if reset_weight_decay:
+                    starting_opt_step = 0
+
+        # start position (convert optimizer-step index -> micro-step index)
+        if reset_start_iter:
+            starting_micro = 1
+            opt_step_idx = 0
+        else:
+            # Resume *after* the last finished optimizer step
+            starting_micro = starting_opt_step * acc_steps + 1
+            opt_step_idx = starting_opt_step
 
         # zero grads ONCE before the loop
         support_sets_optim.zero_grad(set_to_none=True)
@@ -696,8 +789,8 @@ class Trainer(object):
             reconstructor = DataParallelPassthrough(reconstructor)
             cudnn.benchmark = True
 
-        # Early exit if complete
-        if starting_iter == self.params.max_iter:
+        # Early exit if already done
+        if starting_micro > self.params.max_iter:
             print("#. This experiment has already been completed and can be found @ {}".format(self.wip_dir))
             print("#. Copy {} to {}...".format(self.wip_dir, self.complete_dir))
             try:
@@ -706,14 +799,16 @@ class Trainer(object):
             except IOError as e:
                 print("  \\__Already exists -- {}".format(e))
             sys.exit()
-        print("#. Start training from iteration {}".format(starting_iter))
 
-        t0 = time.time()
-        
+        print("#. Start training from micro-step {}".format(starting_micro))
+        print(f"#. Training loop: {starting_micro} to {self.params.max_iter}")
 
-        # Training loop
-        print(f"#. Training loop: {starting_iter} to {self.params.max_iter}")
-        for micro_idx, iteration in enumerate(range(starting_iter, self.params.max_iter + 1), start=1):
+        # zero grads ONCE before the loop
+        support_sets_optim.zero_grad(set_to_none=True)
+        reconstructor_optim.zero_grad(set_to_none=True)
+
+        # === main loop ===
+        for micro_idx, iteration in enumerate(range(starting_micro, self.params.max_iter + 1), start=1):
             iter_t0 = time.time()
 
 
@@ -759,37 +854,27 @@ class Trainer(object):
             k_ptr += 1
 
             index = torch.tensor([k], device=self.device)
-            half_range = self.params.num_support_timesteps // 2
             t_idx = torch.randint(0, max(1, half_range - 1), (1,), device=self.device)
             time_stamp = t_idx.to(z).repeat(self.params.batch_size, 1)
 
-            # Wave traversal step
-            energy, latent1, latent2, loss_wave = support_sets(index.item(), z, time_stamp, generator)
 
-            # Images after step 1 and 2
+            # KL loss and outputs
+            (loss, classification_loss, loss_wave, kl_loss,
+             logits, target, latent1, latent2) = self.loss(
+                support_sets, generator, reconstructor, index, z, time_stamp, acc_steps
+            )
+
+            # For visual logging (keep here)
             img_step1 = generator(latent1)
             img_step2 = generator(latent2)
-
-            # Store images for visualization
             if k < VIS_IMAGE_N:
                 imgs_step1[k] = img_step1[:1]
                 imgs_step2[k] = img_step2[:1]
 
-            # Classifier
-            predicted_support_sets_indices, _ = reconstructor(img_step1, img_step2)
 
-            # Targets
-            target = index.repeat(self.params.batch_size)
-            classification_loss = self.cross_entropy(predicted_support_sets_indices, target)
-
-
-            loss = self.params.lambda_cls * classification_loss + self.params.lambda_pde * loss_wave
-            loss = loss / acc_steps
-            loss.backward()
 
             # ---- Enhanced analytics (safe device handling) ----            
             with torch.no_grad():
-                logits = predicted_support_sets_indices
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(logits, dim=1)
                 entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=1).mean()
@@ -811,17 +896,17 @@ class Trainer(object):
                                 g2 += float(p.grad.detach().to('cpu').pow(2).sum())
                         grad_norm_selected = math.sqrt(max(g2, 1e-12))
 
-                # Accumulate micro-step means into the tracker (unscaled totals for readability)
                 self.stat_tracker.add_micro(
                     acc=float((preds == index.item()).float().mean().item()),
                     classification_loss=float(classification_loss.item()),
                     wave_loss=float(loss_wave.item()),
-                    total_loss=float((self.params.lambda_cls * classification_loss + self.params.lambda_pde * loss_wave).item()),
+                    kl_loss=float(kl_loss.item()),
+                    total_loss=float((loss).item()),
                     entropy=float(entropy.item()),
                     step1_norm=step1_norm,
                     step2_norm=step2_norm,
                 )
-
+                
                 # Per-MLP analytics in tracker (CPU numpy)
                 self.stat_tracker.update_per_k_after_micro(
                     true_k=int(index.item()),
@@ -829,15 +914,27 @@ class Trainer(object):
                     batch_size=int(self.params.batch_size),
                     grad_norm_selected_mlp=grad_norm_selected if analytics else None,
                 )
-                
+            
             if (micro_idx % acc_steps == 0) or (iteration == self.params.max_iter):
-                # Optimizer step (after acc_steps micro-steps, or at the very end)
+                if analytics and self.tensorboard:
+                    # Global grad norms (CPU, correct L2 norm)
+                    def module_grad_norm(mod):
+                        total_sq = 0.0
+                        for p in mod.parameters():
+                            if p.grad is not None:
+                                total_sq += float(p.grad.detach().to('cpu').pow(2).sum().item())
+                        return math.sqrt(total_sq)
+                    gn_support = module_grad_norm(support_sets)
+                    gn_recon = module_grad_norm(reconstructor)
+                    self.tb_writer.add_scalar("train/grad_norm/support_sets", gn_support, opt_step_idx)
+                    self.tb_writer.add_scalar("train/grad_norm/reconstructor", gn_recon, opt_step_idx)
+                    
+                    
                 support_sets_optim.step()
                 reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True)
                 reconstructor_optim.zero_grad(set_to_none=True)
 
-                # LR schedulers step once per optimizer step
                 sched_support.step()
                 sched_recon.step()
                 opt_step_idx += 1

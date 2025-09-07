@@ -5,6 +5,9 @@ import json
 import argparse
 import numpy as np
 import torch
+from torch import nn
+from torch.optim.lr_scheduler import _LRScheduler
+
 import math
 import time
 from scipy.stats import truncnorm
@@ -134,6 +137,7 @@ class TrainingStatTracker(object):
             'accuracy_index': 0.0,
             'classification_loss': 0.0,
             'wave_loss': 0.0,
+            'kl_loss': 0.0,
             'total_loss': 0.0,
             'entropy': 0.0,
             'step1_norm': 0.0,
@@ -146,6 +150,7 @@ class TrainingStatTracker(object):
         acc: float,
         classification_loss: float,
         wave_loss: float,
+        kl_loss: float,
         total_loss: float,
         entropy: float = 0.0,
         step1_norm: float = 0.0,
@@ -156,6 +161,7 @@ class TrainingStatTracker(object):
         self.win_sum['accuracy_index'] += float(acc)
         self.win_sum['classification_loss'] += float(classification_loss)
         self.win_sum['wave_loss'] += float(wave_loss)
+        self.win_sum['kl_loss'] += float(kl_loss)
         self.win_sum['total_loss'] += float(total_loss)
         self.win_sum['entropy'] += float(entropy)
         self.win_sum['step1_norm'] += float(step1_norm)
@@ -396,3 +402,109 @@ def create_summarizing_gif(imgs_root, gif_filename, num_imgs=None, gif_size=None
         optimize=False,
         loop=0,
         duration=1000 // gif_fps)
+
+
+# -----------------------------
+# Hyperparameter helper function
+# --------------------------------
+
+def _norm_classes():
+    return (
+        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm,
+        nn.LayerNorm, nn.GroupNorm,
+        nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
+        nn.LocalResponseNorm
+    )
+
+def split_weight_decay_groups(
+    model: nn.Module,
+    weight_decay: float,
+    extra_no_decay_names=(),
+    extra_no_decay_params=(),
+    include_1d_as_no_decay=True,
+):
+    """
+    Build AdamW param groups:
+      - Decay: 'true' weights.
+      - No-decay: biases, norm params, explicitly provided params, and (optionally) 1D tensors.
+    Uses PARAM IDENTITY to ensure correct bucketing.
+    """
+    norm_types = _norm_classes()
+
+    # 1) Collect no-decay by identity
+    no_decay_ids = set(id(p) for p in extra_no_decay_params if p is not None)
+
+    # 2) Add norm layer params by identity
+    for m in model.modules():
+        if isinstance(m, norm_types):
+            for p in m.parameters(recurse=False):
+                no_decay_ids.add(id(p))
+
+    # 3) Add by name rules (bias, and explicit name matches)
+    name_rules = set(extra_no_decay_names or ())
+    def name_is_extra(n: str) -> bool:
+        # exact or endswith(".name")
+        return (n in name_rules) or any(n.endswith(f".{x}") for x in name_rules)
+
+    # 4) Final pass: bucket by identity (primary), with optional 1D rule
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        if id(p) in no_decay_ids or n.endswith("bias") or name_is_extra(n) \
+           or (include_1d_as_no_decay and p.ndim == 1):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+def build_adamw(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+    extra_no_decay_names=(),
+    extra_no_decay_params=(),
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    include_1d_as_no_decay=True,
+):
+    groups = split_weight_decay_groups(
+        model, weight_decay,
+        extra_no_decay_names=extra_no_decay_names,
+        extra_no_decay_params=extra_no_decay_params,
+        include_1d_as_no_decay=include_1d_as_no_decay,
+    )
+    # Global WD = 0.0; we rely on group-level WD only.
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+
+
+
+class CosineScheduleWithWarmup(_LRScheduler):
+    """
+    A custom learning rate scheduler that implements a linear warmup followed
+    by a cosine decay. This avoids the need for the `transformers` library.
+    """
+    def __init__(self, optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
+        self.num_warmup_steps = num_warmup_steps
+        self.num_training_steps = num_training_steps
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.num_warmup_steps:
+            progress = float(self.last_epoch) / float(max(1, self.num_warmup_steps))
+            return [base_lr * progress for base_lr in self.base_lrs]
+        
+        progress = float(self.last_epoch - self.num_warmup_steps) / float(max(1, self.num_training_steps - self.num_warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        return [base_lr * cosine_decay for base_lr in self.base_lrs]
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+    return CosineScheduleWithWarmup(optimizer, num_warmup_steps, num_training_steps, last_epoch)
