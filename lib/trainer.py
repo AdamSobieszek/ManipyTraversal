@@ -253,15 +253,11 @@ class Trainer(object):
         # ----------------- Hyperparameters -----------------
         steps       = int(getattr(self.params, "pretrain_steps", 200))
         B          = int(getattr(self.params, "pretrain_batch_size", 32))
-        lr          = float(getattr(self.params, "pretrain_lr", 1e-3))
-        t_rand      = bool(getattr(self.params, "pretrain_time_random", True))
         cons_sigma  = float(getattr(self.params, "pretrain_consistency_sigma", 0.01))
-        target_norm = float(getattr(self.params, "pretrain_target_grad_norm", 0.0))  # (unused by default)
         # contrastive weights
         lambda_orth = float(getattr(self.params, "pretrain_lambda_orth", 1.0))
         lambda_in   = float(getattr(self.params, "pretrain_lambda_in", 1.0))
         lambda_cons = float(getattr(self.params, "pretrain_lambda_consistency", 1.0))
-        lambda_norm = float(getattr(self.params, "pretrain_lambda_norm", .0))
         lambda_sup = float(getattr(self.params, "pretrain_lambda_support", .0))
         p_power = int(getattr(self.params, "pretrain_support_power", 2))
         # PDE/IC weights (default to WavePDE's current settings)
@@ -271,18 +267,15 @@ class Trainer(object):
                                     getattr(support_sets, "lambda_ic", 0.0)))
 
         # how many potentials to hit per iteration (<= K)
-        K           = int(getattr(self.params, "num_support_sets", support_sets.num_support_sets))
+        K           = support_sets.num_support_sets
         K_per_step  = int(getattr(self.params, "pretrain_k_per_step", K))  # set <K for speed
-
-        T_all       = int(getattr(self.params, "num_support_timesteps", support_sets.num_support_timesteps))
-        half_range  = max(1, T_all // 2)
+        half_range  = max(1, support_sets.num_support_timesteps // 2)
         log_freq    = int(getattr(self.params, "pretrain_log_freq", 100))
         use_amp     = bool(getattr(self.params, "pretrain_amp", False))
         eps         = 1e-8
         # ----------------- Choose latent space & stats -----------------
         use_w = bool(getattr(generator, "shift_in_w_space", False))
-        mu = Sigma_inv = R_prec = None
-        r2_thresh = None
+        r2_thresh = mu = Sigma_inv = R_prec = None
         q = float(getattr(self.params, "pretrain_support_quantile", 0.9))
 
         if use_w:
@@ -293,47 +286,12 @@ class Trainer(object):
             mu, Sigma_inv, R_prec = self._estimate_w_full_stats(generator, n_stats, stats_bs,
                                                                 shrink=shrink, jitter=1e-6)
 
-            # Optional: empirical r^2 quantile in W
-            n_q = min(20000, n_stats)
-            d2_vals, seen = [], 0
-            with torch.no_grad():
-                while seen < n_q:
-                    this_bs = min(stats_bs, n_q - seen)
-                    zq = sample_z(batch_size=this_bs, dim_z=generator.dim_z,
-                                truncation=self.params.z_truncation).to(self.device)
-                    wq = generator.get_w(zq)
-                    d2_vals.append(self._mahalanobis_sq(wq, mu, R_prec))   # ||R (w - mu)||^2
-                    seen += this_bs
-            d2_all = torch.cat(d2_vals, dim=0)
-            r2_thresh = torch.quantile(d2_all, q).detach()
-
-            # Register buffers (optional)
-            support_sets.register_buffer("w_mu", mu)
-            support_sets.register_buffer("w_Sigma_inv", Sigma_inv)
-            support_sets.register_buffer("w_R_prec", R_prec)
-            support_sets.register_buffer("w_r2_thresh", r2_thresh)
-        else:
-            print("   - Using Z prior N(0,I); no W stats needed.")
-            # For Z ~ N(0,I_d), D^2 = ||z||^2 ~ Chi^2(df=d). Use chi-square quantile.
-            df = int(generator.dim_z)
-
-            t_q = torch.tensor(q, device=device, dtype=torch.float32)
-            df_t = torch.tensor(float(df), device=device, dtype=torch.float32)
-            # Fallback: Wilson–Hilferty approximation
-            normal0 = torch.distributions.Normal(
-                torch.tensor(0.0, device=device, dtype=torch.float32),
-                torch.tensor(1.0, device=device, dtype=torch.float32)
-            )
-            z = normal0.icdf(t_q)  # this is implemented
-            w = 1.0 - 2.0 / (9.0 * df_t) + z * torch.sqrt(2.0 / (9.0 * df_t))
-            # clamp to avoid tiny negative due to numerical noise before cubing
-            w = torch.clamp(w, min=1e-6)
-            r2_thresh = df_t * (w ** 3)/2
-            # Optionally cache as buffer
-            support_sets.register_buffer("z_r2_thresh", r2_thresh)
-
-        # ----------------- Optimizer -----------------
-        opt = torch.optim.AdamW(support_sets.parameters(), lr=lr, weight_decay=1e-5)
+        opt = build_adamw(
+            support_sets,
+             lr=float(getattr(self.params, "pretrain_lr", 1e-3)),
+            weight_decay=1e-2,
+            extra_no_decay_names=('c',),
+        )
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
         autocast = (torch.cuda.amp.autocast if device.type == 'cuda' else torch.autocast)
 
@@ -393,9 +351,7 @@ class Trainer(object):
                             z_sel = z_curr
 
                         if lambda_in > 0:
-                            Zk_all_list.append(z_curr)   # [B, D]
-                            
-                        if lambda_norm > 0 or lambda_in > 0:
+                            Zk_all_list.append(z_curr) 
                             all_G_list.append(u_z_i)
 
                     # match forward(): average over number of steps processed (≈ i)
@@ -447,8 +403,6 @@ class Trainer(object):
 
 
             # Optional norm target for |g_k|
-            
-            L_norm = torch.zeros((), device=device, dtype=G.dtype)
 
             # PDE & IC aggregates
             L_pde = torch.stack(PDE_list).mean() if len(PDE_list) > 0 else torch.zeros((), device=device)
@@ -458,7 +412,6 @@ class Trainer(object):
             loss = (lambda_orth * L_orth
                 + lambda_in   * L_in
                 + lambda_cons * L_cons
-                + lambda_norm * L_norm
                 + lambda_pde  * L_pde
                 + lambda_ic   * L_ic
                 ) 
@@ -473,7 +426,7 @@ class Trainer(object):
                 print(f"[pretrain {it:06d}/{steps:06d}] "
                     f"loss={float(loss):.5f} | "
                     f"orth={float(L_orth):.5f} in={float(L_in):.5f} cons={float(L_cons):.5f} "
-                    f"norm={float(L_norm):.5f} pde={float(L_pde):.5f} "
+                    f"pde={float(L_pde):.5f} "
                     f"cons={float(L_cons):.5f} "
                     f"(dt={dt:.1f}s)"
                     )
@@ -599,7 +552,7 @@ class Trainer(object):
             kl_loss = torch.tensor(0.0, device=self.device)
 
 
-        # Classifier (unchanged)
+        # Classifier
         predicted_support_sets_indices, _ = reconstructor(img_step1, img_step2)
         target = index.repeat(self.params.batch_size)
         classification_loss = self.cross_entropy(predicted_support_sets_indices, target)
@@ -620,7 +573,6 @@ class Trainer(object):
         save_checkpoints = True
         analytics = True
         if not osp.isfile(self.checkpoint):
-            self.contrastive_pretrain_potentials(generator, support_sets)
             # Save initial `support_sets` model as `support_sets_init.pt`
             torch.save(support_sets.state_dict(), osp.join(self.models_dir, 'support_sets_init.pt'))
         else:
