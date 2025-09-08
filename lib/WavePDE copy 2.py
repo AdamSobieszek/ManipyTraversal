@@ -70,7 +70,7 @@ class WavePDE(nn.Module):
         self.n_laplace_probes = int(n_laplace_probes)
 
         self.c = nn.Parameter(torch.full((num_support_sets, 1), 1.))
-        self.MLP_SET = nn.ModuleList(
+        self.PSI_SET = nn.ModuleList(
             [MLP(n_in=support_vectors_dim, n_out=1, final_activation=final_activation) for _ in range(num_support_sets)]
         )
         self.proj = generator_projection if generator_projection is not None else nn.Identity()
@@ -179,7 +179,7 @@ class WavePDE(nn.Module):
     
     # ---------- Public API ----------
     def forward(self, index: int, z: torch.Tensor, t: torch.Tensor, generator, direction: int = +1):
-        mlp_k = self.MLP_SET[index]
+        mlp_k = self.PSI_SET[index]
         c_k = self.c[index:index+1]  # [1,1]
         B, D = z.shape
         device, dtype = z.device, z.dtype
@@ -233,7 +233,7 @@ class WavePDE(nn.Module):
 
     @torch.enable_grad()
     def inference(self, index: int, z: torch.Tensor, t: torch.Tensor, generator=None, direction: int = +1):
-        mlp_k = self.MLP_SET[index]
+        mlp_k = self.PSI_SET[index]
         B = z.size(0)
         t = t if t.dim() == 2 else t.view(B, 1)
         z_req = z.detach().requires_grad_(True)

@@ -93,10 +93,10 @@ class WavePDE(nn.Module):
         self.n_laplace_probes = int(n_laplace_probes)
 
         self.c = nn.Parameter(torch.full((num_support_sets, 1), 1.))
-        self.MLP_SET = nn.ModuleList(
+        self.PSI_SET = nn.ModuleList(
             [SliceEnergy(n_in=support_vectors_dim, n_out=1, final_activation=nn.Identity()) for _ in range(num_support_sets)]
         )
-        self.SEM_SET = nn.ModuleList(
+        self.F_POT_SET = nn.ModuleList(
             [SemanticPotential(n_in=support_vectors_dim, n_out=1, final_activation=nn.Identity()) for _ in range(num_support_sets)]
         )
 
@@ -166,8 +166,8 @@ class WavePDE(nn.Module):
 
     # ---------- Public API ----------
     def forward(self, index: int, z: torch.Tensor, t: torch.Tensor, direction: int = +1):
-        mlp_k = self.MLP_SET[index]
-        sem_k = self.SEM_SET[index]
+        mlp_k = self.PSI_SET[index]
+        sem_k = self.F_POT_SET[index]
         c_k = self.c[index:index+1]  # [1,1]
         B, D = z.shape
         device, dtype = z.device, z.dtype

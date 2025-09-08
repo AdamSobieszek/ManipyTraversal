@@ -94,7 +94,6 @@ def create_exp_dir(args, new_experiment=False):
 import sys
 import time
 import numpy as np
-
 class TrainingStatTracker(object):
     """
     Tracks metrics at two levels:
@@ -133,16 +132,12 @@ class TrainingStatTracker(object):
     # ---------- window (micro-steps) ----------
     def _reset_window(self):
         self.win_count = 0
-        self.win_sum = {
-            'accuracy_index': 0.0,
-            'classification_loss': 0.0,
-            'wave_loss': 0.0,
-            'kl_loss': 0.0,
-            'total_loss': 0.0,
-            'entropy': 0.0,
-            'step1_norm': 0.0,
-            'step2_norm': 0.0,
-        }
+        self.win_sum =  dict()
+
+    def _acc(self, key: str, val: float | None):
+        if val is None:  # allow optional arguments
+            return
+        self.win_sum[key] = self.win_sum.get(key, 0.0) + float(val)
 
     def add_micro(
         self,
@@ -155,17 +150,49 @@ class TrainingStatTracker(object):
         entropy: float = 0.0,
         step1_norm: float = 0.0,
         step2_norm: float = 0.0,
+        potential_std: float = 0.0,
+        xf_now: float = 0.0,
+        # ---- optional PDE component-wise losses ----
+        ot: float | None = None,
+        kin: float | None = None,
+        sliceHJ: float | None = None,
+        foot: float | None = None,
+        unitspeed: float | None = None,
+        div: float | None = None,
+        BB: float | None = None,
+        tan: float | None = None,
+        # ---- allow arbitrary extras without breaking ----
+        **extras,
     ):
         """Accumulate values from a micro-step; all inputs are Python floats."""
         self.win_count += 1
-        self.win_sum['accuracy_index'] += float(acc)
-        self.win_sum['classification_loss'] += float(classification_loss)
-        self.win_sum['wave_loss'] += float(wave_loss)
-        self.win_sum['kl_loss'] += float(kl_loss)
-        self.win_sum['total_loss'] += float(total_loss)
-        self.win_sum['entropy'] += float(entropy)
-        self.win_sum['step1_norm'] += float(step1_norm)
-        self.win_sum['step2_norm'] += float(step2_norm)
+        self._acc('accuracy_index', acc)
+        self._acc('L_classification', classification_loss)
+        self._acc('L_wave', wave_loss)
+        self._acc('L_kl', kl_loss)
+        self._acc('total_loss', total_loss)
+        self._acc('entropy', entropy)
+        self._acc('step1_norm', step1_norm)
+        self._acc('step2_norm', step2_norm)
+        self._acc('potential_std', potential_std)
+        self._acc('xf_now', xf_now)
+        # PDE components
+        self._acc('L_ot', ot)
+        self._acc('L_kin', kin)
+        self._acc('L_sliceHJ', sliceHJ)
+        self._acc('L_foot', foot)
+        self._acc('L_unitspeed', unitspeed)
+        self._acc('L_div', div)
+        self._acc('L_BB', BB)
+        self._acc('L_tan', tan)
+
+        # Any extra scalar metrics can be merged automatically
+        for k, v in extras.items():
+            try:
+                self._acc(k, v)
+            except Exception:
+                # ignore non-scalar or malformed extras
+                pass
 
     def close_window(self):
         """Return window means and reset micro accumulators."""

@@ -19,7 +19,6 @@ from .aux import CosineScheduleWithWarmup, build_adamw
 from .validity_loss import KLPath
 
 
-VIS_IMAGE_N = 15
 
 
 class DataParallelPassthrough(nn.DataParallel):
@@ -94,7 +93,6 @@ class Trainer(object):
 
         # ========= Enhanced logging state (set later in train() once K is known) =========
         self.K = None  # just for plotting helpers in this class (heatmap/confusion figs)
-
 
 
     def _to_uint8_images(self, x):
@@ -173,271 +171,6 @@ class Trainer(object):
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         fig.tight_layout()
         return fig
-
-    # ---------- Helper: estimate W stats (full Gaussian) ----------
-    @torch.no_grad()
-    def _estimate_w_full_stats(self, generator, n_samples: int, batch_size: int, shrink: float = 0.01, jitter: float = 1e-6):
-        """
-        Estimate mean and *full* covariance of W-space by sampling z -> w.
-        Returns (mu: [D], Sigma_inv: [D,D], chol_precision: [D,D]) on self.device.
-
-        - 'shrink' applies Σ <- (1-shrink)Σ + shrink*tr(Σ)/D * I  (Ledoit-Wolf style ridge).
-        - 'jitter' adds tiny εI for numerical stability.
-        """
-        device = self.device
-        mu = None
-        # Second-moment accumulator for online covariance (Welford in matrix form)
-        # We keep running mean and running covariance via batch-wise updates.
-        # See "parallel/online covariance" formula.
-        cov = None
-        seen = 0
-
-        while seen < n_samples:
-            this_bs = min(batch_size, n_samples - seen)
-            z = sample_z(batch_size=this_bs, dim_z=generator.dim_z, truncation=self.params.z_truncation).to(device)
-            w = generator.get_w(z)  # [B, D]
-            B, D = w.shape
-
-            if mu is None:
-                mu = torch.zeros(D, device=device, dtype=w.dtype)
-                cov = torch.zeros(D, D, device=device, dtype=w.dtype)
-
-            # batch stats
-            mu_b = w.mean(dim=0)                                   # [D]
-            Xc = (w - mu_b)                                        # [B, D]
-            cov_b = (Xc.T @ Xc) / max(1, B - 1)                    # [D, D]
-
-            # combine running + batch (online)
-            new_seen = seen + B
-            delta = (mu_b - mu)
-            mu_new = mu + delta * (B / new_seen)
-
-            # covariance merge (Chan–Golub–LeVeque)
-            cov = ( (seen - 1) / max(1, new_seen - 1) ) * cov \
-                + ( (B - 1)   / max(1, new_seen - 1) ) * cov_b \
-                + ( seen * B / max(1, new_seen * (new_seen - 1)) ) * torch.ger(delta, delta)
-
-            mu = mu_new
-            seen = new_seen
-
-        # Final covariance regularization + shrinkage
-        # Ridge toward spherical: α tr(Σ)/D I
-        trace = torch.trace(cov)
-        D = cov.shape[0]
-        cov = (1.0 - shrink) * cov + shrink * (trace / max(1, D)) * torch.eye(D, device=cov.device, dtype=cov.dtype)
-        cov = cov + jitter * torch.eye(D, device=cov.device, dtype=cov.dtype)
-
-        # Invert robustly via Cholesky
-        L = torch.linalg.cholesky(cov)               # Σ = L L^T
-        Sigma_inv = torch.cholesky_inverse(L)        # Σ^{-1}
-        # (optional) store precision Cholesky R s.t. Σ^{-1} = R R^T for fast Mahalanobis
-        # Compute R via chol of precision: numerically stable using solve_triangular
-        # Here we just reuse Sigma_inv's chol:
-        R = torch.linalg.cholesky(Sigma_inv)         # precision factor
-
-        return mu, Sigma_inv, R
-
-    def contrastive_pretrain_potentials(self, generator, support_sets):
-        """
-        Latent-only contrastive pretraining with *PDE traversal*:
-        - Works in W-space if generator.shift_in_w_space == True (uses only get_w).
-        - For each selected potential k, rolls z from i=0..t using WavePDE._per_step
-        (same discretization & truncation as training), accumulates PDE loss,
-        and applies contrastive terms at the selected step i=t.
-        """
-        import time, math
-        device = self.device
-        support_sets = support_sets.to(device).train()
-        generator = generator.to(device).eval()
-
-        # ----------------- Hyperparameters -----------------
-        steps       = int(getattr(self.params, "pretrain_steps", 200))
-        B          = int(getattr(self.params, "pretrain_batch_size", 32))
-        cons_sigma  = float(getattr(self.params, "pretrain_consistency_sigma", 0.01))
-        # contrastive weights
-        lambda_orth = float(getattr(self.params, "pretrain_lambda_orth", 1.0))
-        lambda_in   = float(getattr(self.params, "pretrain_lambda_in", 1.0))
-        lambda_cons = float(getattr(self.params, "pretrain_lambda_consistency", 1.0))
-        lambda_sup = float(getattr(self.params, "pretrain_lambda_support", .0))
-        p_power = int(getattr(self.params, "pretrain_support_power", 2))
-        # PDE/IC weights (default to WavePDE's current settings)
-        lambda_pde  = float(getattr(self.params, "pretrain_lambda_pde",
-                                    getattr(support_sets, "lambda_pde", 1.)))
-        lambda_ic   = float(getattr(self.params, "pretrain_lambda_ic",
-                                    getattr(support_sets, "lambda_ic", 0.0)))
-
-        # how many potentials to hit per iteration (<= K)
-        K           = support_sets.num_support_sets
-        K_per_step  = int(getattr(self.params, "pretrain_k_per_step", K))  # set <K for speed
-        half_range  = max(1, support_sets.num_support_timesteps // 2)
-        log_freq    = int(getattr(self.params, "pretrain_log_freq", 100))
-        use_amp     = bool(getattr(self.params, "pretrain_amp", False))
-        eps         = 1e-8
-        # ----------------- Choose latent space & stats -----------------
-        use_w = bool(getattr(generator, "shift_in_w_space", False))
-        r2_thresh = mu = Sigma_inv = R_prec = None
-        q = float(getattr(self.params, "pretrain_support_quantile", 0.9))
-
-        if use_w:
-            n_stats  = int(getattr(self.params, "pretrain_w_stats_samples", 50000))
-            stats_bs = int(getattr(self.params, "pretrain_w_stats_batch", 1024))
-            shrink   = float(getattr(self.params, "pretrain_w_stats_shrink", 0.01))
-            print(f"   - Estimating W full-Gaussian stats with {n_stats} samples...")
-            mu, Sigma_inv, R_prec = self._estimate_w_full_stats(generator, n_stats, stats_bs,
-                                                                shrink=shrink, jitter=1e-6)
-
-        opt = build_adamw(
-            support_sets,
-             lr=float(getattr(self.params, "pretrain_lr", 1e-3)),
-            weight_decay=1e-2,
-            extra_no_decay_names=('c',),
-        )
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        autocast = (torch.cuda.amp.autocast if device.type == 'cuda' else torch.autocast)
-
-        # Temporarily turn off JVP inside WavePDE (latent-only here)
-        prev_lambda_jvp = float(getattr(support_sets, "lambda_jvp", 0.0))
-        if hasattr(support_sets, "lambda_jvp"):
-            support_sets.lambda_jvp = 0.0
-
-        t_print = time.time()
-        for it in range(1, steps + 1):
-            # ---- sample batch in chosen latent space ----
-            z = sample_z(batch_size=B, dim_z=generator.dim_z,
-                        truncation=self.params.z_truncation).to(device)
-            with torch.no_grad():
-                lat0 = generator.get_w(z, truncation_psi=self.params.z_truncation) if use_w else z  # [B, D]
-
-
-
-            # energy gradient at *selected* step locations will be computed later per-k
-            # here we keep lat0 for rollouts
-            # select K' potentials (without replacement)
-            if K_per_step < K:
-                k_indices = torch.randperm(K, device=device)[:K_per_step].tolist()
-            else:
-                k_indices = list(range(K))
-
-            # accumulators across selected potentials
-            Gk_list   = []  # [B, D] grads at selected step (normalized by OEMS in _per_step)
-            Zk_list   = []  # [B, D] lat locations at selected step (for in-distribution)
-            PDE_list  = []  # scalars per k
-            IC_list   = []  # scalars per k (optional)
-            GP_list   = []  # [B, D] perturbed grads for consistency
-            all_G_list = []  # [B*timesteps, D] all grads
-            Zk_all_list = []  # [B, D] locations at selected step
-            opt.zero_grad(set_to_none=True)
-            with autocast(device_type=device.type, enabled=use_amp):
-                for k in k_indices:
-                    mlp_k = support_sets.MLP_SET[k]
-                    c_k   = support_sets.c[k:k+1]  # [1,1]
-
-                    z_curr = lat0
-                    pde_acc = 0.0
-                    g_sel = None
-                    z_sel = None
-                    direction = np.random.choice([-1, 1])
-                    denom=0
-                    for i_ind, i in enumerate((range(half_range) if direction == +1 else range(0, -half_range, -1))):
-                        denom += 1
-                        t_i = torch.full((B, 1), float(i), device=device, dtype=lat0.dtype, requires_grad=True)
-
-                        u_i, u_z_i, pde_res_i, z_curr = support_sets._per_step(mlp_k, z_curr, t_i, c_k, direction)
-                        # accumulate PDE residual like forward()
-                        pde_acc = pde_acc + (pde_res_i.pow(2).mean())
-                        # capture at target i
-                        if i_ind == 0:
-                            g_sel = u_z_i
-                            z_sel = z_curr
-
-                        if lambda_in > 0:
-                            Zk_all_list.append(z_curr) 
-                            all_G_list.append(u_z_i)
-
-                    # match forward(): average over number of steps processed (≈ i)
-                    denom = max(1, denom)  
-                    PDE_list.append(pde_acc / denom)
-
-                    Gk_list.append(g_sel)   # [B, D]
-                    Zk_list.append(z_sel)   # [B, D]
-                    # local consistency at selected step
-                    if lambda_cons > 0:
-                        z_pert = (lat0+cons_sigma*torch.randn_like(lat0)).detach().requires_grad_(True)
-                        t_i = torch.full((B, 1), 0 if direction == +1 else 0, device=device, dtype=lat0.dtype, requires_grad=True)
-                        u_i, u_z_i, pde_res_i, z_curr = support_sets._per_step(mlp_k, z_pert, t_i, c_k, -1*direction)
-
-                        
-                        GP_list.append(u_z_i)
-
-            # Stack across selected k: [B, K', D]
-            G = torch.stack(Gk_list, dim=1)                     # grads at selected step
-            Zs = torch.stack(Zk_list, dim=1)                    # locations at selected step
-            Z_all = torch.stack(Zk_all_list, dim=0)   
-            all_G = torch.stack(all_G_list, dim=0)                 # locations at selected step
-            G_norm = G.norm(dim=-1, keepdim=True).clamp_min(eps)
-            G_unit = G / G_norm
-
-            # Orthogonality across potentials
-            Kp = G.shape[1]
-            Gram = torch.matmul(G_unit, G_unit.transpose(1, 2))  # [B, K', K']
-            I = torch.eye(Kp, device=device, dtype=Gram.dtype)[None]
-            L_orth = ((Gram - I).pow(2).sum(dim=(1, 2)) / max(1, Kp * (Kp - 1))).mean()
-
-            # In-distribution alignment at each k's selected location
-            if use_w:
-                GE = (Z_all - mu[None, None, :]) @ Sigma_inv   # [B,K',D]
-            else:
-                GE = Z_all
-            all_G_unit = all_G / all_G.norm(dim=-1, keepdim=True).clamp_min(eps)
-            cos_g_GE = (GE * all_G_unit).sum(dim=-1)       # [B,K']
-            L_in = (cos_g_GE.pow(2)).mean()
-
-            # Consistency
-            if lambda_cons > 0:
-                GP = torch.stack(GP_list, dim=1)                # [B, K', D]
-                # GP_unit = GP / GP.norm(dim=-1, keepdim=True).clamp_min(eps)
-                cos_cons = (GP + G).pow(2).sum(dim=-1)       # [B, K']
-                L_cons = (cos_cons).mean()
-            else:
-                L_cons = torch.zeros((), device=device, dtype=G.dtype)
-
-
-            # Optional norm target for |g_k|
-
-            # PDE & IC aggregates
-            L_pde = torch.stack(PDE_list).mean() if len(PDE_list) > 0 else torch.zeros((), device=device)
-            L_ic  = torch.stack(IC_list).mean() if (lambda_ic > 0 and len(IC_list) > 0) else torch.zeros((), device=device)
-
-            # Total loss
-            loss = (lambda_orth * L_orth
-                + lambda_in   * L_in
-                + lambda_cons * L_cons
-                + lambda_pde  * L_pde
-                + lambda_ic   * L_ic
-                ) 
-
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-
-            # Logging
-            if it % log_freq == 0:
-                dt = time.time() - t_print
-                print(f"[pretrain {it:06d}/{steps:06d}] "
-                    f"loss={float(loss):.5f} | "
-                    f"orth={float(L_orth):.5f} in={float(L_in):.5f} cons={float(L_cons):.5f} "
-                    f"pde={float(L_pde):.5f} "
-                    f"cons={float(L_cons):.5f} "
-                    f"(dt={dt:.1f}s)"
-                    )
-                t_print = time.time()
-
-        # restore original lambda_jvp
-        if hasattr(support_sets, "lambda_jvp"):
-            support_sets.lambda_jvp = prev_lambda_jvp
-
-        print("#. Contrastive pretraining complete.")
-
 
     # -----------------------------------------------------------------------
 
@@ -522,80 +255,113 @@ class Trainer(object):
         print("      ==============================================================")
         
 
+    def loss(self, support_sets, generator, reconstructor, index, z, time_step, acc_steps):
+        """
+        Computes the total loss for one semantic index.
+        - Keeps gradients to support_sets (the PDE potentials).
+        - Keeps gradients from classifier through generator to latent1.
+        - Uses latent2 as a target frame (with grads to potentials via classifier).
+        - Optional KL regularizer can be computed in latent or image space; the 'reference'
+        side can be detached via kl_detach_reference.
+        """
+        # --- Config for optional KL ---
+        kl_space        = getattr(self.params, "kl_space", "latent")               # "latent" | "image"
+        lambda_kl       = float(getattr(self.params, "lambda_kl", 0.0))            # main weight
+        kl_bandwidth    = getattr(self.params, "kl_bandwidth", None)               # (passed inside self.kl_loss_fn if used)
+        kl_detach_ref   = True
+        
+        # --- Ensure proper shapes/types for time ---
+        if time_step.ndim == 1:
+            time_step = time_step.unsqueeze(1)  # [B,1]
+        time_step = time_step.to(z.dtype).to(z.device)
 
-    def loss(self, support_sets, generator, reconstructor, index, z, time_stamp, acc_steps):
-        kl_space        = getattr(self.params, "kl_space", "latent")            # "latent" | "image"
-        lambda_kl       = float(getattr(self.params, "lambda_kl", 0.0))         # main weight
-        kl_bandwidth    = getattr(self.params, "kl_bandwidth", None)            # for kde: None/"median"/"scott"/float
-        kl_detach_ref   = bool(getattr(self.params, "kl_detach_reference", True))  # don't backprop through initial set
+        # === PDE/OT step (potentials forward) ===
+        # NOTE: WavePDE.forward returns: potential_preds, latent1 (with grads), latent2 (with grads), loss_wave (= total PDE loss)
+        potential_preds, latent1, latent2, loss_wave = support_sets(index.item(), z, time_step, direction=+1)
 
-        energy, latent1, latent2, loss_wave = support_sets(index.item(), z, time_stamp, generator)
+        # === Generate images (generator is frozen but we allow grads through inputs) ===
+        img_step1 = generator(latent1)        # grads flow back to latent1 (and thus to potentials)
+        img_step2 = generator(latent2)       
 
-        # Images after step 1 and 2
-        img_step1 = generator(latent1)
-        img_step2 = generator(latent2)
-
-
-        # === KL path loss (latent or image space) ===
+        # === Optional KL path loss ===
         if lambda_kl > 0.0:
             if kl_space == "latent":
                 initial_samples     = latent1
-                manipulated_samples = latent2
+                manipulated_samples = latent2  
             elif kl_space == "image":
                 initial_samples     = img_step1
-                manipulated_samples = img_step2
+                manipulated_samples = img_step2 
             else:
                 raise ValueError(f"Unknown kl_space={kl_space}, expected 'latent' or 'image'.")
 
-            kl_loss = self.kl_loss_fn(initial_samples, manipulated_samples)
+            if kl_detach_ref:
+                initial_samples = initial_samples.clone().detach()
+
+            kl_loss = self.kl_loss_fn(initial_samples, manipulated_samples, bandwidth=kl_bandwidth)
         else:
-            kl_loss = torch.tensor(0.0, device=self.device)
+            kl_loss = torch.tensor(0.0, device=self.device, dtype=z.dtype)
 
-
-        # Classifier
+        # === Semantic classifier (main discriminability signal) ===
+        # logits shape: [B, K]; 'target' is [B] with the semantic index
         predicted_support_sets_indices, _ = reconstructor(img_step1, img_step2)
         target = index.repeat(self.params.batch_size)
         classification_loss = self.cross_entropy(predicted_support_sets_indices, target)
 
-        # === Total loss (with KL) ===
+        # === Total loss ===
         loss = (
             self.params.lambda_cls * classification_loss
             + self.params.lambda_pde * loss_wave
             + lambda_kl * kl_loss
         )
-        loss = loss / acc_steps
+        # gradient accumulation normalize
+        loss = loss / max(1, int(acc_steps))
         loss.backward()
-        return loss, classification_loss, loss_wave, kl_loss, predicted_support_sets_indices, target, latent1, latent2
+
+        return (
+            loss.detach(),
+            classification_loss.detach(),
+            loss_wave.detach(),
+            kl_loss.detach(),
+            predicted_support_sets_indices.detach(),
+            target,
+            latent1,   
+            latent2,    
+            img_step1,
+            img_step2,
+        )
+
 
     def train(self, generator, support_sets, reconstructor):
         histograms = True
         save_images = True
         save_checkpoints = True
         analytics = True
+
         if not osp.isfile(self.checkpoint):
             # Save initial `support_sets` model as `support_sets_init.pt`
             torch.save(support_sets.state_dict(), osp.join(self.models_dir, 'support_sets_init.pt'))
         else:
             print("#. checkpoint found, skipping contrastive pretraining.")
 
-        # Set modes/devices
-        generator = generator.to(self.device).eval()
-        support_sets = support_sets.to(self.device).train()
-        reconstructor = reconstructor.to(self.device).train()
+        # ===================== Modes / devices =====================
+        generator     = generator.to(self.device).eval()   # frozen, but keep graph through inputs
+        generator.requires_grad_(False)                    # no grads to generator params
 
-        # Initialize enhanced logging arrays (now owned by stat_tracker) once K is known
+        support_sets  = support_sets.to(self.device).train()    # potentials (ψ, f) learnable
+        reconstructor = reconstructor.to(self.device).train()   # classifier learnable
+
+        # ===================== Bookkeeping =====================
         self.K = int(self.params.num_support_sets)
         self.stat_tracker.init_per_k(self.K)
 
-        # Optimizers
-        # Starting iter (maybe resume)
-        
-        acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
-        # === before the loop, after K is known ===
+        # Gradient accumulation sanity check:
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
         if acc_steps > self.K:
-            raise ValueError(f"accumulate_grad_steps ({acc_steps}) must be ≤ num_support_sets K ({self.K}) "
-                            "to guarantee unique indices within each accumulation window.")
+            raise ValueError(
+                f"accumulate_grad_steps ({acc_steps}) must be ≤ num_support_sets K ({self.K}) "
+                "to guarantee unique indices within each accumulation window."
+            )
+        VIS_IMAGE_N = min(16, self.K, acc_steps)
 
         # helper to draw a unique k-sequence for a window of length win_len (≤ K)
         def draw_unique_k_sequence(K, win_len, device):
@@ -611,19 +377,19 @@ class Trainer(object):
 
         # --- hyperparams for wd (with sensible defaults) ---
         support_set_wd  = float(getattr(self.params, "support_set_wd", 0.05))
-        reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.0001))
+        reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.001))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
 
         # --- restart flags (all default False) ---
-        reset_lr          = bool(getattr(self.params, "reset_lr", False))
+        reset_lr          = bool(getattr(self.params, "reset_lr", True))
         reset_weight_decay = bool(getattr(self.params, "reset_weight_decay", False))
         reset_schedulers  = bool(getattr(self.params, "reset_schedulers", False))
         reset_start_iter  = bool(getattr(self.params, "reset_start_iter", False))
 
         # --- create optimizer(s) with split weight decay ---
         support_sets_optim = build_adamw(
-            support_sets,
+            support_sets.PSI_SET,
             lr=self.params.support_set_lr,
             weight_decay=support_set_wd,
             extra_no_decay_names=(),                      
@@ -631,6 +397,7 @@ class Trainer(object):
             betas=betas,
             eps=eps,
         )
+        support_sets_optim.add_param_group({"params": support_sets.F_POT_SET.parameters(), "weight_decay": 0.1, "lr": self.params.support_set_lr})
         reconstructor_optim = build_adamw(
             reconstructor,
             lr=self.params.reconstructor_lr,
@@ -643,14 +410,15 @@ class Trainer(object):
         # --- create schedulers (we may re-init them below if needed) ---
         total_opt_steps = math.ceil(self.params.max_iter / acc_steps)
         warmup_steps = math.ceil(self.params.warmup_fraction * total_opt_steps)
-        sched_support = CosineScheduleWithWarmup(
-            support_sets_optim, num_warmup_steps=warmup_steps,
-            num_training_steps=total_opt_steps, last_epoch=-1
-        )
-        sched_recon = CosineScheduleWithWarmup(
-            reconstructor_optim, num_warmup_steps=warmup_steps,
-            num_training_steps=total_opt_steps, last_epoch=-1
-        )
+        if reset_schedulers:
+            sched_support = CosineScheduleWithWarmup(
+                support_sets_optim, num_warmup_steps=warmup_steps,
+                num_training_steps=total_opt_steps, last_epoch=-1
+            )
+            sched_recon = CosineScheduleWithWarmup(
+                reconstructor_optim, num_warmup_steps=warmup_steps,
+                num_training_steps=total_opt_steps, last_epoch=-1
+            )
 
         # --- load models/opts/schedulers if checkpoint exists ---
         starting_opt_step = self.get_starting_iteration(
@@ -669,18 +437,15 @@ class Trainer(object):
                 g["lr"] = float(self.params.support_set_lr)
             for g in reconstructor_optim.param_groups:
                 g["lr"] = float(self.params.reconstructor_lr)
-            # keep schedule progress unless also resetting schedulers
-            if not reset_schedulers:
-                sched_support.base_lrs = [pg["lr"] for pg in support_sets_optim.param_groups]
-                sched_recon.base_lrs   = [pg["lr"] for pg in reconstructor_optim.param_groups]
 
         # If WD is reset: rebuild optimizers (this naturally drops moment state,
         # which is typically what you want when "restarting" WD).
         if reset_weight_decay:
             support_sets_optim = build_adamw(
-                support_sets, lr=self.params.support_set_lr, weight_decay=support_set_wd,
+                support_sets.PSI_SET, lr=self.params.support_set_lr, weight_decay=support_set_wd,
                 extra_no_decay_names=("c",), betas=betas, eps=eps
             )
+            support_sets_optim.add_param_group({"params": support_sets.F_POT_SET.parameters(), "weight_decay": 0.1, "lr": self.params.support_set_lr})
             reconstructor_optim = build_adamw(
                 reconstructor, lr=self.params.reconstructor_lr, weight_decay=reconstructor_wd,
                 extra_no_decay_names=(), betas=betas, eps=eps
@@ -807,18 +572,16 @@ class Trainer(object):
 
             index = torch.tensor([k], device=self.device)
             t_idx = torch.randint(0, max(1, half_range - 1), (1,), device=self.device)
-            time_stamp = t_idx.to(z).repeat(self.params.batch_size, 1)
+            time_step = t_idx.to(z).repeat(self.params.batch_size, 1)
 
 
             # KL loss and outputs
             (loss, classification_loss, loss_wave, kl_loss,
-             logits, target, latent1, latent2) = self.loss(
-                support_sets, generator, reconstructor, index, z, time_stamp, acc_steps
+             logits, target, latent1, latent2, img_step1, img_step2) = self.loss(
+                support_sets, generator, reconstructor, index, z, time_step, acc_steps
             )
 
             # For visual logging (keep here)
-            img_step1 = generator(latent1)
-            img_step2 = generator(latent2)
             if k < VIS_IMAGE_N:
                 imgs_step1[k] = img_step1[:1]
                 imgs_step2[k] = img_step2[:1]
@@ -840,7 +603,7 @@ class Trainer(object):
                 # Per-MLP selected grad norm (only selected MLP has grads)
                 grad_norm_selected = None
                 if analytics:
-                    mlp_params = list(support_sets.MLP_SET[int(index.item())].parameters())
+                    mlp_params = list(support_sets.PSI_SET[int(index.item())].parameters())
                     if len(mlp_params) > 0:
                         g2 = 0.0
                         for p in mlp_params:
@@ -848,6 +611,9 @@ class Trainer(object):
                                 g2 += float(p.grad.detach().to('cpu').pow(2).sum())
                         grad_norm_selected = math.sqrt(max(g2, 1e-12))
 
+                wave_dict = support_sets.get_losses()
+                wave_dict['potential_std'] = wave_dict['potential_preds'].std()
+                wave_dict['xf_now'] = wave_dict['xf_now'].norm(dim=-1).mean()
                 self.stat_tracker.add_micro(
                     acc=float((preds == index.item()).float().mean().item()),
                     classification_loss=float(classification_loss.item()),
@@ -857,6 +623,7 @@ class Trainer(object):
                     entropy=float(entropy.item()),
                     step1_norm=step1_norm,
                     step2_norm=step2_norm,
+                    **wave_dict,
                 )
                 
                 # Per-MLP analytics in tracker (CPU numpy)
@@ -876,12 +643,16 @@ class Trainer(object):
                             if p.grad is not None:
                                 total_sq += float(p.grad.detach().to('cpu').pow(2).sum().item())
                         return math.sqrt(total_sq)
-                    gn_support = module_grad_norm(support_sets)
+                    gn_support = module_grad_norm(support_sets.PSI_SET)
+                    gn_support_f = module_grad_norm(support_sets.F_POT_SET)
                     gn_recon = module_grad_norm(reconstructor)
-                    self.tb_writer.add_scalar("train/grad_norm/support_sets", gn_support, opt_step_idx)
+                    self.tb_writer.add_scalar("train/grad_norm/psi_sets", gn_support, opt_step_idx)
+                    self.tb_writer.add_scalar("train/grad_norm/f_potential_sets", gn_support_f, opt_step_idx)
                     self.tb_writer.add_scalar("train/grad_norm/reconstructor", gn_recon, opt_step_idx)
-                    
-                    
+                # Gradient clipping before optimizer step
+                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=3.0)
+                torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=3.0)
+                
                 support_sets_optim.step()
                 reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True)
@@ -911,10 +682,10 @@ class Trainer(object):
                     if analytics:
                         # Wave speed c stats (support_sets.c: [K,1])
                         c_vals = support_sets.c.detach().view(-1).cpu().numpy()
-                        self.tb_writer.add_scalar("train/c_stats/mean", float(c_vals.mean()), opt_step_idx)
-                        self.tb_writer.add_scalar("train/c_stats/std", float(c_vals.std()), opt_step_idx)
-                        self.tb_writer.add_scalar("train/c_stats/min", float(c_vals.min()), opt_step_idx)
-                        self.tb_writer.add_scalar("train/c_stats/max", float(c_vals.max()), opt_step_idx)
+                        # self.tb_writer.add_scalar("train/c_stats/mean", float(c_vals.mean()), opt_step_idx)
+                        # self.tb_writer.add_scalar("train/c_stats/std", float(c_vals.std()), opt_step_idx)
+                        # self.tb_writer.add_scalar("train/c_stats/min", float(c_vals.min()), opt_step_idx)
+                        # self.tb_writer.add_scalar("train/c_stats/max", float(c_vals.max()), opt_step_idx)
 
                         # Periodic snapshots for heatmap/confusion
                         if (micro_idx//acc_steps % self.params.log_freq) == 0:
@@ -928,15 +699,18 @@ class Trainer(object):
                                                          (delta1.norm(dim=1)).detach().cpu().numpy(), opt_step_idx)
                             self.tb_writer.add_histogram("train/latent_step_norm/step2",
                                                          (delta2.norm(dim=1)).detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("train/potential_preds", wave_dict['potential_preds'].detach().cpu().numpy().reshape(-1), opt_step_idx)
                             self.tb_writer.add_histogram("per_mlp/ema_accuracy", self.stat_tracker.per_k_ema_acc, opt_step_idx)
                             self.tb_writer.add_histogram("per_mlp/ema_grad_norm", self.stat_tracker.per_k_ema_grad, opt_step_idx)
                             self.tb_writer.add_histogram("per_mlp/selection_counts", self.stat_tracker.per_k_select_counts, opt_step_idx)
-                            self.tb_writer.add_histogram("meta/timestep_idx", time_stamp[:, 0].detach().cpu().numpy(), opt_step_idx)
+                            self.tb_writer.add_histogram("meta/timestep_idx", time_step[:, 0].detach().cpu().numpy(), opt_step_idx)
                             self.tb_writer.add_histogram("meta/predicted_k", preds.detach().cpu().numpy(), opt_step_idx)
                             self.tb_writer.add_histogram("meta/true_k", target.detach().cpu().numpy(), opt_step_idx)
 
                     # Images & figures (on optimizer-step cadence)
                     if save_images and ((micro_idx)//acc_steps % self.params.log_freq) == 0:
+                        print([isinstance(img, torch.Tensor) for img in imgs_step1])
+                        print([isinstance(img, torch.Tensor) for img in imgs_step2])
                         self._log_image_triplet(self.tb_writer, "images", torch.cat(imgs_orig), torch.cat(imgs_step1), torch.cat(imgs_step2),
                                                 opt_step_idx, n_vis=min(VIS_IMAGE_N, self.params.batch_size))
 

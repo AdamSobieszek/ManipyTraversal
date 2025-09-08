@@ -280,7 +280,7 @@ def main():
     #For stylegan remove the last activation layer otherwise the changes are too small
     if gan_type == 'StyleGAN2':
         for i in range(S.num_support_sets):
-            S.MLP_SET[i].activation4 = nn.Identity()
+            S.PSI_SET[i].activation4 = nn.Identity()
     # Load pre-trained weights and set to evaluation mode
     if args.verbose:
         print("  \\__Pre-trained weights: {}".format(support_sets_model))

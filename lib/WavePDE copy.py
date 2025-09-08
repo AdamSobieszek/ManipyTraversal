@@ -73,7 +73,7 @@ class WavePDE(nn.Module):
         self.support_vectors_dim = support_vectors_dim
         self.c = nn.Parameter(torch.ones(num_support_sets,1,requires_grad=True))
 
-        self.MLP_SET= nn.ModuleList([MLP(n_in=support_vectors_dim,n_out=1) for i in range(num_support_sets)])
+        self.PSI_SET= nn.ModuleList([MLP(n_in=support_vectors_dim,n_out=1) for i in range(num_support_sets)])
 
     #Loss of initial condition
     def loss_ic(self,mlp,z):
@@ -122,14 +122,14 @@ class WavePDE(nn.Module):
 
 
     def forward(self, index, z, t, generator):
-        mse_ic = self.loss_ic(self.MLP_SET[index],z)
+        mse_ic = self.loss_ic(self.PSI_SET[index],z)
         mse_pde = 0.0
         half_range = self.num_support_timesteps // 2
         for i in range(0,half_range):
             t_index = torch.tensor([[i]], dtype=z.dtype, device=z.device, requires_grad=True)
-            mse_pde_t_index, u_z , u = self.loss_pde(self.MLP_SET[index],z,t_index,self.c[index],generator)
+            mse_pde_t_index, u_z , u = self.loss_pde(self.PSI_SET[index],z,t_index,self.c[index],generator)
             if i == int(t[0]):
-                mse_jvp, u_z1 = self.loss_jvp(self.MLP_SET[index], z, t_index, generator)
+                mse_jvp, u_z1 = self.loss_jvp(self.PSI_SET[index], z, t_index, generator)
                 energy = u
                 latent1 = z + u_z
                 latent2 = z + u_z + u_z1
@@ -139,5 +139,5 @@ class WavePDE(nn.Module):
         return energy, latent1, latent2, loss
 
     def inference(self, index, z, t, generator):
-        _, u_z, u = self.loss_pde(self.MLP_SET[index], z, t, self.c[index], generator)
+        _, u_z, u = self.loss_pde(self.PSI_SET[index], z, t, self.c[index], generator)
         return u, u_z

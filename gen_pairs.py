@@ -109,14 +109,14 @@ def robust_load_waves(S: nn.Module, ckpt):
             sd = ckpt['support_sets']
         elif 'state_dict' in ckpt and isinstance(ckpt['state_dict'], dict):
             # if state_dict looks like WavePDE already
-            if any(k.startswith('MLP_SET') or k == 'c' for k in ckpt['state_dict'].keys()):
+            if any(k.startswith('PSI_SET') or k == 'c' for k in ckpt['state_dict'].keys()):
                 sd = ckpt['state_dict']
         elif all(isinstance(k, str) for k in ckpt.keys()):
             # checkpoint is the state_dict itself
-            if any(k.startswith('MLP_SET') or k == 'c' for k in ckpt.keys()):
+            if any(k.startswith('PSI_SET') or k == 'c' for k in ckpt.keys()):
                 sd = ckpt
     if sd is None:
-        raise RuntimeError("Could not find WavePDE weights in checkpoint. Expected keys like 'support_sets' or 'MLP_SET.*'")
+        raise RuntimeError("Could not find WavePDE weights in checkpoint. Expected keys like 'support_sets' or 'PSI_SET.*'")
     S.load_state_dict(sd, strict=True)
 
 # ------------------

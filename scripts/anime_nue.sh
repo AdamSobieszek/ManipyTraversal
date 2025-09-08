@@ -1,13 +1,14 @@
 gan_type="SNGAN_AnimeFaces"
 num_support_sets=8
 num_support_timesteps=8
-warmup_fraction=0.01
+warmup_fraction=0.001
 accumulate_grad_steps=8
 reconstructor_type="LeNet"
-batch_size=32
-max_iter=20000
+batch_size=48
+max_iter=30000
 tensorboard=true
 new_experiment=true
+
 # ================================
 
 
