@@ -189,6 +189,13 @@ class StackedSemanticPotential(nn.Module):
         return self.final_activation(out)
 
 
+    def update_y_distributions(self, y: torch.Tensor):
+        """
+        Update the density estimates for each k. This should stay implementation-agnostic with a plug-in estimator class call.
+        """
+        pass
+
+
 class StackedSliceEnergy(nn.Module):
     def __init__(self, K: int, n_in: int, n_out: int = 1, final_activation: nn.Module = nn.Identity(),
                  apply_output_bn: bool = False):
@@ -288,7 +295,7 @@ class WavePDE(nn.Module):
             kin=0.0,
             sliceHJ=0.0,
             foot=0.0,
-            unitspeed=1.0,
+            unitspeed=0.0,
             div=0.0,
             BB=0.,
             tan=0.0,
@@ -413,7 +420,7 @@ class WavePDE(nn.Module):
         # losses (per step)
         zero = torch.zeros((), device=device, dtype=dtype)
 
-        L_ot = (gpsi_next - (Xf_now + Xf_next).detach() / 2.0).pow(2).sum(dim=-1, keepdim=True)  # [B,K,1]
+        L_ot = zero # [B,K,1]
 
         if lam.get("kin", 0.0) > 0.0:
             kin_res = psi_tt_next - gpsi_next.norm(dim=-1, keepdim=True) / (norm2_f_next.sqrt())

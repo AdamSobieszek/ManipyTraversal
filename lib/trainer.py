@@ -88,6 +88,14 @@ class Trainer(object):
         x = x.clamp(0.0, 1.0)
         return x
 
+    def _plot_potential_distribution(self, writer, tag_prefix, potential_preds, iteration):
+        """
+        potential_preds: [B,K,1]
+        """
+        for k in range(self.K):
+            potential_preds = potential_preds.detach().cpu()
+            writer.add_histogram(f"{tag_prefix}/{k}/potential_distribution", potential_preds[:, k].reshape(-1), iteration)
+
     def _log_image_triplet(self, writer, tag_prefix, x0, x1, x2, iteration, n_vis=8):
         """
         Works with the new train() call:
@@ -228,58 +236,7 @@ class Trainer(object):
         targets = k_idx                                              # class k for row (b,k)
 
         return flat, targets, (b_idx, k_idx), (B, K)
-
-    def get_starting_iteration(
-        self,
-        support_sets,
-        reconstructor,
-        support_opt=None,
-        recon_opt=None,
-        support_sched=None,
-        recon_sched=None,
-    ):
-        """
-        Loads all available states from checkpoint:
-        - models (support_sets, reconstructor)
-        - optimizers (support_opt, recon_opt)   [if provided]
-        - schedulers (support_sched, recon_sched) [if provided]
-        Returns the stored optimizer-step index ('iter') or 1 if no checkpoint.
-        """
-        def safe_load_state_dict(obj, ckpt, name, strict=True):
-            if obj is not None and name in ckpt:
-                try:
-                    # if strict is an available argument for load_state_dict, use it
-                    if hasattr(obj, 'load_state_dict') and hasattr(obj.load_state_dict, 'strict'):
-                        incompatibilities = obj.load_state_dict(ckpt[name], strict=strict)
-                    else:
-                        incompatibilities = obj.load_state_dict(ckpt[name])
-                    if incompatibilities:
-                        if str(incompatibilities) != "<All keys matched successfully>":
-                            print(f"Warning: {name} loaded state_dict with non-strict mode")
-                            print(f"Incompatibilities: {incompatibilities}")
-                    
-                except Exception as e:
-                    print(f"Error loading state_dict for {name}: {e}")
-
-        start_iter = 1
-        if osp.isfile(self.checkpoint):
-            ckpt = torch.load(self.checkpoint, map_location=self.device)
-            start_iter = int(ckpt.get('iter', 1))
-
-            # Model weights (allow non-strict to be robust to minor changes)
-            safe_load_state_dict(support_sets, ckpt, 'support_sets', strict=False)
-            safe_load_state_dict(reconstructor, ckpt, 'reconstructor', strict=False)
-
-            # Optimizers (if both objects and states exist)
-            safe_load_state_dict(support_opt, ckpt, 'support_opt')
-            safe_load_state_dict(recon_opt, ckpt, 'recon_opt')
-
-            # Schedulers (if both objects and states exist)
-            safe_load_state_dict(support_sched, ckpt, 'support_sched')
-            safe_load_state_dict(recon_sched, ckpt, 'recon_sched')
-
-        return start_iter
-    # ------------------------ helpers for TB visuals ------------------------
+     # ------------------------ helpers for TB visuals ------------------------
     def _write_stats_json(self):
         # Update training statistics json file (optimizer-step keyed)
         with open(self.stats_json, 'w') as out:
@@ -387,230 +344,7 @@ class Trainer(object):
         loss = loss / max(1, int(acc_denominator))
 
 
-        # --- PROBE PLANNING (run once) ---
-        if not getattr(self, "grad_check_planned", False) and self.stat_tracker.global_opt_step > 100:
-            # Non-leaf tensors we want grads for after backward
-            # NOTE: retain_grad() must be called BEFORE backward
-            try:
-                # lat1_flat/lat2_flat/img1/img2/logits are the gradient-carrying versions here
-                lat2_flat.retain_grad()
-                img2.retain_grad()
-                logits.retain_grad()
-                # If img1 is NOT detached in your setup, probe it too
-                if img1.requires_grad:
-                    img1.retain_grad()
-                # If you want to inspect lat1_flat grads (only if you didn't detach img1), retain too
-                if lat1_flat.requires_grad:
-                    lat1_flat.retain_grad()
-            except RuntimeError:
-                pass  # harmless if retain_grad was already called on these tensors
-
-            # Stash strong references needed for the post-backward checks
-            self._grad_probe = {
-                "B": B, "K": K, "D": D,
-                "lat1_flat": lat1_flat, "lat2_flat": lat2_flat,
-                "img1": img1, "img2": img2,
-                "logits": logits,
-                "targets": targets,            # [B*K]
-                "cls_loss": cls_loss,
-                "loss_wave": loss_wave,
-                "kl_loss": kl_loss,
-            }
-            self.grad_check_planned = True
-
-
-
         loss.backward()
-
-
-
-                # ========== POST-BACKWARD GRAPH INSPECTION (run once) ==========
-        if (not getattr(self, "grad_check_completed", False)) and getattr(self, "grad_check_planned", False) and self.stat_tracker.global_opt_step > 100:
-            pb = self._grad_probe  # shorthand
-            B, K, D = pb["B"], pb["K"], pb["D"]
-            lat1_flat, lat2_flat = pb["lat1_flat"], pb["lat2_flat"]
-            img1, img2 = pb["img1"], pb["img2"]
-            logits = pb["logits"]
-            targets = pb["targets"]
-            cls_loss = pb["cls_loss"]
-            loss_wave = pb["loss_wave"]
-            kl_loss = pb["kl_loss"]
-
-            def _safe_norm(x):
-                if x is None:
-                    return 0.0
-                if torch.is_tensor(x):
-                    return float(x.detach().pow(2).sum().sqrt().item())
-                try:
-                    return float(x)
-                except Exception:
-                    return 0.0
-
-            def _params_grad_norm(model):
-                g2 = 0.0
-                n = 0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        g2 += float(p.grad.detach().pow(2).sum().item())
-                        n += 1
-                return math.sqrt(g2) if g2 > 0 else 0.0, n
-
-            # --- 2.1: CE -> ψ/f path should exist (ψ & f params must see grad) ---
-            psi_gn, psi_n = _params_grad_norm(support_sets.PSI)
-            f_gn,   f_n   = _params_grad_norm(support_sets.F)
-
-            # --- 2.2: Reconstructor should get grads; Generator should NOT ---
-            recon_gn, recon_n = _params_grad_norm(reconstructor)
-
-            gen_has_grad = False
-            for p in generator.parameters():
-                if p.grad is not None and p.grad.detach().abs().sum().item() > 0:
-                    gen_has_grad = True
-                    break
-
-            # --- 2.3: Non-leaf grads along the CE path ---
-            # We retained grads on these in loss_allK() BEFORE backward.
-            dCE_d_logits = _safe_norm(logits.grad)
-            dCE_d_img2   = _safe_norm(img2.grad)     # MUST be >0 for classifier->latent2->ψ/f
-            dCE_d_lat2_flat   = _safe_norm(lat2_flat.grad)     # MUST be >0
-
-            dCE_d_img1   = _safe_norm(img1.grad)     # MUST be >0 for classifier->latent2->ψ/f
-            dCE_d_lat1_flat   = _safe_norm(lat1_flat.grad)     # MUST be >0
-
-
-            # 3.1 Top-1 accuracy directly (should correlate with sanity)
-            with torch.no_grad():
-                top1 = (logits.detach().argmax(dim=1) == targets).float().mean().item()
-
-            # 3.2 Within-b wrong targets: rotate k by +1 for each b (guaranteed wrong)
-            # targets shape is [B*K]: rebuild [B,K], rotate, then flatten back.
-            with torch.no_grad():
-                tgt_bk = targets.view(B, K)
-                wrong_bk = (tgt_bk + 1) % K
-                wrong_targets = wrong_bk.reshape(B * K)
-                ce_true = float(nn.CrossEntropyLoss()(logits.detach(), targets).item())
-                ce_wrong = float(nn.CrossEntropyLoss()(logits.detach(), wrong_targets).item())
-                alignment_ok = (ce_true + 1e-6 < ce_wrong)
-
-            # 3.3 Row→(b,k) consistency: verify a few rows map to the expected (b,k)
-            with torch.no_grad():
-                # sample a handful of rows
-                idx = torch.randint(0, B * K, (min(16, B * K),), device=targets.device)
-                ok_rows = True
-                for r in idx.tolist():
-                    b = b_idx[r].item()
-                    k = k_idx[r].item()
-                    # These must be exact same tensors’ elements (no reorder between lat1_bk and lat2_bk pack)
-                    same_l1 = torch.allclose(latent1_bk[b, k], lat1_flat.detach()[r], atol=0, rtol=0)
-                    same_l2 = torch.allclose(latent2_bk[b, k], lat2_flat.detach()[r], atol=0, rtol=0)
-                    if not (same_l1 and same_l2):
-                        ok_rows = False
-                        break
-                alignment_ok = alignment_ok and ok_rows
-            # Additional simple signal: CE should be sensitive to permuting targets
-            with torch.no_grad():
-                perm = torch.randperm(B * K, device=targets.device)
-                wrong_targets = targets[perm]
-                ce_ok = True
-                try:
-                    crit = nn.CrossEntropyLoss()
-                    ce_true = float(crit(logits.detach(), targets).item())
-                    ce_wrong = float(crit(logits.detach(), wrong_targets).item())
-                    # With correct alignment CE should be smaller than a random permutation
-                    alignment_ok = alignment_ok and (ce_true + 1e-6 < ce_wrong)
-                except Exception:
-                    ce_ok = False
-
-            # --- 2.5: Latent displacement sanity (manipulation not degenerate) ---
-            with torch.no_grad():
-                # Use the detached versions you already produced for logging if available;
-                # here we recompute safely from the handles.
-                # Estimate ||lat2_flat - lat1_flat|| per sample
-                mean_lat_move = float((lat2_flat.detach() - lat1_flat.detach()).norm(dim=1).mean().item())
-
-            # --- 2.6: Per-K grad norms on stacked parameters (optional) ---
-            per_k_gn = None
-            try:
-                per_k_gn = self._per_k_grad_norms(support_sets)  # returns np.ndarray[K]
-                # summarize
-                per_k_min = float(np.min(per_k_gn)) if per_k_gn.size else 0.0
-                per_k_max = float(np.max(per_k_gn)) if per_k_gn.size else 0.0
-                per_k_med = float(np.median(per_k_gn)) if per_k_gn.size else 0.0
-            except Exception:
-                per_k_min = per_k_max = per_k_med = 0.0
-
-            # --- 2.7: Thresholded pass/fail ---
-            # These are conservative “something is flowing” thresholds; tune as needed.
-            eps_small = 1e-10
-            passed_checks = True
-            reasons = []
-
-            if psi_gn <= eps_small and f_gn <= eps_small:
-                passed_checks = False
-                reasons.append("No gradient on ψ/f parameters from total loss.")
-
-            if dCE_d_img2 <= eps_small or dCE_d_lat2_flat <= eps_small:
-                passed_checks = False
-                reasons.append("Classifier gradients are not reaching img2/latent2.")
-
-            if gen_has_grad:
-                passed_checks = False
-                reasons.append("Frozen generator received parameter gradients (should be 0).")
-
-            if not alignment_ok:
-                reasons.append("Flatten/targets alignment suspicious (rotK CE and/or row→(b,k) mapping failed).")
-            print(f"top1(B·K)={top1:.3f} | CE_true={ce_true:.3f} vs CE_rotK={ce_wrong:.3f}")
-
-            # If you purposely detached img1, expect near-zero grads there.
-            if img1.requires_grad and dCE_d_img1 <= eps_small:
-                # ok
-                pass
-            elif (not img1.requires_grad) and dCE_d_img1 > eps_small:
-                passed_checks = False
-                reasons.append("img1 was detached but still has grads (unexpected).")
-
-            # Degenerate manipulation heuristic
-            if mean_lat_move < 1e-6:
-                reasons.append("Latent displacement (||lat2_flat - lat1_flat||) is ~0; manipulation may be degenerate.")
-
-            # --- 2.8: TensorBoard logging (if enabled) ---
-            if self.tensorboard and self.tb_writer is not None:
-                step = self.stat_tracker.global_opt_step
-                self.tb_writer.add_scalar("debug/psi_grad_norm", psi_gn, step)
-                self.tb_writer.add_scalar("debug/f_grad_norm", f_gn, step)
-                self.tb_writer.add_scalar("debug/recon_grad_norm", recon_gn, step)
-                self.tb_writer.add_scalar("debug/dCE_d_logits", dCE_d_logits, step)
-                self.tb_writer.add_scalar("debug/dCE_d_img2", dCE_d_img2, step)
-                self.tb_writer.add_scalar("debug/dCE_d_lat2_flat", dCE_d_lat2_flat, step)
-                self.tb_writer.add_scalar("debug/dCE_d_img1", dCE_d_img1, step)
-                self.tb_writer.add_scalar("debug/dCE_d_lat1_flat", dCE_d_lat1_flat, step)
-                self.tb_writer.add_scalar("debug/mean_latent_move", mean_lat_move, step)
-                if per_k_gn is not None:
-                    self.tb_writer.add_scalar("debug/per_k_grad_norm/min", per_k_min, step)
-                    self.tb_writer.add_scalar("debug/per_k_grad_norm/median", per_k_med, step)
-                    self.tb_writer.add_scalar("debug/per_k_grad_norm/max", per_k_max, step)
-
-            # --- 2.9: Print a compact summary once ---
-            print("\\n[Grad-Graph Inspection]")
-            print(f"ψ_grad_norm={psi_gn:.3e} | f_grad_norm={f_gn:.3e} | recon_grad_norm={recon_gn:.3e} | gen_has_grad={gen_has_grad}")
-            print(f"||∂CE/∂logits||={dCE_d_logits:.3e} | ||∂CE/∂img2||={dCE_d_img2:.3e} | ||∂CE/∂lat2_flat||={dCE_d_lat2_flat:.3e}")
-            if img1.requires_grad:
-                print(f"||∂CE/∂img1||={dCE_d_img1:.3e} | ||∂CE/∂lat1_flat||={dCE_d_lat1_flat:.3e}")
-            print(f"CE/targets_align_ok={alignment_ok} | mean||lat2_flat-lat1_flat||={mean_lat_move:.3e}")
-            if per_k_gn is not None:
-                print(f"per-k grad norm: min/med/max = {per_k_min:.3e}/{per_k_med:.3e}/{per_k_max:.3e}")
-            if passed_checks:
-                print("Grad-graph inspection: PASSED") 
-            else:
-                print("Grad-graph inspection: FAILED -> " + "; ".join(reasons))
-
-            # Mark as completed so we don't run this again
-            if passed_checks:
-                self.grad_check_completed = True
-            else:
-                sys.exit()  
-        # ========== END INSPECTION ==========
-
 
 
         # Logging views
@@ -931,6 +665,7 @@ class Trainer(object):
                         fig_c = self._plot_confusion(self.stat_tracker.confusion) 
                         self.tb_writer.add_figure("classifier/confusion_matrix", fig_c, global_step=self.stat_tracker.global_opt_step) 
                         plt.close(fig_c) 
+                        self._plot_potential_distribution(self.tb_writer, "potential_distribution", potential_preds, self.stat_tracker.global_opt_step)
                 # ============================ /TensorBoard logging ===========================
 
                 # Timing, progress, persist
