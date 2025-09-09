@@ -63,20 +63,20 @@ def main():
     parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
 
     # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-type', type=str, default='ResNet',
-                        help='set reconstructor network type')
     parser.add_argument('--reconstructor-lr', type=float, default=3e-4,
                         help="set learning rate for reconstructor R optimization")
+    parser.add_argument('--reconstructor-type', type=str, default='ResNet',
+                        help='set reconstructor network type')
 
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
     parser.add_argument('--batch-size', type=int, default=32, help="set batch size")
-    parser.add_argument('--accumulate-grad-steps', type=int, default=10, help="set number of steps to accumulate gradients")
+    parser.add_argument('--accumulate-grad-steps', type=int, default=1, help="set number of steps to accumulate gradients")
     parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
     parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
     parser.add_argument('--lambda-reg', type=float, default=1.00, help="regression loss weight")
     parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
-    parser.add_argument('--log-freq', default=20, type=int, help='set number iterations per log')
+    parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
     # === Restart ===================================================================================================== #

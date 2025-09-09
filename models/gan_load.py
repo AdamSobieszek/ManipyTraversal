@@ -170,19 +170,19 @@ class StyleGAN2MPSWrapper(nn.Module):
                 # Input latent code is in W-space
             if not isinstance(z, torch.Tensor):
                 z = torch.cat([z if shift is None else z + shift])
-            if not isinstance(shift, torch.Tensor):
+            if shift is not None and not isinstance(shift, torch.Tensor):
                 shift = torch.cat([shift])
             z = z if shift is None else z + shift
             if z.dim() == 2:
                 z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
-            return self.G.synthesis(z, None)
+            return self.G.synthesis(z)
             #else:
                 # Input latent code is in Z-space -- get w code first
                 #w = self.G.get_latent(z)
                 #return self.G([w if shift is None else w + shift], input_is_latent=True)[0]
         # The given latent codes and shift vectors lie on the Z-space
         else:
-            return self.G(torch.cat([z if shift is None else z + shift]), None, truncation_psi=1)
+            return self.G(torch.cat([z if shift is None else z + shift]), truncation_psi=1)
 
 
 def build_stylegan2mps(pretrained_gan_weights, resolution, shift_in_w_space=False):

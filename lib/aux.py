@@ -89,11 +89,148 @@ def create_exp_dir(args, new_experiment=False):
         command_file.write(' '.join(sys.argv) + '\n')
 
     return exp_dir
+import torch
+from torch import nn
+from typing import Iterable, Sequence, Union, Optional
 
-# aux.py
-import sys
-import time
-import numpy as np
+# -----------------------------
+# Hyperparameter helper function
+# --------------------------------
+
+def _norm_classes():
+    return (
+        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm,
+        nn.LayerNorm, nn.GroupNorm,
+        nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
+        nn.LocalResponseNorm,
+    )
+
+
+def split_weight_decay_groups(
+    model: nn.Module,
+    weight_decay: float,
+    extra_no_decay_names: Sequence[str] = (),
+    extra_no_decay_params: Sequence[Optional[torch.nn.Parameter]] = (),
+    include_1d_as_no_decay: bool = True,
+):
+    """
+    Build AdamW param groups:
+      - Decay: 'true' weights.
+      - No-decay: biases, norm params, explicitly provided params, and (optionally) 1D tensors.
+    Uses PARAM IDENTITY to ensure correct bucketing.
+
+    Args:
+        model: the module to scan for parameters.
+        weight_decay: WD to apply to the decay group.
+        extra_no_decay_names: param names or suffixes to exclude from WD (exact or ".suffix" match).
+        extra_no_decay_params: explicit Parameter objects to exclude (by identity).
+        include_1d_as_no_decay: if True, any 1D tensor (e.g., LayerNorm/Bias) goes to no-decay.
+
+    Returns:
+        A list of param-group dicts suitable for torch.optim.AdamW.
+    """
+    norm_types = _norm_classes()
+
+    # 1) Collect no-decay by identity (explicit params)
+    no_decay_ids = set(id(p) for p in extra_no_decay_params if p is not None)
+
+    # 2) Add norm layer params by identity
+    for m in model.modules():
+        if isinstance(m, norm_types):
+            for p in m.parameters(recurse=False):
+                no_decay_ids.add(id(p))
+
+    # 3) Name-based rules (bias and explicit suffix matches)
+    name_rules = set(extra_no_decay_names or ())
+
+    def name_is_extra(n: str) -> bool:
+        # exact or endswith(".name")
+        return (n in name_rules) or any(n.endswith(f".{x}") for x in name_rules)
+
+    # 4) Final bucketing
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if (
+            id(p) in no_decay_ids
+            or n.endswith("bias")
+            or name_is_extra(n)
+            or (include_1d_as_no_decay and p.ndim == 1)
+        ):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
+def _as_param_groups(obj, weight_decay: float):
+    """Best-effort conversion of various inputs into AdamW param groups.
+
+    Accepts:
+      - nn.Module -> single WD-specified group (caller typically wants split_weight_decay_groups instead)
+      - Iterable[Parameter] -> one group
+      - Sequence[dict] (already param groups) -> returned as-is
+    """
+    if isinstance(obj, nn.Module):
+        return [{"params": [p for p in obj.parameters() if p.requires_grad], "weight_decay": float(weight_decay)}]
+
+    # Already param groups
+    if isinstance(obj, (list, tuple)) and len(obj) > 0 and isinstance(obj[0], dict):
+        return list(obj)
+
+    # Iterable of parameters
+    try:
+        it = iter(obj)  # type: ignore
+    except TypeError:
+        raise TypeError("build_adamw: unsupported input type for 'model'/'params' argument.")
+    params = [p for p in it if isinstance(p, torch.nn.Parameter)]
+    if not params:
+        raise ValueError("build_adamw: received an iterable with no Parameters.")
+    return [{"params": params, "weight_decay": float(weight_decay)}]
+
+
+def build_adamw(
+    model: Union[nn.Module, Sequence[dict], Iterable[torch.nn.Parameter]],
+    lr: float,
+    weight_decay: float,
+    extra_no_decay_names: Sequence[str] = (),
+    extra_no_decay_params: Sequence[Optional[torch.nn.Parameter]] = (),
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    include_1d_as_no_decay: bool = True,
+):
+    """
+    Flexible AdamW builder.
+
+    If `model` is an nn.Module -> build groups using split_weight_decay_groups (norms/bias excluded).
+    If `model` is an iterable of Parameters -> single group (uses provided weight_decay).
+    If `model` is a sequence of param-group dicts -> passed through unchanged.
+
+    Note: We always pass `weight_decay=0.0` to the optimizer itself and rely on group-level WD.
+    """
+    if isinstance(model, nn.Module):
+        groups = split_weight_decay_groups(
+            model,
+            weight_decay,
+            extra_no_decay_names=extra_no_decay_names,
+            extra_no_decay_params=extra_no_decay_params,
+            include_1d_as_no_decay=include_1d_as_no_decay,
+        )
+    else:
+        groups = _as_param_groups(model, weight_decay)
+
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+
+# ============================================================
+# TrainingStatTracker (updated to support global_opt_step)
+# ============================================================
 class TrainingStatTracker(object):
     """
     Tracks metrics at two levels:
@@ -107,6 +244,11 @@ class TrainingStatTracker(object):
     def __init__(self, ema_decay: float = 0.9, ema_max_history: int = 200):
         # Window (micro-step) accumulators
         self._reset_window()
+
+        # Global optimizer-step index (used by logging)
+        # Convention: this marks the CURRENT step id used for logging;
+        # it is incremented AFTER finalize_step() completes.
+        self.global_opt_step: int = 0
 
         # LRs (latest seen per optimizer-step)
         self.last_support_lr = 0.0
@@ -256,6 +398,10 @@ class TrainingStatTracker(object):
         self.last_support_lr = float(support_lr)
         self.last_recon_lr = float(recon_lr)
 
+    # Allow trainer to sync starting index (resume)
+    def set_opt_step(self, step_idx: int):
+        self.global_opt_step = int(step_idx)
+
     # ---------- per-step finalize ----------
     def finalize_step(
         self,
@@ -268,8 +414,20 @@ class TrainingStatTracker(object):
     ):
         """
         Called once per optimizer step to store a compact dictionary of metrics.
+        - Stores under the provided step_idx
+        - Exposes both legacy and new metric keys for backward compatibility
+        - Increments global_opt_step AFTER storing
         """
         rec = dict(window_means)
+
+        # Backward-compat aliases expected by some logs
+        if 'classification_loss' not in rec and 'L_classification' in rec:
+            rec['classification_loss'] = rec['L_classification']
+        if 'wave_loss' not in rec and 'L_wave' in rec:
+            rec['wave_loss'] = rec['L_wave']
+        if 'kl_loss' not in rec and 'L_kl' in rec:
+            rec['kl_loss'] = rec['L_kl']
+
         rec.update({
             'support_sets_lr': self.last_support_lr,
             'reconstructor_lr': self.last_recon_lr,
@@ -278,6 +436,9 @@ class TrainingStatTracker(object):
             'eta_sec': float(eta_seconds),
         })
         self.stats_by_step[int(step_idx)] = rec
+
+        # Advance the global step *after* storing
+        self.global_opt_step = int(step_idx) + 1
 
     # ---------- time helpers ----------
     def push_step_time(self, dt_seconds: float):
@@ -430,86 +591,7 @@ def create_summarizing_gif(imgs_root, gif_filename, num_imgs=None, gif_size=None
         loop=0,
         duration=1000 // gif_fps)
 
-
-# -----------------------------
-# Hyperparameter helper function
-# --------------------------------
-
-def _norm_classes():
-    return (
-        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm,
-        nn.LayerNorm, nn.GroupNorm,
-        nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d,
-        nn.LocalResponseNorm
-    )
-
-def split_weight_decay_groups(
-    model: nn.Module,
-    weight_decay: float,
-    extra_no_decay_names=(),
-    extra_no_decay_params=(),
-    include_1d_as_no_decay=True,
-):
-    """
-    Build AdamW param groups:
-      - Decay: 'true' weights.
-      - No-decay: biases, norm params, explicitly provided params, and (optionally) 1D tensors.
-    Uses PARAM IDENTITY to ensure correct bucketing.
-    """
-    norm_types = _norm_classes()
-
-    # 1) Collect no-decay by identity
-    no_decay_ids = set(id(p) for p in extra_no_decay_params if p is not None)
-
-    # 2) Add norm layer params by identity
-    for m in model.modules():
-        if isinstance(m, norm_types):
-            for p in m.parameters(recurse=False):
-                no_decay_ids.add(id(p))
-
-    # 3) Add by name rules (bias, and explicit name matches)
-    name_rules = set(extra_no_decay_names or ())
-    def name_is_extra(n: str) -> bool:
-        # exact or endswith(".name")
-        return (n in name_rules) or any(n.endswith(f".{x}") for x in name_rules)
-
-    # 4) Final pass: bucket by identity (primary), with optional 1D rule
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-
-        if id(p) in no_decay_ids or n.endswith("bias") or name_is_extra(n) \
-           or (include_1d_as_no_decay and p.ndim == 1):
-            no_decay.append(p)
-        else:
-            decay.append(p)
-
-    groups = []
-    if decay:
-        groups.append({"params": decay, "weight_decay": float(weight_decay)})
-    if no_decay:
-        groups.append({"params": no_decay, "weight_decay": 0.0})
-    return groups
-
-def build_adamw(
-    model: nn.Module,
-    lr: float,
-    weight_decay: float,
-    extra_no_decay_names=(),
-    extra_no_decay_params=(),
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    include_1d_as_no_decay=True,
-):
-    groups = split_weight_decay_groups(
-        model, weight_decay,
-        extra_no_decay_names=extra_no_decay_names,
-        extra_no_decay_params=extra_no_decay_params,
-        include_1d_as_no_decay=include_1d_as_no_decay,
-    )
-    # Global WD = 0.0; we rely on group-level WD only.
-    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+from typing import Iterable, Sequence, Union, Optional
 
 
 
