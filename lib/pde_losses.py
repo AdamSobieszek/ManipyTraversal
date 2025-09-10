@@ -149,7 +149,6 @@ class FConvex(PDELoss):
       - margin: float (default 0.0) # require average curvature >= margin
     """
     name = "fconvex"
-
     def _loss(self, st: PDEState) -> torch.Tensor:
         probes = int(self.ctx.get("probes", 1))
         margin = float(self.ctx.get("margin", 0.0))
@@ -157,7 +156,35 @@ class FConvex(PDELoss):
         viol = (margin - q).clamp_min(0.0)           # hinge on negative average curvature
         return viol.pow(2)
 
+class FGradNormEMA(PDELoss):
+    r"""
+    Per-head EMA target for ||∇f|| with deviation penalty.
 
+    Keeps an [K,1] EMA buffer of the batch-mean gradient norm for each head
+    and penalizes per-sample deviations from that running target.
+
+    Ctx (optional):
+      - ema_beta: float in [0,1) (default 0.99)
+      - relative: bool (default False)  # if True, penalize relative error
+      - eps: float (default 1e-8)       # stability for relative mode
+    """
+    name = "fgnorm"
+    @torch.no_grad()
+    def _init_or_update_ema(self, gnorm: torch.Tensor):
+        gnorm = gnorm.mean(dim=0, keepdim=True)
+        if "ema_fgnorm" not in self.ctx:
+            self.ctx["ema_fgnorm"] = torch.ones_like(gnorm)
+        else:
+            self.ctx["ema_fgnorm"].lerp_(gnorm, 1.0 - self.ctx.get("ema_beta", 0.99))
+
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        gnorm = st.f_grad().norm(dim=-1, keepdim=True)
+        self._init_or_update_ema(gnorm.clone().detach())
+        if self.ctx.get("relative", False):
+            diff = (gnorm - self.ctx["ema_fgnorm"]) / (self.ctx["ema_fgnorm"].abs() + self.ctx.get("eps", 1e-8))
+        else:
+            diff = gnorm - self.ctx["ema_fgnorm"]
+        return diff.pow(2)
 
 # ---------------- Public registry API ----------------
 
@@ -185,7 +212,7 @@ def build_losses(lambda_dict: Dict[str, float], **ctx) -> Tuple[List[PDELoss], b
     Returns (loss_list, needs_next_any).
     """
     reg = loss_registry()
-    losses: List[PDELoss] = []
+    losses: List[PDELoss] = []  
     needs_next_any = False
     for raw_name, lam in lambda_dict.items():
         key = _normalize(raw_name)

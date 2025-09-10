@@ -14,7 +14,7 @@ import torch.backends.cudnn as cudnn
 from torchvision.utils import make_grid
 
 from .aux import sample_z, TrainingStatTracker, update_progress, update_stdout, sec2dhms
-from .aux import CosineScheduleWithWarmup, build_adamw, ImageLogger, ImageViz, _pack_BK
+from .aux import CosineScheduleWithWarmup, build_adamw, ImageLogger, ImageViz, _pack_BK,_per_k_grad_norms,module_grad_norm
 from .validity_loss import KLPath
 
 
@@ -110,30 +110,6 @@ class Trainer(object):
         print("      ==============================================================")
         
 
-    # ------------------------ per-k grad norms (stacked) ------------------------
-    @torch.no_grad()
-    def _per_k_grad_norms(self, support_sets) -> np.ndarray:
-        K = support_sets.num_support_sets
-        g2 = torch.zeros(K, dtype=torch.float32)
-
-        for p in support_sets.parameters():
-            g = p.grad
-            if g is None:
-                continue
-            g = g.detach().float()
-            if g.ndim == 0:
-                continue
-                
-            # find which axis corresponds to K (don’t assume it’s dim 0)
-            axes_with_K = [ax for ax, sz in enumerate(g.shape) if sz == K]
-            if not axes_with_K:
-                continue
-            k_ax = axes_with_K[0]
-            if k_ax != 0:
-                g = g.movedim(k_ax, 0)  # put K in front
-            g2 += g.float().reshape(K, -1).pow(2).sum(dim=1)
-        return torch.sqrt(torch.clamp(g2, min=1e-12)).cpu().numpy()
-
     def loss_allK(self, support_sets, generator, reconstructor, z, t_index, acc_denominator: int):
         """
         One forward for all K in parallel. Ensures classifier gradients reach ψ/f via img2.
@@ -204,14 +180,15 @@ class Trainer(object):
             img1_bk = img1.detach().contiguous().view(B, K, *img1.shape[1:])
             img2_bk = img2.detach().contiguous().view(B, K, *img2.shape[1:])
 
-        return (
-            loss.detach(), cls_loss.detach(), pde_loss.detach(), kl_loss.detach(),
-            logits.detach(), targets,
-            latent1_bk.detach(), latent2_bk.detach(),
-            img1_bk, img2_bk,
-            float(entropy.item()), float(d1.item()), float(d2.item()),
-            potential_preds.detach(),
-        )
+        return {
+            "total_loss": float(loss.detach()),
+            "classification_loss": float(cls_loss.detach()),
+            "pde_loss": float(pde_loss.detach()),
+            "kl_loss": float(kl_loss.detach()),
+            "entropy": float(entropy.item()),
+            "step1_norm": float(d1.item()),
+            "step2_norm": float(d2.item())}, logits.detach(), targets, latent1_bk.detach(), latent2_bk.detach(), img1_bk, img2_bk, potential_preds.detach()
+
 
     # ------------------------ checkpoint utils ------------------------
     def get_starting_iteration(self, support_sets, reconstructor, support_opt=None, recon_opt=None, support_sched=None, recon_sched=None):
@@ -376,8 +353,8 @@ class Trainer(object):
 
         if self.tensorboard and save_images:
             img_logger = ImageLogger(
-                base_logdir= osp.join(self.tb_writer.log_dir, "_images"),
-                keep_last=img_keep_last,
+                run_logdir=self.tb_writer.log_dir,
+                keep_last_images=img_keep_last,
             )
 
         t0 = time.time()
@@ -411,11 +388,9 @@ class Trainer(object):
             # Random step index per sample
             t_idx = torch.randint(0, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)
 
-            (loss, cls_loss, pde_loss, kl_loss, logits, targets,
-            latent1_bk, latent2_bk, img1_bk, img2_bk, entropy, step1_norm, step2_norm,
-            potential_preds) = self.loss_allK(
-                support_sets, generator, reconstructor, z, t_idx, acc_denominator=acc_steps
-            )
+            (loss_dict, logits, targets,
+            latent1_bk, latent2_bk, img1_bk, img2_bk, potential_preds) = self.loss_allK(
+                support_sets, generator, reconstructor, z, t_idx, acc_denominator=acc_steps)
 
             # ===== analytics & stats =====
             with torch.no_grad():
@@ -427,7 +402,7 @@ class Trainer(object):
                 batch_acc = (preds_2d == true_2d).float().mean().item()
 
                 per_k_acc = (preds_2d == true_2d).float().mean(dim=0).cpu().numpy()  # [K]
-                per_k_gn = self._per_k_grad_norms(support_sets) if analytics else None
+                per_k_gn = _per_k_grad_norms(support_sets) if analytics else None
 
                 wave_dict = support_sets.get_losses()
                 wave_dict['potential_std'] = potential_preds.std().item()
@@ -436,13 +411,7 @@ class Trainer(object):
                 # Stat tracker accumulates raw window metrics
                 self.stat_tracker.add_micro(
                     acc=batch_acc,
-                    classification_loss=float(cls_loss.item()),
-                    kl_loss=float(kl_loss.item()),
-                    pde_loss=float(pde_loss.item()),
-                    total_loss=float(loss.item()),
-                    entropy=float(entropy),
-                    step1_norm=float(step1_norm),
-                    step2_norm=float(step2_norm),
+                    **loss_dict,
                     **{k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in wave_dict.items()},
                 )
 
@@ -461,12 +430,6 @@ class Trainer(object):
             if is_boundary:
                 # Grad norm snapshots (to scalars writer)
                 if analytics and self.tensorboard:
-                    def module_grad_norm(mod):
-                        total_sq = 0.0
-                        for p in mod.parameters():
-                            if p.grad is not None:
-                                total_sq += float(p.grad.detach().to('cpu').pow(2).sum().item())
-                        return math.sqrt(total_sq)
                     gn_support = module_grad_norm(support_sets.PSI) + module_grad_norm(support_sets.F)
                     gn_recon = module_grad_norm(reconstructor)
                     self.tb_writer.add_scalar("train/grad_norm/support_sets", gn_support, self.stat_tracker.global_opt_step)
@@ -520,7 +483,6 @@ class Trainer(object):
                         fig_c = ImageViz.plot_confusion(self.stat_tracker.confusion, K=self.K)
                         self.tb_writer.add_figure("classifier/confusion_matrix", fig_c, global_step=self.stat_tracker.global_opt_step)
                         plt.close(fig_c)
-
                         ImageViz.log_potential_distribution(self.tb_writer, "potential_distribution",
                                                             potential_preds, self.stat_tracker.global_opt_step, K=self.K)
                 # --------------------------- /TensorBoard logging ---------------------------
