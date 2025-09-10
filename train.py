@@ -172,7 +172,7 @@ def main():
     S = WavePDE(num_support_sets=args.num_support_sets,
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
-                    lambdas={'fgorth': 1.0 },
+                    lambdas={'g2orth': 1.0, 'vnorm': 1.0 },
                     
                     )
 

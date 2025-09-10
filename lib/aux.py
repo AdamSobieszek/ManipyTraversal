@@ -665,98 +665,6 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return CosineScheduleWithWarmup(optimizer, num_warmup_steps, num_training_steps, last_epoch)
 
 
-# image_logging.py
-import math
-import shutil
-from pathlib import Path
-from typing import Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torchvision.utils import make_grid
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe
-import matplotlib.pyplot as plt
-from torch.utils.tensorboard import SummaryWriter
-
-
-class RollingImageWriter:
-    """
-    Writes TensorBoard image summaries into rotating subdirs:
-      base_logdir/_images/images_000000, images_000001, ...
-    Keeps only the most recent `keep_last` buckets on disk.
-    """
-    def __init__(
-        self,
-        base_logdir: str,
-        keep_last: int = 4,
-        new_bucket_every_n_steps: int = -1,
-        filename_suffix: str = ".images",
-    ):
-        self.base = Path(base_logdir)
-        self.keep_last = int(keep_last)
-        self.roll_every = int(new_bucket_every_n_steps)
-        self.suffix = filename_suffix
-
-        self.base.mkdir(parents=True, exist_ok=True)
-        self._cur_bucket_idx: Optional[int] = None
-        self._cur_path: Optional[Path] = None
-        self._writer: Optional[SummaryWriter] = None
-
-    def _bucket_for(self, step: int) -> int:
-        return int(step // max(1, self.roll_every))
-
-    def _ensure_writer(self, step: int):
-        bucket_idx = self._bucket_for(step)
-        if self._cur_bucket_idx == bucket_idx and self._writer is not None:
-            return
-
-        # close previous
-        if self._writer is not None:
-            self._writer.flush()
-            self._writer.close()
-
-        # open new
-        path = self.base / f"images_{bucket_idx:06d}"
-        path.mkdir(parents=True, exist_ok=True)
-        self._writer = SummaryWriter(log_dir=str(path), filename_suffix=self.suffix)
-        self._cur_bucket_idx = bucket_idx
-        self._cur_path = path
-
-        self._prune_old_buckets()
-
-    def _prune_old_buckets(self):
-        runs = sorted([p for p in self.base.glob("images_*") if p.is_dir()],
-                      key=lambda p: p.stat().st_mtime)
-        if self.keep_last <= 0:
-            # delete everything except current
-            runs_to_delete = runs[:-1]
-        else:
-            runs_to_delete = runs[:-self.keep_last]
-
-        for p in runs_to_delete:
-            try:
-                shutil.rmtree(p, ignore_errors=True)
-            except Exception:
-                pass
-
-    def add_image(self, tag: str, img: torch.Tensor, step: int):
-        self._ensure_writer(step)
-        self._writer.add_image(tag, img, step)
-
-    def flush(self):
-        if self._writer is not None:
-            self._writer.flush()
-
-    def close(self):
-        if self._writer is not None:
-            self._writer.flush()
-            self._writer.close()
-            self._writer = None
-
-
 
 # image_logging.py
 import os
@@ -883,20 +791,6 @@ class ImageViz:
         fig.tight_layout()
         return fig
 
-    @staticmethod
-    def log_potential_distribution(
-        tb_writer: SummaryWriter,
-        tag_prefix: str,
-        potential_preds: torch.Tensor,  # [B,K,1] or [B,K]
-        step: int,
-        K: int,
-    ):
-        pot = potential_preds.detach().cpu()
-        if pot.ndim == 3 and pot.shape[-1] == 1:
-            pot = pot[..., 0]
-        for k in range(K):
-            tb_writer.add_histogram(f"{tag_prefix}/{k}/potential_distribution",
-                                    pot[:, k].reshape(-1), step)
 
 
 class ImageLogger:
@@ -908,16 +802,15 @@ class ImageLogger:
       • closing it,
       • pruning older `events.*.images*` files in the same run directory.
     """
-    def __init__(self, run_logdir: str, keep_last_images: int = 50, downscale: Optional[float] = None):
-        self.run_logdir = Path(run_logdir)
-        self.run_logdir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, writer: SummaryWriter, keep_last_images: int = 50, downscale: Optional[float] = None):
+        self.writer = writer
         self.keep_last_images = int(keep_last_images)
         self.downscale = downscale
 
     def _list_image_eventfiles(self):
         # PyTorch appends filename_suffix to event filename, so match *.images*
         return sorted(
-            [p for p in self.run_logdir.glob("events.out.tfevents.*.images*") if p.is_file()],
+            [p for p in self.writer.log_dir.glob("events.out.tfevents.*.images*") if p.is_file()],
             key=lambda p: p.stat().st_mtime
         )
 
@@ -936,11 +829,11 @@ class ImageLogger:
     def log_triplet(self, tag_prefix: str, x0: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor,
                     step: int, n_vis: int = 8):
         # short-lived writer to the SAME run dir; one event file per image step
-        writer = SummaryWriter(log_dir=str(self.run_logdir), filename_suffix=f".images.{step:09d}")
         triplet, diffs = ImageViz.make_triplet_grids(x0, x1, x2, n_vis=n_vis, downscale=self.downscale)
-        writer.add_image(f"{tag_prefix}/triplet", triplet, step)
-        writer.add_image(f"{tag_prefix}/diff_triplet_abs", diffs, step)
-        writer.flush(); writer.close()
-        self._prune_old_images()
+        self.writer.add_image(f"{tag_prefix}/triplet", triplet, step)
+        self.writer.add_image(f"{tag_prefix}/diff_triplet_abs", diffs, step)
+        self.writer.flush()
+        #  writer.close()
+        # self._prune_old_images()
         
     def close(self): self.writer.close()

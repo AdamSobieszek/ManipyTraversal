@@ -30,8 +30,8 @@ python train.py $tb \
                 --max-iter=${max_iter} \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
-                --log-freq=16 \
-                --ckp-freq=100 \
+                --log-freq=50 \
+                --ckp-freq=1000 \
                 --mps \
                 --no-cuda \
                 --reset_lr \

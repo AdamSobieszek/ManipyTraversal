@@ -212,7 +212,7 @@ class Trainer(object):
 
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, support_sets, reconstructor, acc_steps: int):
-        support_set_wd = float(getattr(self.params, "support_set_wd", 0.05))
+        support_set_wd = float(getattr(self.params, "support_set_wd", 0.01))
         reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.001))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
@@ -270,22 +270,6 @@ class Trainer(object):
                 sched_support.base_lrs = [g["lr"] for g in support_sets_optim.param_groups]
             if hasattr(sched_recon, "base_lrs"):
                 sched_recon.base_lrs = [g["lr"] for g in reconstructor_optim.param_groups]
-
-        if reset_weight_decay:
-            # Rebuild optimizers (drop moments)
-            support_sets_optim = build_adamw(
-                [
-                    {"params": support_sets.PSI.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
-                    {"params": support_sets.F.parameters(), "weight_decay": 0.1, "lr": self.params.support_set_lr},
-                    {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
-                ],
-                lr=self.params.support_set_lr, weight_decay=0.0, extra_no_decay_names=(), betas=betas, eps=eps
-            )
-            reconstructor_optim = build_adamw(
-                reconstructor, lr=self.params.reconstructor_lr, weight_decay=reconstructor_wd, extra_no_decay_names=(), betas=betas, eps=eps
-            )
-            sched_support = CosineScheduleWithWarmup(support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1)
-            sched_recon = CosineScheduleWithWarmup(reconstructor_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1)
 
         if reset_schedulers:
             sched_support = CosineScheduleWithWarmup(support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1)
@@ -353,7 +337,7 @@ class Trainer(object):
 
         if self.tensorboard and save_images:
             img_logger = ImageLogger(
-                run_logdir=self.tb_writer.log_dir,
+                writer=self.tb_writer,
                 keep_last_images=img_keep_last,
             )
 
@@ -483,8 +467,9 @@ class Trainer(object):
                         fig_c = ImageViz.plot_confusion(self.stat_tracker.confusion, K=self.K)
                         self.tb_writer.add_figure("classifier/confusion_matrix", fig_c, global_step=self.stat_tracker.global_opt_step)
                         plt.close(fig_c)
-                        ImageViz.log_potential_distribution(self.tb_writer, "potential_distribution",
-                                                            potential_preds, self.stat_tracker.global_opt_step, K=self.K)
+                        for k in range(K):
+                            self.tb_writer.add_histogram(f"potential_distribution/{k}",
+                                                    potential_preds[:, k].reshape(-1).cpu(), self.stat_tracker.global_opt_step)
                 # --------------------------- /TensorBoard logging ---------------------------
 
                 # Timing, progress, persist

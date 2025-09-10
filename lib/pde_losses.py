@@ -156,7 +156,7 @@ class FConvex(PDELoss):
         viol = (margin - q).clamp_min(0.0)           # hinge on negative average curvature
         return viol.pow(2)
 
-class FGradNormEMA(PDELoss):
+class VNormEMA(PDELoss):
     r"""
     Per-head EMA target for ||∇f|| with deviation penalty.
 
@@ -168,23 +168,73 @@ class FGradNormEMA(PDELoss):
       - relative: bool (default False)  # if True, penalize relative error
       - eps: float (default 1e-8)       # stability for relative mode
     """
-    name = "fgnorm"
+    name = "vnorm"
     @torch.no_grad()
-    def _init_or_update_ema(self, gnorm: torch.Tensor):
-        gnorm = gnorm.mean(dim=0, keepdim=True)
-        if "ema_fgnorm" not in self.ctx:
-            self.ctx["ema_fgnorm"] = torch.ones_like(gnorm)
+    def _init_or_update_ema(self, vnorm: torch.Tensor):
+        vnorm = vnorm.mean(dim=0, keepdim=True)
+        if "ema_vnorm" not in self.ctx:
+            self.ctx["ema_vnorm"] = vnorm.clone().detach()+1
         else:
-            self.ctx["ema_fgnorm"].lerp_(gnorm, 1.0 - self.ctx.get("ema_beta", 0.99))
+            self.ctx["ema_vnorm"].lerp_(vnorm, 1.0 - self.ctx.get("ema_beta", 0.99))
+
+        self.ctx["ema_vnorm"].lerp_(vnorm.mean(dim=1,keepdim=True).repeat(1,vnorm.shape[1],1), 1.0 - self.ctx.get("ema_beta", 0.99))
+        
 
     def _loss(self, st: PDEState) -> torch.Tensor:
-        gnorm = st.f_grad().norm(dim=-1, keepdim=True)
-        self._init_or_update_ema(gnorm.clone().detach())
+        vnorm = st.v().norm(dim=-1, keepdim=True)
+        self._init_or_update_ema(vnorm.clone().detach())
         if self.ctx.get("relative", False):
-            diff = (gnorm - self.ctx["ema_fgnorm"]) / (self.ctx["ema_fgnorm"].abs() + self.ctx.get("eps", 1e-8))
+            diff = (vnorm - self.ctx["ema_vnorm"]) / (self.ctx["ema_vnorm"].abs() + self.ctx.get("eps", 1e-8))
         else:
-            diff = gnorm - self.ctx["ema_fgnorm"]
+            diff = vnorm - self.ctx["ema_vnorm"]
         return diff.pow(2)
+
+class GradGroupSecondMomentOrtho(PDELoss):
+    r"""
+    Group-level second-moment orthogonality of gradients.
+
+    For gradients g_{b,k,:} ∈ R^D (k = 1..K), form the group Gram matrix
+        G_{b, k, l} = < g_{b,k,:}, g_{b,l,:} >  (second moment, uncentered)
+    and penalize off-diagonal entries:
+        L = mean_l ( G_{b,k,l}^2 ),  l != k
+    returned per (b,k) as [B,K,1].
+
+    Ctx:
+      - field: {"f","psi","v"} (default "f")  # which gradient/vector to use
+      - when:  {"now","next"} for psi/v (default "now")
+      - normalize: bool (default False)       # if True, use cosine (scale-invariant)
+      - eps: float (default st.cfg["eps_norm2"])  # for safe normalization
+    """
+    name = "g2orth"
+
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        field = str(self.ctx.get("field", "v"))
+        when  = str(self.ctx.get("when", "now"))
+        normalize = bool(self.ctx.get("normalize", False))
+        eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
+
+        # pick the vector field whose group orthogonality we regularize
+        if field == "f":
+            g = st.f_grad()            # [B,K,D]
+        elif field == "psi":
+            g = st.psi_grad(when)      # [B,K,D]
+        elif field == "v":
+            g = st.v(when)             # [B,K,D]
+        else:
+            g = st.f_grad()
+
+        if normalize:
+            # scale-invariant (cosine-style) orthogonality
+            g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
+
+        # Gram across group members (second moment): [B,K,K]
+        gram = torch.einsum("bkd,bld->bkl", g, g)
+
+        # zero the diagonal (we only penalize off-diagonal cross-terms)
+        gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
+
+        # per-member penalty: mean of squared off-diagonals in each row -> [B,K,1]
+        return gram.pow(2).sum(dim=-1, keepdim=True)
 
 # ---------------- Public registry API ----------------
 
