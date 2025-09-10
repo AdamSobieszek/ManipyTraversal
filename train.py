@@ -172,7 +172,8 @@ def main():
     S = WavePDE(num_support_sets=args.num_support_sets,
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
-                    lambdas={'bb': 1.0, 'div': 1.0, 'foot': 1.0, 'tan': 1.0})
+                    lambdas={'fconvex': 2.0 },
+                    )
 
     # For stylegan remove the last activation layer otherwise the changes are too small
     # if args.gan_type != 'StyleGAN2':

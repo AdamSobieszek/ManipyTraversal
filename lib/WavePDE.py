@@ -148,7 +148,7 @@ class StackedSinusoidalPositionEmbeddings(nn.Module):
 #   - Only the FINAL output of f (and optionally ψ) is BatchNormed per-k
 # ================================================================
 class StackedSemanticPotential(nn.Module):
-    def __init__(self, K: int, n_in: int, n_out: int = 1, final_activation: nn.Module = nn.Identity()):
+    def __init__(self, K: int, n_in: int, n_out: int = 1, activation: nn.Module = nn.Tanh(), final_activation: nn.Module = nn.Identity()):
         super().__init__()
         self.K = int(K)
         self.n_in = int(n_in)
@@ -156,13 +156,13 @@ class StackedSemanticPotential(nn.Module):
 
         hidden = self.n_in
         self.fc1 = StackedLinear(self.K, self.n_in, hidden)
-        self.act1 = nn.Tanh()
+        self.act1 = activation
 
         self.fc2 = StackedLinear(self.K, hidden, hidden)
-        self.act2 = nn.Tanh()
+        self.act2 = activation
 
         self.fc3 = StackedLinear(self.K, hidden, hidden)
-        self.act3 = nn.Tanh()
+        self.act3 = activation
 
         self.fc4 = StackedLinear(self.K, hidden, self.n_out)
 
@@ -746,7 +746,6 @@ class WavePDE(nn.Module):
         # telemetry
         potential_preds = last_st.f().detach() if last_st is not None else torch.zeros(B, K, 1, device=z.device, dtype=z.dtype)
         self._acc = {
-            "potential_preds": potential_preds,
             "xf_now": last_st.Xf() if last_st is not None else torch.zeros(B, K, D, device=z.device, dtype=z.dtype),
             "L_mean": L_total_mean.detach(),
             **last_st.state["losses"],

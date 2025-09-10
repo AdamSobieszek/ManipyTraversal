@@ -32,68 +32,130 @@ class PDELoss(nn.Module):
 # ---------------- Losses ----------------
 
 class OT(PDELoss):
+    """Placeholder; define your optimal transport term here."""
     name = "ot"
     def _loss(self, st: PDEState) -> torch.Tensor:
         return st.zeros()
 
 class BB(PDELoss):
+    """Benamou–Brenier kinetic energy: ||v||^2."""
     name = "bb"
     def _loss(self, st: PDEState) -> torch.Tensor:
         return st.v("now").pow(2).sum(dim=-1, keepdim=True)
 
 class UnitSpeed(PDELoss):
+    """(<∇f, v> - 1)^2."""
     name = "unitspeed"
     def _loss(self, st: PDEState) -> torch.Tensor:
         res = (st.f_grad() * st.v("now")).sum(dim=-1, keepdim=True) - 1.0
         return res.pow(2)
-
+     
 class SliceHJ(PDELoss):
+    r"""
+    HJ residual at "now": (ψ + 0.5||∇ψ||^2 - 0.5 ε^2 Δψ)^2.
+    Pass epsilon via `epsilon=...` (defaults to 0.0).
+    """
     name = "slicehj"
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon", 0.0))
         H = 0.5 * st.psi_grad("now").pow(2).sum(dim=-1, keepdim=True)
-        lap = st.psi_laplace("now") if eps > 0.0 else st.zeros()
-        res = st.psi("now") + H - 0.5 * (eps**2) * lap
+        if eps > 0.0:
+            lap = st.psi_laplace("now")
+        else:
+            lap = st.zeros()
+        res = st.psi("now") + H - 0.5 * (eps ** 2) * lap
+        return res.pow(2)
+             
+class HJ(PDELoss):
+    r"""
+    HJ residual at "now": (ψ + 0.5||∇ψ||^2 - 0.5 ε^2 Δψ)^2.
+    Pass epsilon via `epsilon=...` (defaults to 0.0).
+    """
+    name = "hj"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        eps = float(self.ctx.get("epsilon", 0.0))
+        H = 0.5 * st.psi_grad("now").pow(2).sum(dim=-1, keepdim=True)
+        if eps > 0.0:
+            lap = st.psi_laplace("now")
+        else:
+            lap = st.zeros()
+        res = st.psi("now") + H - 0.5 * (eps ** 2) * lap
         return res.pow(2)
 
 class Kinetic(PDELoss):
+    r"""
+    Kinetic term (wave-like): ψ_tt(next) - ||∇ψ(next)|| / ||∇f(x_hat)||, with x_hat := x + ∇ψ(next).
+    Requires the semantic potential module F: pass as `F=...` when constructing.
+    """
     name = "kin"
-    needs_next = True
     def _loss(self, st: PDEState) -> torch.Tensor:
-        F: nn.Module = self.ctx["F"]
+        F: nn.Module = self.ctx["F"]  # required
         eps_norm2 = float(st.cfg["eps_norm2"])
-        psi_tt_next = st.psi_tt("next")
-        gpsi_next = st.psi_grad("next")
-        gnorm = gpsi_next.norm(dim=-1, keepdim=True)
-        x_hat = st.x() + gpsi_next
-        t_hat = F(x_hat)
+
+        psi_tt_next = st.psi_tt("next")                         # [B,K,1]
+        gpsi_next   = st.psi_grad("next")                       # [B,K,D]
+        gnorm       = gpsi_next.norm(dim=-1, keepdim=True)      # [B,K,1]
+
+        x_hat = st.x() + gpsi_next                              # [B,K,D]
+        t_hat = F(x_hat)                                        # [B,K,1]
         gradf_hat = grad(t_hat.sum(), x_hat, create_graph=True)[0]
         denom = gradf_hat.pow(2).sum(dim=-1, keepdim=True).add(eps_norm2).sqrt()
+
         res = psi_tt_next - (gnorm / denom)
         return res.pow(2)
 
 class Footpoint(PDELoss):
+    r"""
+    Footpoint consistency: f(x + ∇ψ(now)) - ( f(x) + dt ) squared.
+    Requires F: pass as `F=...`.
+    """
     name = "foot"
     def _loss(self, st: PDEState) -> torch.Tensor:
-        F: nn.Module = self.ctx["F"]
+        F: nn.Module = self.ctx["F"]  # required
         x_hat = st.x() + st.psi_grad("now")
         t_next_from_hat = F(x_hat)
         return (t_next_from_hat - (st.f() + st.dt())).pow(2)
 
 class DivPrior(PDELoss):
+    r"""
+    Divergence prior: ( ∇·v(now) + <s_prior(x), v(now)> )^2.
+    Default s_prior(x) = -x (Gaussian prior). You can pass a custom callable via `prior_score=...`.
+    """
     name = "div"
     def _loss(self, st: PDEState) -> torch.Tensor:
+        div_v = st.v_div("now")                                  # [B,K,1]
         prior_score: Optional[Callable[[torch.Tensor], torch.Tensor]] = self.ctx.get("prior_score", None)
-        div_v = st.v_div("now")
         s_prior = prior_score(st.x()) if prior_score is not None else -st.x()
         res = div_v + (s_prior * st.v("now")).sum(dim=-1, keepdim=True)
         return res.pow(2)
 
-class Tangential(PDELoss):
+class Tangency(PDELoss):
+    """Placeholder for tangency constraints if you add one later."""
     name = "tan"
     def _loss(self, st: PDEState) -> torch.Tensor:
-        return st.zeros()
+        res = (st.f_grad() * st.psi_grad()).sum(dim=-1, keepdim=True)
+        return res.pow(2)
 
+class FConvex(PDELoss):
+    r"""
+    Trace-based convexity penalty for f.
+
+    Uses Hutchinson's estimator of the Laplacian:
+        q ≈ E_v [ v^T (∇^2 f) v ] = tr(∇^2 f)
+    and penalizes violations of q >= margin via a hinge.
+
+    Ctx:
+      - probes: int (default 8)     # number of Hutchinson probes
+      - margin: float (default 0.0) # require average curvature >= margin
+    """
+    name = "fconvex"
+
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        probes = int(self.ctx.get("probes", 1))
+        margin = float(self.ctx.get("margin", 0.0))
+        q = st.f_laplace(probes=probes)              # [B,K,1], ≈ average v^T Hf v
+        viol = (margin - q).clamp_min(0.0)           # hinge on negative average curvature
+        return viol.pow(2)
 
 
 

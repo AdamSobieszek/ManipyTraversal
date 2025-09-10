@@ -228,6 +228,42 @@ def build_adamw(
 
     return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
 
+
+
+
+# Utils
+
+def _pack_BK(x_bk: torch.Tensor):
+    """
+    Flatten [B,K,...] → [B*K,...] in a *known* order and return the mapping + targets.
+    Order: (b=0,k=0..K-1), (b=1,k=0..K-1), ...
+    """
+    assert x_bk.dim() >= 2, f"Expected [B,K,...], got {tuple(x_bk.shape)}"
+    B, K = x_bk.shape[:2]
+
+    # Ensure [B,K,...] with K as dim=1 (guard against permuted tensors)
+    if x_bk.stride(1) == 1 and x_bk.is_contiguous(memory_format=torch.contiguous_format):
+        x_bk_c = x_bk
+    else:
+        x_bk_c = x_bk.contiguous()
+
+    flat = x_bk_c.view(B * K, *x_bk_c.shape[2:])
+
+    # Mapping & targets (same device as input)
+    dev = x_bk.device
+    b_idx = torch.arange(B, device=dev).repeat_interleave(K)     # [0,0,...,1,1,...]
+    k_idx = torch.arange(K, device=dev).repeat(B)                # [0..K-1, 0..K-1, ...]
+    targets = k_idx                                              # class k for row (b,k)
+
+    return flat, targets, (b_idx, k_idx), (B, K)
+
+
+
+
+
+
+
+
 # ============================================================
 # TrainingStatTracker (updated to support global_opt_step)
 # ============================================================
@@ -596,3 +632,287 @@ class CosineScheduleWithWarmup(_LRScheduler):
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     return CosineScheduleWithWarmup(optimizer, num_warmup_steps, num_training_steps, last_epoch)
+
+
+# image_logging.py
+import math
+import shutil
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision.utils import make_grid
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+
+
+class RollingImageWriter:
+    """
+    Writes TensorBoard image summaries into rotating subdirs:
+      base_logdir/_images/images_000000, images_000001, ...
+    Keeps only the most recent `keep_last` buckets on disk.
+    """
+    def __init__(
+        self,
+        base_logdir: str,
+        keep_last: int = 4,
+        new_bucket_every_n_steps: int = -1,
+        filename_suffix: str = ".images",
+    ):
+        self.base = Path(base_logdir)
+        self.keep_last = int(keep_last)
+        self.roll_every = int(new_bucket_every_n_steps)
+        self.suffix = filename_suffix
+
+        self.base.mkdir(parents=True, exist_ok=True)
+        self._cur_bucket_idx: Optional[int] = None
+        self._cur_path: Optional[Path] = None
+        self._writer: Optional[SummaryWriter] = None
+
+    def _bucket_for(self, step: int) -> int:
+        return int(step // max(1, self.roll_every))
+
+    def _ensure_writer(self, step: int):
+        bucket_idx = self._bucket_for(step)
+        if self._cur_bucket_idx == bucket_idx and self._writer is not None:
+            return
+
+        # close previous
+        if self._writer is not None:
+            self._writer.flush()
+            self._writer.close()
+
+        # open new
+        path = self.base / f"images_{bucket_idx:06d}"
+        path.mkdir(parents=True, exist_ok=True)
+        self._writer = SummaryWriter(log_dir=str(path), filename_suffix=self.suffix)
+        self._cur_bucket_idx = bucket_idx
+        self._cur_path = path
+
+        self._prune_old_buckets()
+
+    def _prune_old_buckets(self):
+        runs = sorted([p for p in self.base.glob("images_*") if p.is_dir()],
+                      key=lambda p: p.stat().st_mtime)
+        if self.keep_last <= 0:
+            # delete everything except current
+            runs_to_delete = runs[:-1]
+        else:
+            runs_to_delete = runs[:-self.keep_last]
+
+        for p in runs_to_delete:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+
+    def add_image(self, tag: str, img: torch.Tensor, step: int):
+        self._ensure_writer(step)
+        self._writer.add_image(tag, img, step)
+
+    def flush(self):
+        if self._writer is not None:
+            self._writer.flush()
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.flush()
+            self._writer.close()
+            self._writer = None
+
+
+class ImageViz:
+    """All image-creation helpers that used to live on Trainer."""
+
+    @staticmethod
+    def to_uint01(x: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize from [-1,1] or [0,1] to [0,1], clamp. Returns CPU float tensor.
+        x: (..., C, H, W)
+        """
+        x = x.detach().cpu()
+        if torch.numel(x) == 0:
+            return x
+        if x.min() < 0.0:
+            x = (x + 1.0) / 2.0
+        return x.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _pick_first_batch_and_K(t: torch.Tensor, k_vis: int) -> torch.Tensor:
+        # Accept [B,K,C,H,W], [B,C,H,W], or [C,H,W]
+        if t.ndim == 5:            # [B,K,C,H,W]
+            return t[0, :k_vis]    # [k_vis,C,H,W]
+        elif t.ndim == 4:          # [B,C,H,W]
+            return t[:k_vis]       # [min(B,k_vis),C,H,W]
+        elif t.ndim == 3:          # [C,H,W]
+            return t.unsqueeze(0).repeat(k_vis, 1, 1, 1)
+        else:
+            raise ValueError(f"Unexpected tensor ndim={t.ndim} for visualization")
+
+    @staticmethod
+    def _infer_k_vis(step1_src: torch.Tensor, n_vis: int) -> int:
+        if step1_src.ndim == 5:
+            K = step1_src.shape[1]
+            return min(int(n_vis), K)
+        elif step1_src.ndim == 4:
+            return min(int(n_vis), step1_src.shape[0])
+        else:
+            return int(n_vis)
+
+    @staticmethod
+    def _maybe_downscale(t: torch.Tensor, scale: Optional[float]) -> torch.Tensor:
+        if scale is None or abs(scale - 1.0) < 1e-6:
+            return t
+        return F.interpolate(t.float(), scale_factor=scale, mode="area").type_as(t)
+
+    @classmethod
+    def make_triplet_grids(
+        cls,
+        x0: torch.Tensor,  # step1
+        x1: torch.Tensor,  # step2
+        x2: torch.Tensor,  # ref
+        n_vis: int = 8,
+        downscale: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns (stacked_grid, stacked_diff_grid) ready for TB add_image.
+        """
+        step1_src, step2_src, ref_src = x0, x1, x2
+        k_vis = cls._infer_k_vis(step1_src, n_vis)
+
+        step1 = cls._pick_first_batch_and_K(step1_src, k_vis)
+        step2 = cls._pick_first_batch_and_K(step2_src, k_vis)
+
+        # Reference/original: repeat to match K columns if needed
+        if ref_src.ndim == 5:
+            orig = ref_src[0, :k_vis]  # [k_vis,C,H,W]
+        elif ref_src.ndim == 4:
+            if ref_src.shape[0] == 1:
+                orig = ref_src.repeat(k_vis, 1, 1, 1)
+            else:
+                orig = ref_src[:k_vis]
+        elif ref_src.ndim == 3:
+            orig = ref_src.unsqueeze(0).repeat(k_vis, 1, 1, 1)
+        else:
+            raise ValueError(f"Unexpected reference tensor ndim={ref_src.ndim}")
+
+        # Optional downscale for size savings
+        orig = cls._maybe_downscale(orig, downscale)
+        step1 = cls._maybe_downscale(step1, downscale)
+        step2 = cls._maybe_downscale(step2, downscale)
+
+        # Normalize to [0,1] for grid
+        orig_n = cls.to_uint01(orig)
+        s1_n   = cls.to_uint01(step1)
+        s2_n   = cls.to_uint01(step2)
+
+        # Grids: K columns, rows stacked vertically
+        grid_o  = make_grid(orig_n, nrow=k_vis)
+        grid_s1 = make_grid(s1_n,   nrow=k_vis)
+        grid_s2 = make_grid(s2_n,   nrow=k_vis)
+        stacked_grid = torch.cat([grid_o, grid_s1, grid_s2], dim=1)  # stack along height
+
+        # Absolute differences vs original
+        diff1 = (s1_n - orig_n).abs()
+        diff2 = (s2_n - orig_n).abs()
+        grid_d1 = make_grid(diff1, nrow=k_vis)
+        grid_d2 = make_grid(diff2, nrow=k_vis)
+        stacked_diff_grid = torch.cat([grid_d1, grid_d2], dim=1)
+
+        return stacked_grid, stacked_diff_grid
+
+    # ---------- Analytics (figures + histograms) ----------
+    @staticmethod
+    def plot_heatmap(mat_t_by_k, K: int, title: str, xlabel: str, ylabel: str):
+        """
+        mat_t_by_k: np.array of shape [K, T_hist] (preferred) or [T_hist, K]
+        Returns a matplotlib Figure.
+        """
+        arr = np.array(mat_t_by_k)
+        if arr.ndim == 2 and arr.shape[0] != K:
+            arr = arr.T  # make it [K, T_hist]
+        fig, ax = plt.subplots(figsize=(max(6, arr.shape[1] * 0.15), max(4, K * 0.15)))
+        im = ax.imshow(arr, aspect='auto', origin='lower', interpolation='nearest')
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_yticks(np.arange(K))
+        ax.set_yticklabels([str(i) for i in range(K)])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        return fig
+
+    @staticmethod
+    def plot_confusion(conf_mat_nd: np.ndarray, K: int):
+        """
+        conf_mat_nd: numpy.ndarray [K, K], rows = true k, cols = predicted k
+        """
+        cm = torch.tensor(conf_mat_nd, dtype=torch.float32)
+        row_sums = cm.sum(dim=1, keepdim=True).clamp(min=1.0)
+        cm_norm = (cm / row_sums).cpu().numpy()
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(cm_norm, interpolation='nearest', aspect='auto', origin='lower')
+        ax.set_title("Classifier Confusion (row=true k, col=pred k)")
+        ax.set_xlabel("predicted k")
+        ax.set_ylabel("true k")
+        ax.set_xticks(np.arange(K))
+        ax.set_yticks(np.arange(K))
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        return fig
+
+    @staticmethod
+    def log_potential_distribution(
+        tb_writer: SummaryWriter,
+        tag_prefix: str,
+        potential_preds: torch.Tensor,  # [B,K,1] or [B,K]
+        step: int,
+        K: int,
+    ):
+        pot = potential_preds.detach().cpu()
+        if pot.ndim == 3 and pot.shape[-1] == 1:
+            pot = pot[..., 0]
+        for k in range(K):
+            tb_writer.add_histogram(f"{tag_prefix}/{k}/potential_distribution", pot[:, k].reshape(-1), step)
+
+
+class ImageLogger:
+    """
+    Facade that combines the visualizers and the rotating TB writer.
+    """
+    def __init__(
+        self,
+        base_logdir: str,
+        keep_last: int = 4,
+        new_bucket_every_n_steps: int = -1,
+        downscale: Optional[float] = None,
+    ):
+        self.writer = RollingImageWriter(
+            base_logdir=base_logdir,
+            keep_last=keep_last,
+            new_bucket_every_n_steps=new_bucket_every_n_steps,
+        )
+        self.downscale = downscale
+
+    def log_triplet(
+        self,
+        tag_prefix: str,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        step: int,
+        n_vis: int = 8,
+    ):
+        triplet, diffs = ImageViz.make_triplet_grids(
+            x0, x1, x2, n_vis=n_vis, downscale=self.downscale
+        )
+        self.writer.add_image(f"{tag_prefix}/triplet", triplet, step)
+        self.writer.add_image(f"{tag_prefix}/diff_triplet_abs", diffs, step)
+
+    def flush(self): self.writer.flush()
+    def close(self): self.writer.close()
