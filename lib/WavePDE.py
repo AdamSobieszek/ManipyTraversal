@@ -241,7 +241,7 @@ class StackedSliceEnergy(nn.Module):
 # ================================================================
 # WavePDE: fully parallel over K
 # ================================================================
-class WavePDE(nn.Module):
+class WavePDELegacy(nn.Module):
     """
     Parallel (stacked) implementation over K support sets.
 
@@ -586,4 +586,197 @@ class WavePDE(nn.Module):
             z_next = z_leaf + dt * v
             traj.append(z_next)
             z_leaf = z_next
+        return traj
+
+# wave_pde.py
+import torch
+from torch import nn
+from typing import Dict, Optional, List
+
+from lib.pde_ops import PDEState
+from lib.pde_losses import build_losses 
+
+class WavePDE(nn.Module):
+    """
+    K-parallel WavePDE powered by PDEState and modular PDE losses.
+    """
+    def __init__(
+        self,
+        num_support_sets: int,
+        num_support_timesteps: int,
+        support_vectors_dim: int,
+        lambdas: Dict[str, float] = {},                   # ONLY what you want active (may include 0.0)
+        n_laplace_probes: int = 1,
+        apply_bn_on_psi_output: bool = False,
+        # PDEState config
+        time_ad: str = "reverse",
+        detach_between_steps: bool = True,
+        eps_norm2: float = 1e-8,
+        divergence_probes: int = 1,
+        rng: str = "rademacher",
+        seed: Optional[int] = None,
+        # optional: prior score function for DivPrior (defaults to Gaussian score -x)
+        prior_score: Optional[callable] = None,
+    ):
+        super().__init__()
+        self.num_support_sets = int(num_support_sets)
+        self.num_support_timesteps = int(num_support_timesteps)
+        self.support_vectors_dim = int(support_vectors_dim)
+
+        # Learnable per-k scale (kept for parity; not wired to dt by default)
+        self.c = nn.Parameter(torch.full((self.num_support_sets, 1), 1.0))
+
+        # Stacked potentials
+        self.PSI = StackedSliceEnergy(
+            K=self.num_support_sets,
+            n_in=self.support_vectors_dim,
+            n_out=1,
+            final_activation=nn.Identity(),
+            apply_output_bn=apply_bn_on_psi_output,
+        )
+        self.F = StackedSemanticPotential(
+            K=self.num_support_sets,
+            n_in=self.support_vectors_dim,
+            n_out=1,
+            final_activation=nn.Identity(),
+        )
+
+        # PDEState config for each step
+        self._pde_cfg = dict(
+            time_ad=time_ad,
+            detach_between_steps=detach_between_steps,
+            eps_norm2=eps_norm2,
+            laplace_probes=int(n_laplace_probes),
+            divergence_probes=int(divergence_probes),
+            rng=rng,
+            seed=seed,
+        )
+
+        # Build modular loss list from registry (only specified keys are included).
+        # Pass modules/params needed by certain losses through ctx.
+        epsilon = float(lambdas.get("epsilon", 0.0))  # a scalar param (not a loss)
+        self.losses, self._needs_next = build_losses(
+            lambdas,
+            F=self.F,
+            epsilon=epsilon,
+            prior_score=prior_score,
+        )
+
+        # for telemetry
+        self._acc: Dict[str, torch.Tensor] = {}
+
+    # ---- one step ----
+    def _per_step(self, z_bkd: torch.Tensor, direction: int = +1):
+        st = PDEState(
+            f=self.F,
+            psi=self.PSI,
+            z=z_bkd,
+            direction=direction,
+            need_next=self._needs_next,
+            dt_value=1.0,  # use ±1 step; wire self.c here if desired
+            **self._pde_cfg,
+        )
+
+        # compute & sum selected losses [B,K,1]
+        per_bk = [L(st) for L in self.losses]
+        L_sum = sum(per_bk) if per_bk else st.zeros()  # if no losses, zero tensor
+
+        # next latent (semi-implicit Euler @ now)
+        x_next = st.x_next()
+
+        # (optional) same small step noise as before
+        with torch.no_grad():
+            step_delta_norms = (x_next - st.x()).norm(dim=-1, keepdim=True)
+            latent_noise = torch.randn_like(x_next)
+            latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
+            latent_noise = latent_noise * (step_delta_norms / 5.0)
+        x_next_noisy = x_next + latent_noise
+
+        return st, x_next_noisy, L_sum
+
+    # ---- unrolled training ----
+    def forward(self, z: torch.Tensor, t_index: torch.Tensor, direction: int = +1):
+        """
+        Returns:
+          potential_preds: [B,K,1] (detached)
+          latent1_bk, latent2_bk: [B,K,D] (pair captured at t_index)
+          L_total_mean: scalar
+        """
+        B, D = z.shape
+        K = self.num_support_sets
+        T = max(1, int(self.num_support_timesteps))
+
+        if t_index.ndim == 1:
+            t_index = t_index.unsqueeze(-1)
+        i_target = torch.clamp(t_index, 0, T - 1).long().squeeze(-1)
+
+        # expand once to K stacks
+        z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
+
+        latent1_bk = None
+        latent2_bk = None
+        last_st: Optional[PDEState] = None
+
+        L_accum = None  # accumulate per-[B,K,1]
+
+        step_iter = range(T) if direction == +1 else reversed(range(T))
+        for i in step_iter:
+            st, x_next, L_step = self._per_step(z_curr, direction=direction)
+
+            # accumulate loss per step
+            L_accum = (L_step if L_accum is None else L_accum + L_step)
+
+            # capture (latent1, latent2) at the requested index
+            mask_b = (i_target == i).view(B, 1, 1)
+            if latent1_bk is None:
+                latent1_bk = torch.where(mask_b, z_curr, torch.zeros_like(z_curr))
+                latent2_bk = torch.where(mask_b, x_next, torch.zeros_like(x_next))
+            else:
+                latent1_bk = torch.where(mask_b, z_curr, latent1_bk)
+                latent2_bk = torch.where(mask_b, x_next, latent2_bk)
+
+            # advance
+            z_curr = x_next
+            last_st = st
+
+        # average over steps
+        L_total_per_bk = L_accum / float(T) if L_accum is not None else last_st.zeros()
+        L_total_mean = L_total_per_bk.mean()
+
+        # telemetry
+        potential_preds = last_st.f().detach() if last_st is not None else torch.zeros(B, K, 1, device=z.device, dtype=z.dtype)
+        self._acc = {
+            "potential_preds": potential_preds,
+            "xf_now": last_st.Xf() if last_st is not None else torch.zeros(B, K, D, device=z.device, dtype=z.dtype),
+            "L_mean": L_total_mean.detach(),
+            **last_st.state["losses"],
+        }
+        return potential_preds, latent1_bk, latent2_bk, L_total_mean
+
+    def get_losses(self) -> Dict[str, torch.Tensor]:
+        return self._acc
+
+    @torch.enable_grad()
+    def inference(self, z: torch.Tensor, direction: int = +1) -> List[torch.Tensor]:
+        B, D = z.shape
+        K = self.num_support_sets
+        T = max(1, int(self.num_support_timesteps))
+        traj: List[torch.Tensor] = []
+
+        z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
+        traj.append(z_curr)
+
+        for _ in (range(T) if direction == +1 else reversed(range(T))):
+            st = PDEState(
+                f=self.F,
+                psi=self.PSI,
+                z=z_curr,
+                direction=direction,
+                need_next=False,
+                dt_value=1.0,
+                **self._pde_cfg,
+            )
+            z_next = st.x() + st.dt() * st.v("now")
+            traj.append(z_next)
+            z_curr = z_next
         return traj

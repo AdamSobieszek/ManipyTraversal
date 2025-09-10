@@ -286,7 +286,6 @@ class TrainingStatTracker(object):
         *,
         acc: float,
         classification_loss: float,
-        wave_loss: float,
         kl_loss: float,
         total_loss: float,
         entropy: float = 0.0,
@@ -294,15 +293,6 @@ class TrainingStatTracker(object):
         step2_norm: float = 0.0,
         potential_std: float = 0.0,
         xf_now: float = 0.0,
-        # ---- optional PDE component-wise losses ----
-        ot: float | None = None,
-        kin: float | None = None,
-        sliceHJ: float | None = None,
-        foot: float | None = None,
-        unitspeed: float | None = None,
-        div: float | None = None,
-        BB: float | None = None,
-        tan: float | None = None,
         # ---- allow arbitrary extras without breaking ----
         **extras,
     ):
@@ -310,7 +300,6 @@ class TrainingStatTracker(object):
         self.win_count += 1
         self._acc('accuracy_index', acc)
         self._acc('L_classification', classification_loss)
-        self._acc('L_wave', wave_loss)
         self._acc('L_kl', kl_loss)
         self._acc('total_loss', total_loss)
         self._acc('entropy', entropy)
@@ -319,14 +308,6 @@ class TrainingStatTracker(object):
         self._acc('potential_std', potential_std)
         self._acc('xf_now', xf_now)
         # PDE components
-        self._acc('L_ot', ot)
-        self._acc('L_kin', kin)
-        self._acc('L_sliceHJ', sliceHJ)
-        self._acc('L_foot', foot)
-        self._acc('L_unitspeed', unitspeed)
-        self._acc('L_div', div)
-        self._acc('L_BB', BB)
-        self._acc('L_tan', tan)
 
         # Any extra scalar metrics can be merged automatically
         for k, v in extras.items():
@@ -423,8 +404,6 @@ class TrainingStatTracker(object):
         # Backward-compat aliases expected by some logs
         if 'classification_loss' not in rec and 'L_classification' in rec:
             rec['classification_loss'] = rec['L_classification']
-        if 'wave_loss' not in rec and 'L_wave' in rec:
-            rec['wave_loss'] = rec['L_wave']
         if 'kl_loss' not in rec and 'L_kl' in rec:
             rec['kl_loss'] = rec['L_kl']
 
