@@ -375,4 +375,3 @@ class WavePDE(nn.Module):
 
         st, x_next, L_step, dt = self._per_step(z_curr, dt=1.0, direction=direction)
         return z_curr, x_next-z_curr
-pde_
