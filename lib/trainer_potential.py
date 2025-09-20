@@ -125,11 +125,17 @@ class TrainerPotential(object):
         B, K, D = latent1_bk.shape
 
 
+
         # ---- pack latents for generator/classifier ----
         lat1_flat, targets, (b_idx, k_idx), (B, K) = _pack_BK(latent1_bk)
         lat2_flat, _,      _,                  _   = _pack_BK(latent2_bk)  # mapping identical by shape
+        
+        # Add initial latent
+        z0 = z.clone().unsqueeze(1).expand(B, K, D)
+        lat0_flat, _,      _,                  _   = _pack_BK(z0)
 
         # Images
+        img0 = generator(lat0_flat)
         img1 = generator(lat1_flat)
         img2 = generator(lat2_flat)
 
@@ -138,15 +144,17 @@ class TrainerPotential(object):
 
         # Classify
         logits, magnitudes = reconstructor(img1, img2)  # [B*K, K]
-        mse_loss = nn.MSELoss()(magnitudes[:,-1:].reshape(potential_preds.shape), potential_preds)
-        cls_loss = self.cross_entropy(logits, targets)
+        logits0, magnitudes0 = reconstructor(img0, img1)
+        mse_loss = nn.MSELoss()(magnitudes.reshape(B, K, 2), potential_preds[:,:,-2:])
+        mse_loss = (mse_loss + nn.MSELoss()(magnitudes0.reshape(B, K, 2), potential_preds[:,:,[0,-2]]))/2
+        cls_loss = (self.cross_entropy(logits, targets) + self.cross_entropy(logits0, targets))/2
 
 
 
         # Total loss
         loss = (
             self.params.lambda_cls * cls_loss
-            + self.params.lambda_reg * mse_loss
+            + self.params.lambda_reg * (mse_loss)
             + self.params.lambda_pde * pde_loss
         )
         loss = loss / max(1, int(acc_denominator))
@@ -209,6 +217,7 @@ class TrainerPotential(object):
             safe_load_state_dict(recon_opt, ckpt, 'recon_opt')
             safe_load_state_dict(support_sched, ckpt, 'support_sched')
             safe_load_state_dict(recon_sched, ckpt, 'recon_sched')
+            self.stat_tracker.set_opt_step(start_iter)
         return start_iter
 
     # ------------------------ optim/sched ------------------------
@@ -281,6 +290,7 @@ class TrainerPotential(object):
         if reset_start_iter:
             starting_micro = 1
             opt_step_idx = 0
+            self.stat_tracker.set_opt_step(0)
         else:
             starting_micro = starting_opt_step * acc_steps + 1
             opt_step_idx = starting_opt_step
@@ -318,6 +328,7 @@ class TrainerPotential(object):
         self.K = int(self.params.num_support_sets)
         self.stat_tracker.init_per_k(self.K)
         half_range = self.K // 2
+        init_truncation = float(getattr(self.params, "z_truncation", 1.0))
 
 
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
@@ -355,10 +366,10 @@ class TrainerPotential(object):
         for micro_idx, iteration in enumerate(range(starting_micro, self.params.max_iter + 1), start=1):
             iter_t0 = time.time()
 
-            z = self.sample_z(self.params.batch_size, generator)
+            z = sample_z(self.params.batch_size, generator, self.params, self.device)
 
             # Random step index per sample
-            dt = torch.randint(5_000, 15_000, (1, 1), device=self.device)/5_000
+            dt = torch.randint(2_500, 7_00, (1, 1), device=self.device)/5_000
             dt = dt.repeat(self.params.batch_size, 1)
             t_idx = torch.randint(1, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)
 
@@ -415,6 +426,7 @@ class TrainerPotential(object):
                 support_sets_optim.step(); reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True); reconstructor_optim.zero_grad(set_to_none=True)
                 sched_support.step(); sched_recon.step()
+                self.params.z_truncation = init_truncation * 0.95 + 0.05 * 1.0
 
 
                 self.stat_tracker.set_lrs(sched_support.get_last_lr()[0], sched_recon.get_last_lr()[0])

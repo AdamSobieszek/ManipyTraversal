@@ -15,84 +15,81 @@ from PIL import Image, ImageDraw
 
 
 
-def sample_z(batch_size, dim_z, truncation=None):
-    """Sample a random latent code from multi-variate standard Gaussian distribution with/without truncation.
+# def sample_z(batch_size, dim_z, truncation=None):
+#     """Sample a random latent code from multi-variate standard Gaussian distribution with/without truncation.
 
-    Args:
-        batch_size (int)   : batch size (number of latent codes)
-        dim_z (int)        : latent space dimensionality
-        truncation (float) : trufcatiof parameter
+#     Args:
+#         batch_size (int)   : batch size (number of latent codes)
+#         dim_z (int)        : latent space dimensionality
+#         truncation (float) : trufcatiof parameter
 
-    Returns:
-        z (torch.Tensor)   : batch of latent codes
+#     Returns:
+#         z (torch.Tensor)   : batch of latent codes
+#     """
+#     if truncation is None or truncation == 1.0:
+#         return torch.randn(batch_size, dim_z)
+#     else:
+#         return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
+
+
+@torch.no_grad()
+def sample_z(batch_size, generator, params, device = torch.device('cuda')):
     """
-    if truncation is None or truncation == 1.0:
-        return torch.randn(batch_size, dim_z)
-    else:
-        return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
+    Instead of sampling batch_size independent random vectors,
+    sample one random vector and generate the rest as an orthonormal basis
+    (Gram-Schmidt) to it. If batch_size > generator.dim_z, will pad with zeros.
+    """
+    dim_z = generator.dim_z
 
+    # Draw one random vector
+    z0 = torch.randn(dim_z, device=device)
+    z0_norm = z0.norm()
+    z0 = z0 / (z0_norm + 1e-8)
 
-    @torch.no_grad()
-    def sample_z(self, batch_size, generator):
-        """
-        Instead of sampling batch_size independent random vectors,
-        sample one random vector and generate the rest as an orthonormal basis
-        (Gram-Schmidt) to it. If batch_size > generator.dim_z, will pad with zeros.
-        """
-        dim_z = generator.dim_z
-        device = self.device if (self.use_cuda or self.use_mps) else "cpu"
-
-        # Draw one random vector
-        z0 = torch.randn(dim_z, device=device)
-        z0_norm = z0.norm()
-        z0 = z0 / (z0_norm + 1e-8)
-
-        # Create orthonormal basis (including z0 as the first vector)
-        basis = [z0]
-        for _ in range(1, min(batch_size, dim_z)):
+    # Create orthonormal basis (including z0 as the first vector)
+    basis = [z0]
+    for _ in range(1, min(batch_size, dim_z)):
+        v = torch.randn(dim_z, device=device)
+        # Gram-Schmidt orthogonalization
+        for b in basis:
+            v = v - (v @ b) * b
+        v_norm = v.norm()
+        if v_norm < 1e-8:
+            # If degenerate, resample
             v = torch.randn(dim_z, device=device)
-            # Gram-Schmidt orthogonalization
             for b in basis:
                 v = v - (v @ b) * b
             v_norm = v.norm()
             if v_norm < 1e-8:
-                # If degenerate, resample
-                v = torch.randn(dim_z, device=device)
-                for b in basis:
-                    v = v - (v @ b) * b
-                v_norm = v.norm()
-                if v_norm < 1e-8:
-                    v = torch.zeros_like(v)
-            else:
-                v = v / v_norm
-            basis.append(v)
-        # Stack basis vectors
-        z = torch.stack(basis, dim=0)*z0_norm
-        # If batch_size > dim_z, pad with zeros
-        if batch_size > dim_z:
-            pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
-            z = torch.cat([z, pad], dim=0)
-        # If batch_size < dim_z, truncate
-        if z.shape[0] > batch_size:
-            z = z[:batch_size]
-
-        # Move to correct device if needed
-        if self.use_cuda:
-            z = z.cuda(non_blocking=True)
-        elif self.use_mps:
-            z = z.to(self.device)
-
-        # Optionally shift in w-space and apply truncation
-        if getattr(generator, "shift_in_w_space", False):
-            z = generator.get_w(z)
-            if getattr(self.params, "z_truncation", None) is not None:
-                z_mean = z.mean(dim=0, keepdim=True)
-                z = (z - z_mean) * self.params.z_truncation + z_mean
+                v = torch.zeros_like(v)
         else:
-            if getattr(self.params, "z_truncation", None) is not None:
-                z = z * self.params.z_truncation
+            v = v / v_norm
+        basis.append(v)
+    # Stack basis vectors
+    z = torch.stack(basis, dim=0)*z0_norm
+    # If batch_size > dim_z, pad with zeros
+    if batch_size > dim_z:
+        pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
+        z = torch.cat([z, pad], dim=0)
+    # If batch_size < dim_z, truncate
+    if z.shape[0] > batch_size:
+        z = z[:batch_size]
 
-        return z
+    # Move to correct device if needed
+    if z.device.type == 'cuda':
+        z = z.cuda(non_blocking=True)
+
+    # Optionally shift in w-space and apply truncation
+    if getattr(generator, "shift_in_w_space", False):
+        z = generator.get_w(z)
+        if getattr(params, "z_truncation", None) is not None:
+            z_mean = z.mean(dim=0, keepdim=True)
+            z = (z - z_mean) * params.z_truncation + z_mean
+    else:
+        if getattr(params, "z_truncation", None) is not None:
+            z = z * params.z_truncation
+
+    return z
        
 def create_exp_dir(args, new_experiment=False):
     """Create output directory for current experiment under experiments/wip/ and save given the arguments (json) and

@@ -47,7 +47,7 @@ class Reconstructor(nn.Module):
                 nn.Linear(60 * self.lenet_width, 42 * self.lenet_width),
                 nn.BatchNorm1d(42 * self.lenet_width),
                 nn.ReLU(),
-                nn.Linear(42 * self.lenet_width, self.dim_time-1)
+                nn.Linear(42 * self.lenet_width, 2)
             )
 
         # === ResNet ===
@@ -67,7 +67,7 @@ class Reconstructor(nn.Module):
             # Define classification head (for predicting warping functions (paths) indices)
             self.path_indices = nn.Linear(512, self.dim_index)
 
-            self.shift_magnitudes = nn.Linear(512, 1)
+            self.shift_magnitudes = nn.Linear(512, 2)
 
     def forward(self, x1, x2):
         if self.reconstructor_type == 'LeNet':

@@ -51,76 +51,6 @@ class StackedLinear(nn.Module):
         return y
 
 
-class OutputBatchNormPerK(nn.Module):
-    """
-    BatchNorm applied per (k, channel) using batch statistics over B only.
-    x: [B, K, C] -> y: [B, K, C]
-
-    Keeps running_mean/var per (K,C). Supports affine per (K,C).
-    This preserves BatchNorm semantics for each potential independently.
-    """
-    def __init__(
-        self,
-        K: int,
-        C: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-    ):
-        super().__init__()
-        self.K = int(K)
-        self.C = int(C)
-        self.eps = float(eps)
-        self.momentum = float(momentum)
-        self.affine = bool(affine)
-        self.track_running_stats = bool(track_running_stats)
-
-        if self.affine:
-            self.weight = nn.Parameter(torch.zeros(self.K, self.C))  # gamma
-            self.bias = nn.Parameter(torch.zeros(self.K, self.C))   # beta
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
-
-        if self.track_running_stats:
-            self.register_buffer("running_mean", torch.zeros(self.K, self.C))
-            self.register_buffer("running_var", torch.ones(self.K, self.C))
-            self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
-        else:
-            self.register_buffer("running_mean", None)
-            self.register_buffer("running_var", None)
-            self.register_buffer("num_batches_tracked", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 3 and x.size(1) == self.K and x.size(2) == self.C, (
-            f"Expected [B,K,{self.C}] got {tuple(x.shape)}")
-        B = x.size(0)
-
-        if self.training:
-            mean = x.mean(dim=0)  # [K,C]
-            var = x.var(dim=0, unbiased=False)  # [K,C]
-
-            if self.track_running_stats:
-                with torch.no_grad():
-                    self.num_batches_tracked += 1
-                    m = self.momentum
-                    self.running_mean.mul_(1 - m).add_(m * mean)
-                    self.running_var.mul_(1 - m).add_(m * var)
-        else:
-            if self.track_running_stats:
-                mean = self.running_mean.detach()
-                var = self.running_var.detach()
-            else:
-                # fall back to batch stats if not tracking
-                mean = x.mean(dim=0).detach()
-                var = x.var(dim=0, unbiased=False).detach()
-
-        y = (x - mean.unsqueeze(0)) / torch.sqrt(var.unsqueeze(0) + self.eps)
-        if self.affine:
-            y = y * (self.weight.abs().unsqueeze(0)+1) + self.bias.unsqueeze(0)
-        return y
-
 
 class StackedSinusoidalPositionEmbeddings(nn.Module):
     """
@@ -181,7 +111,6 @@ class StackedSemanticPotential(nn.Module):
 
         # Output-only BatchNorm per k
         # self.out_bn = nn.BatchNorm2d(self.K, self.n_out.)
-        self.out_bn = OutputBatchNormPerK(self.K, self.n_out)
         self.final_activation = final_activation
 
         # zero convolution
@@ -384,7 +313,7 @@ class WavePDE(nn.Module):
         
         # expand once to K stacks
         z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
-
+        potential_preds = []
         latent1_bk = None
         latent2_bk = None
         last_st: Optional[PDEState] = None
@@ -395,6 +324,8 @@ class WavePDE(nn.Module):
         for i in step_iter:
             st, x_next, L_step, dt = self._per_step(z_curr, dt=dt, direction=direction)
 
+
+            potential_preds.append(st.f().detach())
             # accumulate loss per step
             L_accum = (L_step if L_accum is None else L_accum + L_step)
 
@@ -415,9 +346,10 @@ class WavePDE(nn.Module):
         L_total_per_bk = L_accum / float(T) if L_accum is not None else last_st.zeros()
         L_total_mean = L_total_per_bk.mean()
 
-        # telemetry
-        potential_preds = last_st.f().detach() if last_st is not None else torch.zeros(B, K, 1, device=z.device, dtype=z.dtype)
-        
+        # for predicting the attribute
+        potential_preds.append(last_st.f("next").detach())
+        potential_preds = torch.cat(potential_preds, dim=-1)
+
         self._acc = {
             "xf_now": last_st.Xf() if last_st is not None else torch.zeros(B, K, D, device=z.device, dtype=z.dtype),
             "L_mean": L_total_mean.detach(),
@@ -443,3 +375,4 @@ class WavePDE(nn.Module):
 
         st, x_next, L_step, dt = self._per_step(z_curr, dt=1.0, direction=direction)
         return z_curr, x_next-z_curr
+pde_

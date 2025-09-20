@@ -4,9 +4,9 @@ num_support_timesteps=10
 warmup_fraction=0.001
 accumulate_grad_steps=1
 reconstructor_type="LeNet"
-z_truncation=0.35
-batch_size=2
-max_iter=30000
+z_truncation=0.75
+batch_size=32
+max_iter=3000
 tensorboard=true
 new_experiment=true
 
@@ -31,13 +31,12 @@ python train.py $tb \
                 --max-iter=${max_iter} \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
+                --z-truncation=${z_truncation} \
                 --log-freq=50 \
                 --ckp-freq=1000 \
-                --mps \
-                --no-cuda \
+                --cuda \
                 --reset_lr \
                 --reset_weight_decay \
                 --reset_schedulers \
-                --reset_start_iter \
                 --only-potential \
                 $new

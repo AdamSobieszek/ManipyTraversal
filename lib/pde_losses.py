@@ -159,7 +159,7 @@ class FConvex(PDELoss):
     name = "fconvex"
     def _loss(self, st: PDEState) -> torch.Tensor:
         q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
-        margin = float(self.ctx.get("margin", 0.0))
+        margin = float(self.ctx.get("margin", 1e-3))
         return (margin - q).clamp_min(0.0).pow(2)
 
 class DeltaY(PDELoss):
@@ -361,6 +361,209 @@ class Poisson(PDELoss):
         s = s_fn(st.x()) if callable(s_fn) else -st.x()
         return (st.v_div("now") + (s * st.v("now")).sum(dim=-1, keepdim=True)).pow(2)
 
+# ---------------- Losses for preventing convex trivial solutions ----------------
+class FCurvUpper(PDELoss):
+    r"""
+    Upper hinge on average curvature (Laplacian) of f:
+      L = max(0, tr(∇² f) - kappa_max)^2
+    """
+    name = "fcurvmax"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        kappa_max = float(self.ctx.get("kappa_max", 0.05))
+        q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
+        return (q - kappa_max).clamp_min(0.0).pow(2)
+
+class FAlongCurv(PDELoss):
+    r"""
+    Along-flow curvature control for f:
+      q = v̂ᵀ (∇² f) v̂,   v̂ = normalized ∇f (or X_f direction)
+    Penalize (q - target)^2 or hinge on q <= q_max.
+
+    Ctx:
+      - use_xf_dir: bool (default False)  # if True, use direction of X_f; else ∇f
+      - target: Optional[float] (default None)  # if set, use (q - target)^2
+      - q_max: Optional[float] (default None)   # if set, use max(0, q - q_max)^2
+      - eps: float (default st.cfg["eps_norm2"])
+    """
+    name = "fcurvalong"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
+        use_xf_dir = bool(self.ctx.get("use_xf_dir", False))
+
+        # direction v̂
+        if use_xf_dir:
+            v = st.Xf()                                  # [B,K,D]
+            vhat = v / (v.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
+        else:
+            g = st.f_grad()                               # [B,K,D]
+            vhat = g / (g.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
+
+        # HVP: (∇² f) v̂ via one autograd call
+        g = st.f_grad()                                   # [B,K,D]
+        s = (g * vhat).sum()
+        Hv = grad(s, st.x(), create_graph=True)[0]        # [B,K,D]
+        q = (Hv * vhat).sum(-1, keepdim=True)             # [B,K,1]
+
+        if "q_max" in self.ctx and self.ctx["q_max"] is not None:
+            return (q - float(self.ctx["q_max"])).clamp_min(0.0).pow(2)
+        target = self.ctx.get("target", None)
+        target = 0.0 if target is None else float(target)
+        return (q - target).pow(2)
+
+class StraightXf(PDELoss):
+    r"""
+    Straightness of the flow X_f via finite differences (no second-order AD):
+      a ≈ (X_f(x + h v̂) - X_f(x)) / h,  v̂ = X_f / ||X_f||
+      L = ||a||^2
+
+    Ctx:
+      - h: float (default 1e-2)
+      - unit_dir: bool (default True)
+    """
+    name = "straightxf"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        h = float(self.ctx.get("h", 1e-2))
+        unit_dir = bool(self.ctx.get("unit_dir", True))
+        eps = float(st.cfg.get("eps_norm2", 1e-8))
+
+        x = st.x()
+        v0 = st.Xf()                                       # [B,K,D]
+        if unit_dir:
+            vhat = v0 / (v0.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
+        else:
+            vhat = v0
+
+        # evaluate X_f at displaced x using f_m
+        x1 = (x + h * vhat).detach().clone().requires_grad_(True)
+        f1 = st.f_m(x1)
+        g1 = grad(f1.sum(), x1, create_graph=True)[0]
+        Xf1 = g1 / g1.pow(2).sum(-1, keepdim=True).add(eps)
+
+        a = (Xf1 - v0) / h                                 # [B,K,D]
+        return a.pow(2).sum(-1, keepdim=True)
+class ShiftMMD(PDELoss):
+    r"""
+    Two-sample match between f(next)-dt (A) and f(now) (B) via unbiased MMD^2
+    with an RBF kernel. Encourages the endpoint distribution to be a shifted
+    copy of the start.
+
+    Ctx:
+      - bandwidth: Optional[float]  # if None, median heuristic per k
+      - whiten: bool (default True) # standardize jointly (detached stats)
+      - eps: float (default 1e-8)
+    """
+    name = "shiftmmd"
+
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        eps = float(self.ctx.get("eps", 1e-8))
+        whiten = bool(self.ctx.get("whiten", True))
+        bw = self.ctx.get("bandwidth", None)
+
+        A = st.f("next") - st.dt()    # [B,K,1]
+        B = st.f("now")               # [B,K,1]
+        Bsz, K, C = A.shape
+        if Bsz < 2:
+            return st.zeros()
+
+        # Optional joint whitening for scale invariance (no grad through stats)
+        if whiten:
+            with torch.no_grad():
+                Z = torch.cat([A, B], dim=0)             # [2B,K,1]
+                mu = Z.mean(dim=0, keepdim=True)
+                sd = Z.std(dim=0, unbiased=False, keepdim=True).clamp_min(eps)
+            A = (A - mu) / sd
+            B = (B - mu) / sd
+
+        # Helpers: within-set and cross-set squared distances -> [B,B,K]
+        def pdist2(Y):               # Y: [B,K,C] -> [B,B,K]
+            d = Y.unsqueeze(1) - Y.unsqueeze(0)
+            return (d*d).sum(dim=-1)
+
+        def cdist2(Y1, Y2):          # Y1,Y2: [B,K,C] -> [B,B,K]
+            d = Y1.unsqueeze(1) - Y2.unsqueeze(0)
+            return (d*d).sum(dim=-1)
+
+        AA = pdist2(A)               # [B,B,K]
+        BB = pdist2(B)               # [B,B,K]
+        AB = cdist2(A, B)            # [B,B,K]  <-- cross distances (fixed)
+
+        # Bandwidth per k (median heuristic over off-diags of AA,BB and all of AB)
+        if bw is None:
+            eye_mask = ~torch.eye(Bsz, dtype=torch.bool, device=A.device)
+            AA_off = AA[eye_mask].view(Bsz*(Bsz-1), K)   # [(B^2-B),K]
+            BB_off = BB[eye_mask].view(Bsz*(Bsz-1), K)   # [(B^2-B),K]
+            AB_all = AB.view(Bsz*Bsz, K)                 # [B^2,K]
+            pool = torch.cat([AA_off, BB_off, AB_all], dim=0)  # [(3B^2-2B),K]
+            h2 = 0.5 * pool.median(dim=0).values.clamp_min(eps)  # [K]
+        else:
+            h2 = torch.full((K,), float(bw), device=A.device, dtype=A.dtype)**2
+
+        # RBF kernels
+        def krbf(d2): return torch.exp(-d2 / (2.0 * h2.view(1,1,K)))
+
+        eye_mask = ~torch.eye(Bsz, dtype=torch.bool, device=A.device)
+        KA = krbf(AA)[eye_mask].view(Bsz*(Bsz-1), K).mean(dim=0)  # E_{i!=j} k( Ai, Aj )
+        KB = krbf(BB)[eye_mask].view(Bsz*(Bsz-1), K).mean(dim=0)  # E_{i!=j} k( Bi, Bj )
+        KAB = krbf(AB).mean(dim=(0,1))                            # E_{i,j}   k( Ai, Bj )
+
+        mmd2_k = KA + KB - 2.0 * KAB                              # [K]
+        return mmd2_k.view(1, K, 1).expand(Bsz, K, 1)
+        
+        
+        
+class LevelSetSpread(PDELoss):
+    r"""
+    Level-set spread: for pairs with small |Δy|, penalize being close in x.
+      L_k = mean_{i≠j} w_y(i,j) * exp(-||x_i-x_j||^2 / (2 τ^2)) / sum w_y
+    Minimizing pushes equal-attribute level sets to have larger spatial support.
+
+    Ctx:
+      - delta: float (default 0.25)     # width of similarity window in y
+      - tau: float (default 1.0)        # spatial scale in x
+      - whiten_y: bool (default True)   # standardize y per k with detached stats
+      - eps: float (default 1e-8)
+    """
+    name = "levelspread"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        eps = float(self.ctx.get("eps", 1e-8))
+        delta = float(self.ctx.get("delta", 0.25))
+        tau = float(self.ctx.get("tau", 1.0))
+        whiten_y = bool(self.ctx.get("whiten_y", True))
+
+        y = st.f()                                       # [B,K,1]
+        if whiten_y:
+            with torch.no_grad():
+                mu = y.mean(0, keepdim=True)
+                sd = y.std(0, unbiased=False, keepdim=True).clamp_min(eps)
+            y = (y - mu) / sd
+
+        x = st.x()                                       # [B,K,D]
+        Bsz, K, _ = y.shape
+        if Bsz < 2:
+            return st.zeros()
+
+        # pairwise over batch per k
+        dy2 = (y.unsqueeze(1) - y.unsqueeze(0)).pow(2).sum(-1)      # [B,B,K]
+        dx2 = (x.unsqueeze(1) - x.unsqueeze(0)).pow(2).sum(-1)      # [B,B,K]
+
+        wy = torch.exp(-dy2 / (2.0 * (delta**2)))                    # [B,B,K]
+        kx = torch.exp(-dx2 / (2.0 * (tau**2)))                      # [B,B,K]
+
+        mask = ~torch.eye(Bsz, dtype=torch.bool, device=y.device)
+        wy_m = wy[mask].view(Bsz*(Bsz-1), K)
+        kx_m = kx[mask].view(Bsz*(Bsz-1), K)
+
+        num = (wy_m * kx_m).sum(0)                                   # [K]
+        den = wy_m.sum(0).clamp_min(eps)                             # [K]
+        val = (num / den)                                            # [K]
+        return val.view(1, K, 1).expand(Bsz, K, 1)
+
+
+
+
+
+
+
 # ---------------- Public registry API ----------------
 
 def _normalize(key: str) -> str:
@@ -383,6 +586,11 @@ def build_losses(lambda_dict: Dict[str, float], **ctx) -> Tuple[List[PDELoss], b
         cls = reg.get(_normalize(raw_name), None)
         if cls is None:
             continue
+        if isinstance(lam,dict):
+            l = lam.pop("lam")
+            ctx.update(lam)
+            lam = l
+
         inst = cls(lam, **ctx)
         losses.append(inst)
         if getattr(cls, "needs_next", False):

@@ -92,7 +92,7 @@ def main():
     parser.add_argument('--no-cuda', dest='cuda', action='store_false', help="do NOT use CUDA during training")
     parser.add_argument('--mps', dest='mps', action='store_true', help="use Apple Metal (MPS) backend")
     parser.add_argument('--no-mps', dest='mps', action='store_false', help="do NOT use MPS backend")
-    parser.set_defaults(cuda=False, mps=True)
+    parser.set_defaults(cuda=True, mps=False)
     # ================================================================================================================ #
 
     # Parse given arguments
@@ -174,7 +174,7 @@ def main():
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
-                    lambdas={'fconvex': 1.0,'BB':1.0,'g2orth': 1.0,  'DeltaY': 1.0},
+                    lambdas={'fconvex': 1.0,'BB':2.0, 'g2orth': 1.0,  'ksd': 1.0},
                     
                     )
 
