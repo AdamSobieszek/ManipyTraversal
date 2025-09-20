@@ -1,10 +1,11 @@
 gan_type="SNGAN_AnimeFaces"
-num_support_sets=16
+num_support_sets=64
 num_support_timesteps=10
 warmup_fraction=0.001
 accumulate_grad_steps=1
 reconstructor_type="LeNet"
-batch_size=8
+z_truncation=0.35
+batch_size=2
 max_iter=30000
 tensorboard=true
 new_experiment=true
@@ -38,4 +39,5 @@ python train.py $tb \
                 --reset_weight_decay \
                 --reset_schedulers \
                 --reset_start_iter \
+                --only-potential \
                 $new

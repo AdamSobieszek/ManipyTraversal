@@ -109,11 +109,11 @@ def robust_load_waves(S: nn.Module, ckpt):
             sd = ckpt['support_sets']
         elif 'state_dict' in ckpt and isinstance(ckpt['state_dict'], dict):
             # if state_dict looks like WavePDE already
-            if any(k.startswith('PSI_SET') or k == 'c' for k in ckpt['state_dict'].keys()):
+            if any(k.startswith('PSI') or k == 'c' for k in ckpt['state_dict'].keys()):
                 sd = ckpt['state_dict']
         elif all(isinstance(k, str) for k in ckpt.keys()):
             # checkpoint is the state_dict itself
-            if any(k.startswith('PSI_SET') or k == 'c' for k in ckpt.keys()):
+            if any(k.startswith('PSI') or k == 'c' for k in ckpt.keys()):
                 sd = ckpt
     if sd is None:
         raise RuntimeError("Could not find WavePDE weights in checkpoint. Expected keys like 'support_sets' or 'PSI_SET.*'")
@@ -135,6 +135,7 @@ if __name__ == '__main__':
     p.add_argument('--gif', action='store_true', help="(unused)")
     p.add_argument('--gif-size', type=int, default=256)
     p.add_argument('--gif-fps', type=int, default=30)
+    p.add_argument('--only-potential', action='store_true', help="only generate potential pairs")
     # Device flags to mirror train.py
     p.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA")
     p.add_argument('--no-cuda', dest='cuda', action='store_false', help="no CUDA")
@@ -145,11 +146,20 @@ if __name__ == '__main__':
     args = p.parse_args()
 
     # Device selection
-    cuda_avail = torch.cuda.is_available()
-    mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    use_cuda = args.cuda and cuda_avail
-    use_mps = args.mps and mps_avail
+    cuda_available = torch.cuda.is_available()
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    use_cuda = args.cuda and cuda_available
+    use_mps = args.mps and mps_available
     device = torch.device('cuda' if use_cuda else ('mps' if use_mps else 'cpu'))
+
+    # Set default tensor type for CUDA only (no MPS default tensor type exists)
+    if use_cuda:
+        torch.set_default_device(torch.device('cuda'))
+    elif use_mps:
+        torch.set_default_device(torch.device('mps'))
+        torch.set_default_dtype(torch.float32)
+    else:
+        torch.set_default_device(torch.device('cpu'))
 
     # Resolve paths
     if not osp.isdir(args.exp):
@@ -175,7 +185,8 @@ if __name__ == '__main__':
     S = WavePDE(
         num_support_sets=a.__dict__['num_support_sets'],
         num_support_timesteps=a.__dict__['num_support_timesteps'],
-        support_vectors_dim=G.dim_z
+        support_vectors_dim=G.dim_z,
+        only_potential=a.__dict__.get('only_potential', False)
     ).to(device).eval()
     robust_load_waves(S, ckpt)
 
@@ -190,7 +201,8 @@ if __name__ == '__main__':
     n_samples = 40_000
     B = int(args.batch_size)
     assert n_samples % B == 0, "Choose batch-size that divides n_samples"
-    n_batches = n_samples // B
+    K = S.num_support_sets
+    n_batches = n_samples // B // K
 
     # PDE rollout length: match training (half_range = T // 2)
     half_range = S.num_support_timesteps // 2
@@ -206,9 +218,6 @@ if __name__ == '__main__':
         # Sample batch z on device, with truncation if specified
         z0 = sample_z(B, G.dim_z, device=device, truncation=z_trunc)
 
-        # Choose ONE potential index per pair (keep same across the mini-batch to simplify labels)
-        k = int(torch.randint(0, S.num_support_sets, (1,), device=device).item())
-
         # Optionally move to W space for StyleGAN2
         if a.__dict__.get('shift_in_w_space', False) and hasattr(G, 'get_w'):
             with torch.no_grad():
@@ -216,22 +225,23 @@ if __name__ == '__main__':
         else:
             z_cur = z0
 
+
         # Rollout by PDE: latent_{t+1} = latent_t + ∇_z u(latent_t, t)
         with torch.no_grad():
             for step in range(half_range):
                 t_b = torch.full((B, 1), float(step), device=device, dtype=z_cur.dtype)
-                _, dz = S.inference(k, z_cur, t_b)  # returns (u, ∇u)
+                z_cur, dz = S.inference(z_cur, t_b)  # returns (u, ∇u)
+                if step==0:
+                    z0_batch = z_cur.reshape(B*K, G.dim_z)
                 z_cur = z_cur + dz
 
         # One-hot labels for VP
-        nz = S.num_support_sets
-        label = np.zeros((B, nz), dtype=np.float32)
-        label[:, k] = 1.0
-        all_labels.append(label)
-
+        label = torch.eye(K, device=device).repeat(B, 1)
+        z_cur = z_cur.reshape(B*K, G.dim_z)
+        all_labels.append(label.cpu().numpy())
         # Generate images
         with torch.no_grad():
-            img1 = G(z0)
+            img1 = G(z0_batch)
             img2 = G(z_cur)
 
         # Resize to requested output size
@@ -243,9 +253,9 @@ if __name__ == '__main__':
         # Convert from [-1,1] RGB to uint8 BGR for cv2
         img1 = img1.clamp(-1, 1)
         img2 = img2.clamp(-1, 1)
-        for j in range(B):
-            a1 = img1[j].detach().cpu().numpy().transpose(1, 2, 0)  # HWC, RGB
-            a2 = img2[j].detach().cpu().numpy().transpose(1, 2, 0)
+        for j,(im1, im2) in enumerate(zip(img1, img2)):
+            a1 = im1.detach().cpu().numpy().transpose(1, 2, 0)  # HWC, RGB
+            a2 = im2.detach().cpu().numpy().transpose(1, 2, 0)
             pair = np.concatenate([a1, a2], axis=1)
             pair = ((pair + 1.0) * 127.5).round().astype(np.uint8)
             pair = pair[:, :, ::-1]  # RGB -> BGR

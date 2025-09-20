@@ -1,8 +1,10 @@
 import math
-from typing import Dict, Optional, List
+from typing import Dict, Tuple, Optional, List
 
 import torch
 from torch import nn
+from torch.autograd import grad
+from torch.func import jvp as jvp_fwd
 
 
 # ================================================================
@@ -75,7 +77,7 @@ class OutputBatchNormPerK(nn.Module):
         self.track_running_stats = bool(track_running_stats)
 
         if self.affine:
-            self.weight = nn.Parameter(torch.ones(self.K, self.C))  # gamma
+            self.weight = nn.Parameter(torch.zeros(self.K, self.C))  # gamma
             self.bias = nn.Parameter(torch.zeros(self.K, self.C))   # beta
         else:
             self.register_parameter("weight", None)
@@ -107,16 +109,16 @@ class OutputBatchNormPerK(nn.Module):
                     self.running_var.mul_(1 - m).add_(m * var)
         else:
             if self.track_running_stats:
-                mean = self.running_mean
-                var = self.running_var
+                mean = self.running_mean.detach()
+                var = self.running_var.detach()
             else:
                 # fall back to batch stats if not tracking
-                mean = x.mean(dim=0)
-                var = x.var(dim=0, unbiased=False)
+                mean = x.mean(dim=0).detach()
+                var = x.var(dim=0, unbiased=False).detach()
 
         y = (x - mean.unsqueeze(0)) / torch.sqrt(var.unsqueeze(0) + self.eps)
         if self.affine:
-            y = y * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+            y = y * (self.weight.abs().unsqueeze(0)+1) + self.bias.unsqueeze(0)
         return y
 
 
@@ -163,28 +165,40 @@ class StackedSemanticPotential(nn.Module):
         self.act3 = activation
 
         self.fc4 = StackedLinear(self.K, self.n_hidden, self.n_out)
+        self.running_mean = torch.zeros(self.K, self.n_out)
+        self.running_std = torch.ones(self.K, self.n_out)
 
         # Additional linear component from input to output, initialized to random unit directions (per k)
         self.dir_linear = StackedLinear(self.K, self.n_in, self.n_out, bias=False)
         with torch.no_grad():
             W = self.dir_linear.weight.data  # [K, out(=1), in]
-            # normalize each row vector (per k, per out)
-            norms = W.norm(dim=-1, keepdim=True).clamp_min_(1e-8)  # [K,1,1]
-            W.normal_()
-            W.div_(norms)
+            W.zero_()
+            for k in range(self.K):
+                W[k, 0, k%self.n_in] = .1
+
+            W.add_(torch.randn_like(W)*0.001)
+
 
         # Output-only BatchNorm per k
+        # self.out_bn = nn.BatchNorm2d(self.K, self.n_out.)
         self.out_bn = OutputBatchNormPerK(self.K, self.n_out)
         self.final_activation = final_activation
+
+        # zero convolution
+        self.c = nn.Parameter(torch.full((self.K, 1), .5))
+        # self.c.data.normal_(std=0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B,K,D]
         h = self.act1(self.fc1(x))
         h = self.act2(self.fc2(h))
         h = self.act3(self.fc3(h))
-        out = self.fc4(h) + self.dir_linear(x)  # [B,K,1]
-        out = self.out_bn(out)
-        return self.final_activation(out)
+        out = self.fc4(h)*self.c  + self.dir_linear(x)  # [B,K,1]
+        # out = self.out_bn(out)
+        with torch.no_grad():   
+            self.running_mean.lerp_(out.mean(dim=0), 0.9)
+            self.running_std.lerp_(out.std(dim=0), 0.9)
+        return self.final_activation((out - self.running_mean) / (self.running_std + 1e-8))
 
 
     def update_y_distributions(self, y: torch.Tensor):
@@ -215,9 +229,9 @@ class StackedSliceEnergy(nn.Module):
         self.layer_time2 = StackedLinear(self.K, self.n_hidden, self.n_in)
 
         # fusion + output
-        self.layer_fusion = StackedLinear(self.K, self.n_in, self.n_hidden)
+        self.layer_fusion = StackedLinear(self.K, self.n_in, self.n_in)
         self.activation3 = nn.Tanh()
-        self.layer_out = StackedLinear(self.K, self.n_hidden, self.n_out)
+        self.layer_out = StackedLinear(self.K, self.n_in, self.n_out)
         self.activation4 = nn.Tanh()
 
         self.apply_output_bn = bool(apply_output_bn)
@@ -233,9 +247,22 @@ class StackedSliceEnergy(nn.Module):
 
         h = self.activation3(self.layer_fusion(xh + t_feat))
         out = self.activation4(self.layer_out(h))  # [B,K,1]
-        if self.apply_output_bn:
-            out = self.out_bn(out)
+        # if self.apply_output_bn:
+        #     out = self.out_bn(out)
         return out
+
+class SkipSliceEnergy(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        return (torch.zeros_like(x)*x).sum(dim=-1, keepdim=True)
+
+# wave_pde.py
+import torch
+from torch import nn
+from typing import Dict, Optional, List
+
 from lib.pde_ops import PDEState
 from lib.pde_losses import build_losses 
 
@@ -253,13 +280,14 @@ class WavePDE(nn.Module):
         apply_bn_on_psi_output: bool = False,
         # PDEState config
         time_ad: str = "reverse",
-        detach_between_steps: bool = True,
+        detach_between_steps: bool = False,
         eps_norm2: float = 1e-8,
         divergence_probes: int = 1,
         rng: str = "rademacher",
         seed: Optional[int] = None,
         # optional: prior score function for DivPrior (defaults to Gaussian score -x)
         prior_score: Optional[callable] = None,
+        only_potential: bool = False,
     ):
         super().__init__()
         self.num_support_sets = int(num_support_sets)
@@ -270,13 +298,15 @@ class WavePDE(nn.Module):
         self.c = nn.Parameter(torch.full((self.num_support_sets, 1), 1.0))
 
         # Stacked potentials
+        
         self.PSI = StackedSliceEnergy(
             K=self.num_support_sets,
             n_in=self.support_vectors_dim,
             n_out=1,
             final_activation=nn.Identity(),
             apply_output_bn=apply_bn_on_psi_output,
-        )
+        ) if not only_potential else SkipSliceEnergy()
+
         self.F = StackedSemanticPotential(
             K=self.num_support_sets,
             n_in=self.support_vectors_dim,
@@ -309,14 +339,13 @@ class WavePDE(nn.Module):
         self._acc: Dict[str, torch.Tensor] = {}
 
     # ---- one step ----
-    def _per_step(self, z_bkd: torch.Tensor, direction: int = +1):
+    def _per_step(self, z_bkd: torch.Tensor, dt: torch.Tensor, direction: int = +1):
         st = PDEState(
             f=self.F,
             psi=self.PSI,
             z=z_bkd,
-            direction=direction,
             need_next=self._needs_next,
-            dt_value=1.0,  # use ±1 step; wire self.c here if desired
+            dt_value=dt,  # use ±1 step; wire self.c here if desired
             **self._pde_cfg,
         )
 
@@ -332,13 +361,13 @@ class WavePDE(nn.Module):
             step_delta_norms = (x_next - st.x()).norm(dim=-1, keepdim=True)
             latent_noise = torch.randn_like(x_next)
             latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
-            latent_noise = latent_noise * (step_delta_norms / 5.0)
-            x_next_noisy = x_next + latent_noise
+            latent_noise = latent_noise * (step_delta_norms.clamp_min(step_delta_norms.mean().item()/3) / 5.0)
+        x_next_noisy = x_next + latent_noise
 
-        return st, x_next_noisy, L_sum
+        return st, x_next_noisy, L_sum, st.dt()
 
     # ---- unrolled training ----
-    def forward(self, z: torch.Tensor, t_index: torch.Tensor, direction: int = +1):
+    def forward(self, z: torch.Tensor, t_index: torch.Tensor, dt: torch.Tensor, direction: int = +1):
         """
         Returns:
           potential_preds: [B,K,1] (detached)
@@ -347,71 +376,70 @@ class WavePDE(nn.Module):
         """
         B, D = z.shape
         K = self.num_support_sets
-        T = max(1, int(self.num_support_timesteps))
+        T = max(1, int(self.num_support_timesteps)-1)
 
-        i_target = torch.clamp(t_index.view(-1), 0, T - 1).long()
-
+        if t_index.ndim == 1:
+            t_index = t_index.unsqueeze(-1)
+        i_target = torch.clamp(t_index, 0, T - 1).long().squeeze(-1)
+        
         # expand once to K stacks
         z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
 
-        latent1_bk = torch.zeros_like(z_curr)
-        latent2_bk = torch.zeros_like(z_curr)
+        latent1_bk = None
+        latent2_bk = None
+        last_st: Optional[PDEState] = None
 
         L_accum = None  # accumulate per-[B,K,1]
 
-        step_iter = range(T) if direction == +1 else reversed(range(T))
+        step_iter = range(T)# if  else reversed(range(T))
         for i in step_iter:
-            st, x_next, L_step = self._per_step(z_curr, direction=direction)
+            st, x_next, L_step, dt = self._per_step(z_curr, dt=dt, direction=direction)
 
             # accumulate loss per step
             L_accum = (L_step if L_accum is None else L_accum + L_step)
 
             # capture (latent1, latent2) at the requested index
             mask_b = (i_target == i).view(B, 1, 1)
-            latent1_bk = torch.where(mask_b, z_curr, latent1_bk)
-            latent2_bk = torch.where(mask_b, x_next, latent2_bk)
+            if latent1_bk is None:
+                latent1_bk = torch.where(mask_b, z_curr, torch.zeros_like(z_curr))
+                latent2_bk = torch.where(mask_b, x_next, torch.zeros_like(x_next))
+            else:
+                latent1_bk = torch.where(mask_b, z_curr, latent1_bk)
+                latent2_bk = torch.where(mask_b, x_next, latent2_bk)
 
             # advance
             z_curr = x_next
+            last_st = st
 
         # average over steps
-        L_total_per_bk = L_accum / float(T) if L_accum is not None else st.zeros()
+        L_total_per_bk = L_accum / float(T) if L_accum is not None else last_st.zeros()
         L_total_mean = L_total_per_bk.mean()
 
         # telemetry
-        potential_preds = st.f().detach()
+        potential_preds = last_st.f().detach() if last_st is not None else torch.zeros(B, K, 1, device=z.device, dtype=z.dtype)
         
         self._acc = {
-            "xf_now": st.Xf(),
+            "xf_now": last_st.Xf() if last_st is not None else torch.zeros(B, K, D, device=z.device, dtype=z.dtype),
             "L_mean": L_total_mean.detach(),
-            **st.state["losses"],
+            **last_st.state["losses"],
         }
-        return potential_preds, latent1_bk, latent2_bk, L_total_mean
+        return potential_preds, latent1_bk, latent2_bk, L_total_mean, last_st.delta_y().detach()
 
     def get_losses(self) -> Dict[str, torch.Tensor]:
         return self._acc
 
     @torch.enable_grad()
-    def inference(self, z: torch.Tensor, direction: int = +1) -> List[torch.Tensor]:
-        B, D = z.shape
-        K = self.num_support_sets
+    def inference(self, z: torch.Tensor, t_index: torch.Tensor = None, direction: int = +1) -> List[torch.Tensor]:
+        if len(z.shape) == 3:
+            B, K, D = z.shape
+            z_curr = z
+        else:
+            B, D = z.shape
+            K = self.num_support_sets
+            z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
+
         T = max(1, int(self.num_support_timesteps))
-        traj: List[torch.Tensor] = []
 
-        z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
-        traj.append(z_curr)
 
-        for _ in (range(T) if direction == +1 else reversed(range(T))):
-            st = PDEState(
-                f=self.F,
-                psi=self.PSI,
-                z=z_curr,
-                direction=direction,
-                need_next=False,
-                dt_value=1.0,
-                **self._pde_cfg,
-            )
-            z_next = st.x() + st.dt() * st.v("now")
-            traj.append(z_next)
-            z_curr = z_next
-        return traj
+        st, x_next, L_step, dt = self._per_step(z_curr, dt=1.0, direction=direction)
+        return z_curr, x_next-z_curr

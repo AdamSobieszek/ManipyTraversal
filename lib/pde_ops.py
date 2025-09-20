@@ -156,7 +156,7 @@ class PDEState:
         z_bk, K = _ensure_bkd(z)
         self.B, self.K, self.D = z_bk.shape
         self.device, self.dtype = z_bk.device, z_bk.dtype
-        self.direction = int(direction)
+        self.direction = direction
 
         # defaults
         self.cfg: Dict[str, Any] = {
@@ -183,10 +183,14 @@ class PDEState:
         else:
             x_leaf = z_bk.requires_grad_(True)
 
-        dt = torch.full((self.B, self.K, 1),
-                        float(self.cfg["dt_value"]) * float(self.direction),
-                        device=self.device, dtype=self.dtype)
-
+        if not isinstance(self.direction, torch.Tensor) and not isinstance(self.cfg["dt_value"], torch.Tensor):
+            dt = torch.full((self.B, self.K, 1),
+                            float(self.cfg["dt_value"]) * float(self.direction),
+                            device=self.device, dtype=self.dtype)
+        else:
+            dt = (self.direction * self.cfg["dt_value"]).reshape(self.B, -1, 1)
+            if self.K>dt.shape[1]:
+                dt = dt.repeat(1, self.K//dt.shape[1], 1)
         self.state["x"] = x_leaf           # [B,K,D]
         self.state["dt"] = dt              # [B,K,1]
         self.state["losses"] = {}
@@ -202,26 +206,37 @@ class PDEState:
     def dt(self) -> torch.Tensor:
         return self.state["dt"]
 
+    def delta_y(self) -> torch.Tensor:
+        if "delta_y" not in self.state:
+            self.state["delta_y"] = self.f("next") - self.f("now").detach()
+        return self.state["delta_y"]
+
     # ------------- f and geometry -------------
 
-    def f(self) -> torch.Tensor:
-        if "f" not in self.state:
-            self.state["f"] = self.f_m(self.x())
-        return self.state["f"]
+    def f(self, when: When = "now") -> torch.Tensor:
+        key = ("f", when)
+        if key not in self.state:
+            if when == "now":
+                self.state[key] = self.f_m(self.x())
+            elif when == "next":
+                self.state[key] = self.f_m(self.x_next())
+        return self.state[key]
 
-    def f_grad(self) -> torch.Tensor:
-        if "f_grad" not in self.state:
+
+    def f_grad(self, when: When = "now") -> torch.Tensor:
+        key = ("f_grad", when)
+        if key not in self.state:
             create_graph = bool(self.cfg["track_param_through_xgrads"])
-            self.state["f_grad"] = grad(self.f().sum(), self.x(), create_graph=create_graph)[0]
-        return self.state["f_grad"]
+            self.state[key] = grad(self.f(when).sum(), self.x() if when == "now" else self.x_next(), create_graph=create_graph)[0]
+        return self.state[key]
 
-    def f_laplace(self, probes: Optional[int] = None) -> torch.Tensor:
-        key = ("f_laplace", probes)
+    def f_laplace(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:
+        key = ("f_laplace", probes, when)
         if key not in self.state:
             p = int(self.cfg["laplace_probes"] if probes is None else probes)
             self.state[key] = _laplacian_hutch(
-                g=self.f_grad(),
-                x=self.x(),
+                g=self.f_grad(when),
+                x=self.x() if when == "now" else self.x_next(),
                 probes=p,
                 mode=self.cfg["rng"],
                 gen=self._gen,
@@ -229,21 +244,24 @@ class PDEState:
             )
         return self.state[key]
 
-    def Xf(self) -> torch.Tensor:
-        if "Xf" not in self.state:
-            g = self.f_grad()
+    def Xf(self, when: When = "now") -> torch.Tensor:
+        key = ("Xf", when)
+        if key not in self.state:
+            g = self.f_grad(when)
             norm2 = g.pow(2).sum(dim=-1, keepdim=True).add_(float(self.cfg["eps_norm2"]))
-            self.state["Xf"] = g / norm2
-        return self.state["Xf"]
+            self.state[key] = g / norm2
+        return self.state[key]
 
-    # ------------- time handling -------------
 
+    # def Xf_div(self) -> torch.Tensor:
+
+    # ------------- f-pseudotime -------------
     def _t(self, when: When = "now") -> torch.Tensor:
         key = ("t", when)
-        if key in self.state:
+        if key in self.state and self.state[key] is not None:
             return self.state[key]
         if when == "now":
-            t = self.f()
+            t = self.f(when)
             if self.cfg["detach_time_for_psi"]:
                 t = t.detach()
         elif when == "next":
@@ -260,7 +278,8 @@ class PDEState:
     def psi(self, when: When = "now") -> torch.Tensor:
         key = ("psi", when)
         if key not in self.state:
-            self.state[key] = self.psi_m(self.x(), self._t(when))
+            self.state[key] = self.psi_m(self.x() if when == "now" else self.x_next(), self._t(when))
+
         return self.state[key]
 
     def psi_grad(self, when: When = "now") -> torch.Tensor:
@@ -355,7 +374,7 @@ class PDEState:
     def v(self, when: When = "now") -> torch.Tensor:
         key = ("v", when)
         if key not in self.state:
-            self.state[key] = self.Xf() + self.psi_grad(when)
+            self.state[key] = self.Xf(when) + self.psi_grad(when)
         return self.state[key]
 
     def v_div(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:

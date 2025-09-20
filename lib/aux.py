@@ -21,7 +21,7 @@ def sample_z(batch_size, dim_z, truncation=None):
     Args:
         batch_size (int)   : batch size (number of latent codes)
         dim_z (int)        : latent space dimensionality
-        truncation (float) : truncation parameter
+        truncation (float) : trufcatiof parameter
 
     Returns:
         z (torch.Tensor)   : batch of latent codes
@@ -32,6 +32,68 @@ def sample_z(batch_size, dim_z, truncation=None):
         return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
 
 
+    @torch.no_grad()
+    def sample_z(self, batch_size, generator):
+        """
+        Instead of sampling batch_size independent random vectors,
+        sample one random vector and generate the rest as an orthonormal basis
+        (Gram-Schmidt) to it. If batch_size > generator.dim_z, will pad with zeros.
+        """
+        dim_z = generator.dim_z
+        device = self.device if (self.use_cuda or self.use_mps) else "cpu"
+
+        # Draw one random vector
+        z0 = torch.randn(dim_z, device=device)
+        z0_norm = z0.norm()
+        z0 = z0 / (z0_norm + 1e-8)
+
+        # Create orthonormal basis (including z0 as the first vector)
+        basis = [z0]
+        for _ in range(1, min(batch_size, dim_z)):
+            v = torch.randn(dim_z, device=device)
+            # Gram-Schmidt orthogonalization
+            for b in basis:
+                v = v - (v @ b) * b
+            v_norm = v.norm()
+            if v_norm < 1e-8:
+                # If degenerate, resample
+                v = torch.randn(dim_z, device=device)
+                for b in basis:
+                    v = v - (v @ b) * b
+                v_norm = v.norm()
+                if v_norm < 1e-8:
+                    v = torch.zeros_like(v)
+            else:
+                v = v / v_norm
+            basis.append(v)
+        # Stack basis vectors
+        z = torch.stack(basis, dim=0)*z0_norm
+        # If batch_size > dim_z, pad with zeros
+        if batch_size > dim_z:
+            pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
+            z = torch.cat([z, pad], dim=0)
+        # If batch_size < dim_z, truncate
+        if z.shape[0] > batch_size:
+            z = z[:batch_size]
+
+        # Move to correct device if needed
+        if self.use_cuda:
+            z = z.cuda(non_blocking=True)
+        elif self.use_mps:
+            z = z.to(self.device)
+
+        # Optionally shift in w-space and apply truncation
+        if getattr(generator, "shift_in_w_space", False):
+            z = generator.get_w(z)
+            if getattr(self.params, "z_truncation", None) is not None:
+                z_mean = z.mean(dim=0, keepdim=True)
+                z = (z - z_mean) * self.params.z_truncation + z_mean
+        else:
+            if getattr(self.params, "z_truncation", None) is not None:
+                z = z * self.params.z_truncation
+
+        return z
+       
 def create_exp_dir(args, new_experiment=False):
     """Create output directory for current experiment under experiments/wip/ and save given the arguments (json) and
     the given command (bash script).
@@ -264,6 +326,8 @@ def _per_k_grad_norms(support_sets) -> np.ndarray:
             g = g.movedim(k_ax, 0)  # put K in front
         g2 += g.float().reshape(K, -1).pow(2).sum(dim=1)
     return torch.sqrt(torch.clamp(g2, min=1e-12)).cpu().numpy()
+
+    
 def _pack_BK(x_bk: torch.Tensor):
     """
     Flatten [B,K,...] → [B*K,...] in a *known* order and return the mapping + targets.
@@ -353,7 +417,6 @@ class TrainingStatTracker(object):
         *,
         acc: float,
         classification_loss: float,
-        kl_loss: float,
         total_loss: float,
         entropy: float = 0.0,
         step1_norm: float = 0.0,
@@ -367,7 +430,6 @@ class TrainingStatTracker(object):
         self.win_count += 1
         self._acc('accuracy_index', acc)
         self._acc('L_classification', classification_loss)
-        self._acc('L_kl', kl_loss)
         self._acc('total_loss', total_loss)
         self._acc('entropy', entropy)
         self._acc('step1_norm', step1_norm)
@@ -757,8 +819,8 @@ class ImageViz:
         grid_s2  = make_grid(s2_n,  nrow=k_vis)
         stacked  = torch.cat([grid_ref, grid_s1, grid_s2], dim=1)
 
-        diff1 = (s1_n - ref_n).abs()
-        diff2 = (s2_n - ref_n).abs()
+        diff1 = (s1_n - ref_n)
+        diff2 = (s2_n - s1_n)
         grid_d1 = make_grid(diff1, nrow=k_vis)
         grid_d2 = make_grid(diff2, nrow=k_vis)
         stacked_diff = torch.cat([grid_d1, grid_d2], dim=1)

@@ -1,3 +1,4 @@
+# trainer_potential.py
 import os
 import os.path as osp
 import sys
@@ -15,7 +16,6 @@ from torchvision.utils import make_grid
 
 from .aux import sample_z, TrainingStatTracker, update_progress, update_stdout, sec2dhms
 from .aux import CosineScheduleWithWarmup, build_adamw, ImageLogger, ImageViz, _pack_BK,_per_k_grad_norms,module_grad_norm
-from .validity_loss import KLPath
 
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -23,185 +23,6 @@ from typing import Optional
 
 DTYPE = torch.float32
 
-import pickle
-
-import math
-from typing import List, Tuple, Optional
-import torch
-from torch.utils.data import Dataset, DataLoader
-
-DTYPE = torch.float32
-
-# Assumes globals:
-#   photo_to_coords: Dict[str, torch.Tensor]                 # latent vec per image [D]
-#   dim_to_photo_to_ratings: Dict[str, Dict[str, List[float]]]
-#   (ratings are in [0,1], variable length per image/dim)
-
-
-# -------------------- Dataset that stores raw ratings per (image, dim) --------------------
-class MultiDimRatingsDataset(Dataset):
-    def __init__(self, dims: List[str], min_ratings_per_dim: int = 10):
-        super().__init__()
-        self.dims = list(dims)  # order defines K
-        xs = photo_to_coords
-        # intersection across all dims and coords
-        imgs = set(xs.keys())
-        for d in self.dims:
-            imgs &= set(dim_to_photo_to_ratings[d].keys())
-        imgs -= {"638.jpg"}  # drop if present
-        self.names = sorted(imgs)
-
-        # build tensors/lists
-        self.X = torch.stack([xs[n].to(dtype=DTYPE, device="cpu") for n in self.names])  # [N, D]
-
-        # ratings[k][i] is a 1D tensor of ratings for image i, dim k
-        self.ratings = []
-        keep_mask = torch.ones(len(self.names), dtype=torch.bool)
-        for k, d in enumerate(self.dims):
-            per_dim = []
-            src = dim_to_photo_to_ratings[d]
-            for n in self.names:
-                r = torch.tensor(src[n], dtype=DTYPE)  # [L_i_k]
-                per_dim.append(r)
-            self.ratings.append(per_dim)
-
-        # filter: require >= min_ratings_per_dim for every dim
-        for i in range(len(self.names)):
-            for k in range(len(self.dims)):
-                if self.ratings[k][i].numel() < min_ratings_per_dim:
-                    keep_mask[i] = False
-                    break
-
-        if not keep_mask.all():
-            self.names = [self.names[i] for i in range(len(self.names)) if keep_mask[i]]
-            self.X = self.X[keep_mask]
-            for k in range(len(self.dims)):
-                self.ratings[k] = [self.ratings[k][i] for i in range(len(keep_mask)) if keep_mask[i]]
-
-        # precompute per-sample weights ~ avg #ratings per dim (normalized to mean 1)
-        counts = torch.tensor(
-            [sum(self.ratings[k][i].numel() for k in range(len(self.dims))) / float(len(self.dims))
-            for i in range(len(self.names))],
-            dtype=torch.float32,
-        )
-        self.sample_weights = counts / (counts.mean() + 1e-12)  # [N]
-
-    def __len__(self):
-        return len(self.names)
-
-    def __getitem__(self, idx: int):
-        # returns latent x, list of per-dim rating tensors, and precomputed sample weight
-        return self.X[idx], [self.ratings[k][idx] for k in range(len(self.dims))], self.sample_weights[idx]
-
-
-# -------------------- Collate: sample-with-replacement means per (sample, dim) --------------------
-def make_collate_random_subset_means(oversample_factor: float = 1.0):
-    """
-    Returns a collate_fn that, for each (sample, dim) with L ratings, draws
-    m = max(1, ceil(L * oversample_factor)) indices with replacement and averages them.
-    Produces:
-    x:    [B, D]
-    y:    [B, K]   (per-dim means for this batch)
-    mask: [B, K]   (all True; kept for API compatibility)
-    w:    [B]      (precomputed sample weights)
-    """
-    def collate(batch):
-        with torch.no_grad():
-            xs, ratings_lists, ws = zip(*batch)                 # xs: list[[D]], ratings_lists: list[list[Li]], ws: list[]
-            B = len(xs)
-            K = len(ratings_lists[0])
-            D = xs[0].numel()
-
-            X = torch.stack(xs, dim=0)                          # [B, D]
-            Y = torch.empty(B, K, dtype=DTYPE)                  # [B, K]
-            for i in range(B):
-                for k in range(K):
-                    r = ratings_lists[i][k]
-                    L = int(r.numel())
-                    m = max(1, math.ceil(L * oversample_factor))
-                    idx = torch.randint(0, L, (m,))
-                    Y[i, k] = r[idx].mean()
-            M = torch.ones(B, K, dtype=torch.bool)              # all valid after averaging
-            W = torch.tensor(ws, dtype=torch.float32)           # [B]
-        return X, Y, M, W
-    return collate
-
-
-# -------------------- Public: build the train dataloader --------------------
-def make_train_dataloader_stacked(
-    dims: List[str],
-    *,
-    batch_size: int = 256,
-    min_ratings_per_dim: int = 10,
-    rating_oversampling_factor: float = 1.0,
-    shuffle: bool = True,
-) -> DataLoader:
-    """
-    Builds a DataLoader for K=len(dims) dims. Keeps raw ratings per dim,
-    and at **collate time** computes mean-of-random-subset labels per dim.
-    """
-
-    photo_to_coords = pickle.load(open('coords.pkl', 'rb'))
-    dim_to_photo_to_ratings = pickle.load(open('ratings.pkl', 'rb'))
-
-    ds = MultiDimRatingsDataset(dims, min_ratings_per_dim=min_ratings_per_dim)
-    collate = make_collate_random_subset_means(rating_oversampling_factor)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, collate_fn=collate, drop_last=False)
-
-
-# -------------------- Loss + one-epoch trainer (works with StackedSemanticPotential) --------------------
-def masked_mse_multi(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, sample_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if pred.dim() == 3 and pred.size(-1) == 1:
-        pred = pred.squeeze(-1)  # [B, K]
-    se = (pred - target).pow(2)
-    se = torch.where(mask, se, torch.zeros_like(se))
-    per_sample = se.sum(dim=1) / mask.sum(dim=1).clamp_min(1)
-    if sample_weights is not None:
-        per_sample = per_sample * sample_weights
-    return per_sample.mean()
-
-
-def train_one_epoch_stacked(
-    model: torch.nn.Module,            # e.g., StackedSemanticPotential(K=K, n_in=D, n_out=1)
-    dataloader: DataLoader,            # yields (x:[B,D], y:[B,K], mask:[B,K], w:[B])
-    optimizer: torch.optim.Optimizer,
-    *,
-    device: torch.device,
-    scheduler: Optional[object] = None,
-    grad_clip_norm: Optional[float] = 5.0,
-    loss_fn=masked_mse_multi,
-) -> float:
-    model.train()
-    total, count = 0.0, 0
-    for x, y, m, w in dataloader:
-        x = x.to(device)         # [B, D]
-        y = y.to(device)         # [B, K]
-        m = m.to(device)         # [B, K] (all True)
-        w = w.to(device)         # [B]
-
-        K = y.size(1)
-        x_stacked = x.unsqueeze(1).expand(-1, K, -1)  # [B, K, D]
-
-        optimizer.zero_grad(set_to_none=True)
-        out = model(x_stacked)                         # [B, K, n_out] (n_out=1 typical)
-        loss = loss_fn(out, y, m, w)
-        loss.backward()
-
-        if grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        bs = x.size(0)
-        total += loss.item() * bs
-        count += bs
-
-    return total / max(count, 1)
-
-
-# ---------------------- tiny usage example ----------------------
 
 class DataParallelPassthrough(nn.DataParallel):
     def __getattr__(self, name):
@@ -211,7 +32,7 @@ class DataParallelPassthrough(nn.DataParallel):
             return getattr(self.module, name)
 
 
-class Trainer(object):
+class TrainerPotential(object):
     def __init__(self, params=None, exp_dir=None, device=torch.device('cpu'), use_cuda=False, use_mps=False, multi_gpu=False):
         if params is None:
             raise ValueError("Cannot build a Trainer instance with empty params: params={}".format(params))
@@ -295,12 +116,12 @@ class Trainer(object):
         print("      ==============================================================")
         
 
-    def loss_allK(self, support_sets, generator, reconstructor, z, t_index, acc_denominator: int):
+    def loss_allK(self, support_sets, generator, reconstructor, z, t_index, dt, acc_denominator: int):
         """
         One forward for all K in parallel. Ensures classifier gradients reach ψ/f via img2.
         """
         # PDE/OT forward
-        potential_preds, latent1_bk, latent2_bk, pde_loss = support_sets(z, t_index, direction=+1)
+        potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
         B, K, D = latent1_bk.shape
 
 
@@ -316,41 +137,23 @@ class Trainer(object):
         img1_det = img1.detach()
 
         # Classify
-        logits, _ = reconstructor(img1_det, img2)  # [B*K, K]
+        logits, magnitudes = reconstructor(img1, img2)  # [B*K, K]
+        mse_loss = nn.MSELoss()(magnitudes[:,-1:].reshape(potential_preds.shape), potential_preds)
         cls_loss = self.cross_entropy(logits, targets)
 
 
-        # KL (optional)
-        kl_space = getattr(self.params, "kl_space", "latent")
-        lambda_kl = float(getattr(self.params, "lambda_kl", 0.0))
-        kl_bandwidth = getattr(self.params, "kl_bandwidth", None)
-        kl_detach_ref = bool(getattr(self.params, "kl_detach_reference", True))
-
-        if lambda_kl > 0.0:
-            if kl_space == "latent":
-                ref, manip = lat1_flat, lat2_flat
-            elif kl_space == "image":
-                ref, manip = img1_det, img2   # use detached ref consistently
-            else:
-                raise ValueError(f"Unknown kl_space={kl_space}")
-            if kl_detach_ref:
-                ref = ref.detach()
-            kl_loss = self.kl_loss_fn(ref, manip, bandwidth=kl_bandwidth)
-        else:
-            kl_loss = torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
         # Total loss
         loss = (
             self.params.lambda_cls * cls_loss
+            + self.params.lambda_reg * mse_loss
             + self.params.lambda_pde * pde_loss
-            + lambda_kl * kl_loss
         )
         loss = loss / max(1, int(acc_denominator))
-        d2 = (latent2_bk - latent1_bk).norm(dim=2).mean()
+        d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
         # Asymmetric penalty: penalize d2 approaching 0 with a 1/x type penalty
-        d2_penalty = 1.0 / (d2 + 1e-6)  # add epsilon for stability
-        loss = loss + 1.0 * d2_penalty  # 0.1 is a weighting factor; adjust as needed
-
+        # d2_penalty = 1.0 / (d2 + 1e-6)  # add epsilon for stability
+        loss = loss #+ 1.0 * d2_penalty  # 0.1 is a weighting factor; adjust as needed
 
         loss.backward()
 
@@ -362,7 +165,7 @@ class Trainer(object):
             entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=1).mean()
 
             z_bk = z.unsqueeze(1).expand(B, K, D)
-            d1 = (latent1_bk - z_bk).norm(dim=2).mean()
+            d1 = (latent1_bk - z_bk).norm(dim=-1).min()
 
             # reshape images back for visuals
             img1_bk = img1.detach().contiguous().view(B, K, *img1.shape[1:])
@@ -372,10 +175,10 @@ class Trainer(object):
             "total_loss": float(loss.detach()),
             "classification_loss": float(cls_loss.detach()),
             "pde_loss": float(pde_loss.detach()),
-            "kl_loss": float(kl_loss.detach()),
             "entropy": float(entropy.item()),
             "step1_norm": float(d1.item()),
-            "step2_norm": float(d2.item())}, logits.detach(), targets, latent1_bk.detach(), latent2_bk.detach(), img1_bk, img2_bk, potential_preds.detach()
+            "step2_norm": float(d2.item()),"mse_loss": float(mse_loss.detach())
+    }, logits.detach(), targets, latent1_bk.detach(), latent2_bk.detach(), img1_bk, img2_bk, potential_preds.detach()
 
 
     # ------------------------ checkpoint utils ------------------------
@@ -410,7 +213,6 @@ class Trainer(object):
 
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, support_sets, reconstructor, acc_steps: int):
-
         support_set_wd = float(getattr(self.params, "support_set_wd", 0.01))
         reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.001))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
@@ -425,7 +227,7 @@ class Trainer(object):
         support_sets_optim = build_adamw(
             [
                 {"params": support_sets.PSI.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
-                {"params": support_sets.F.parameters(), "weight_decay": 0.1, "lr": self.params.support_set_lr},
+                {"params": support_sets.F.parameters(), "weight_decay": 0.5, "lr": self.params.support_set_lr},
                 {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
             ],
             lr=self.params.support_set_lr,
@@ -486,6 +288,7 @@ class Trainer(object):
         support_sets_optim.zero_grad(set_to_none=True)
         reconstructor_optim.zero_grad(set_to_none=True)
         return starting_micro, opt_step_idx, support_sets_optim, reconstructor_optim, sched_support, sched_recon
+ 
     # ------------------------ train ------------------------
     def train(self, generator, support_sets, reconstructor):
         histograms = True
@@ -514,22 +317,17 @@ class Trainer(object):
         # Bookkeeping
         self.K = int(self.params.num_support_sets)
         self.stat_tracker.init_per_k(self.K)
+        half_range = self.K // 2
+
 
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
         VIS_IMAGE_K = min(32, self.K)
+
 
         (starting_micro, opt_step_idx,
         support_sets_optim, reconstructor_optim,
         sched_support, sched_recon) = self.init_optimizers(support_sets, reconstructor, acc_steps)
 
-        # KL path config
-        kl_mode = getattr(self.params, "kl_mode", "gaussian")
-        kl_symmetric = bool(getattr(self.params, "kl_symmetric", True))
-        kl_bandwidth = getattr(self.params, "kl_bandwidth", None)
-        kl_detach_ref = bool(getattr(self.params, "kl_detach_reference", True))
-        self.kl_loss_fn = KLPath(mode=kl_mode, symmetric=kl_symmetric, bandwidth=kl_bandwidth, detach_reference=kl_detach_ref)
-
-        half_range = self.params.num_support_timesteps // 2
 
         # === Image logger (rotating) ===
         img_keep_last = int(getattr(self.params, "image_keep_last", 10))
@@ -557,14 +355,16 @@ class Trainer(object):
         for micro_idx, iteration in enumerate(range(starting_micro, self.params.max_iter + 1), start=1):
             iter_t0 = time.time()
 
-            z = self.sample_z(self.params.batch_size)
+            z = self.sample_z(self.params.batch_size, generator)
 
             # Random step index per sample
-            t_idx = torch.randint(0, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)
+            dt = torch.randint(5_000, 15_000, (1, 1), device=self.device)/5_000
+            dt = dt.repeat(self.params.batch_size, 1)
+            t_idx = torch.randint(1, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)
 
             (loss_dict, logits, targets,
             latent1_bk, latent2_bk, img1_bk, img2_bk, potential_preds) = self.loss_allK(
-                support_sets, generator, reconstructor, z, t_idx, acc_denominator=acc_steps)
+                support_sets, generator, reconstructor, z, t_idx, dt, acc_denominator=acc_steps)
 
             # ===== analytics & stats =====
             with torch.no_grad():
@@ -617,25 +417,6 @@ class Trainer(object):
                 sched_support.step(); sched_recon.step()
 
 
-                loader = make_train_dataloader_stacked("competent", batch_size=256, min_ratings=10)
-
-
-                # -------------------- Minimal usage --------------------
-                dims = ["warm"]*4+["trustworthy"]*4  # K dims in this order
-                loader = make_train_dataloader_stacked(
-                    dims,
-                    batch_size=64,
-                    min_ratings_per_dim=10,
-                    rating_oversampling_factor=1.25,   # e.g., 25% oversampling per dim
-                )
-                sample_x, sample_y, _, _ = next(iter(loader))
-                K = sample_y.size(1)
-                D = sample_x.size(1)
-                sample_x = sample_x + 0.0001*torch.randn_like(sample_x)
-                
-                
-                loss_val = train_one_epoch_stacked(support_sets, loader, support_sets_optim, device=support_sets.device)
-                print("epoch loss:", loss_val)
                 self.stat_tracker.set_lrs(sched_support.get_last_lr()[0], sched_recon.get_last_lr()[0])
 
                 win_means = self.stat_tracker.close_window()

@@ -1,7 +1,7 @@
-declare -a EXPERIMENTS=("experiments/wip/SNGAN_AnimeFaces-LeNet-K10-D10__20250906_080355")
+declare -a EXPERIMENTS=("experiments/wip/SNGAN_AnimeFaces-LeNet-K15-D10__20250919_041423")
 gan_type="SNGAN_AnimeFaces"
-num_support_sets=10
-num_support_timesteps=6
+num_support_sets=15
+num_support_timesteps=10
 warmup_fraction=0.005
 accumulate_grad_steps=10
 reconstructor_type="LeNet"
@@ -15,8 +15,8 @@ do
   # Traverse latent space
   python gen_pairs.py --exp="${exp}" \
                 --mps --no-cuda \
-                --batch-size 400 \
+                --batch-size 16 \
                 --img-size 256 \
-                --img-quality 90
-
+                --img-quality 90 \
+                --only-potential
 done

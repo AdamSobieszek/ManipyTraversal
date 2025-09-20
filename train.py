@@ -61,6 +61,7 @@ def main():
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
     parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
+    parser.add_argument('--only-potential', action='store_true', help="only train potential")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-lr', type=float, default=3e-4,
@@ -172,7 +173,8 @@ def main():
     S = WavePDE(num_support_sets=args.num_support_sets,
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
-                    lambdas={'g2orth': 1.0, 'vnorm': 1.0 },
+                    only_potential = args.only_potential,
+                    lambdas={'fconvex': 1.0,'BB':1.0,'g2orth': 1.0,  'DeltaY': 1.0},
                     
                     )
 
@@ -197,7 +199,11 @@ def main():
 
     # Set up trainer
     print("#. Experiment: {}".format(exp_dir))
-    trn = Trainer(params=args, exp_dir=exp_dir, device=device, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu)
+    print("  \\__Only train potential: {}".format(args.only_potential))
+    if args.only_potential:
+        trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu)
+    else:
+        trn = Trainer(params=args, exp_dir=exp_dir, device=device, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu)
 
     # Train
     trn.train(generator=G, support_sets=S, reconstructor=R)

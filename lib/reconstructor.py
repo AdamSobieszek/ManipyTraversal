@@ -47,7 +47,7 @@ class Reconstructor(nn.Module):
                 nn.Linear(60 * self.lenet_width, 42 * self.lenet_width),
                 nn.BatchNorm1d(42 * self.lenet_width),
                 nn.ReLU(),
-                nn.Linear(42 * self.lenet_width, self.dim_time)
+                nn.Linear(42 * self.lenet_width, self.dim_time-1)
             )
 
         # === ResNet ===
@@ -73,9 +73,9 @@ class Reconstructor(nn.Module):
         if self.reconstructor_type == 'LeNet':
             features = self.feature_extractor(torch.cat([x1, x2], dim=1))
             features = features.mean(dim=[-1, -2]).view(x1.shape[0], -1)
-            return self.path_indices(features), self.shift_magnitudes(features)
+            return self.path_indices(features).view(x1.shape[0], -1), self.shift_magnitudes(features).view(x1.shape[0], -1)
         elif self.reconstructor_type == 'ResNet':
             self.features_extractor(torch.cat([x1, x2], dim=1))
             features = self.features.output.view([x1.shape[0], -1])
-            return self.path_indices(features), self.shift_magnitudes(features)
+            return self.path_indices(features).view(x1.shape[0], -1), self.shift_magnitudes(features).view(x1.shape[0], -1)
 

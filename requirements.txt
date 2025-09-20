@@ -17,3 +17,6 @@ pandas
 kornia
 # pyqt5
 # pyqt5-tools
+requests
+scikit-learn
+POT
