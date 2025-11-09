@@ -19,6 +19,7 @@ from lib import *  # brings in GAN_WEIGHTS, GAN_RESOLUTIONS, WavePDE, etc.
 from models.gan_load import (
     build_biggan, build_proggan, build_stylegan2, build_stylegan2mps, build_sngan
 )
+from lib.aux import sample_z
 
 # ------------------
 # Helpers
@@ -28,14 +29,6 @@ class ModelArgs:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
 
-def sample_z(batch_size, dim_z, device, truncation=None):
-    """Sample latent z with optional truncation."""
-    if truncation is None or truncation == 1.0:
-        return torch.randn(batch_size, dim_z, device=device)
-    else:
-        from scipy.stats import truncnorm
-        z_np = truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))
-        return torch.from_numpy(z_np).to(device=device, dtype=torch.float32)
 
 def build_gan(gan_type, target_classes, stylegan2_resolution, shift_in_w_space, device, use_mps):
     # BigGAN
@@ -130,7 +123,7 @@ if __name__ == '__main__':
     p.add_argument('--eps', type=float, default=0.2, help="shift magnitude (unused for PDE rollout)")
     p.add_argument('--shift-leap', type=int, default=1, help="frame stride for saving (unused here)")
     p.add_argument('--batch-size', type=int, default=2, help="generator batch size")
-    p.add_argument('--img-size', type=int, default=256, help="saved image size (resized)")
+    p.add_argument('--img-size', type=int, default=None, help="saved image size (resized)")
     p.add_argument('--img-quality', type=int, default=75, help="JPEG quality")
     p.add_argument('--gif', action='store_true', help="(unused)")
     p.add_argument('--gif-size', type=int, default=256)
@@ -141,7 +134,7 @@ if __name__ == '__main__':
     p.add_argument('--no-cuda', dest='cuda', action='store_false', help="no CUDA")
     p.add_argument('--mps', dest='mps', action='store_true', help="use MPS")
     p.add_argument('--no-mps', dest='mps', action='store_false', help="no MPS")
-    p.set_defaults(cuda=False, mps=True)
+    p.set_defaults(cuda=True, mps=False)
 
     args = p.parse_args()
 
@@ -198,11 +191,10 @@ if __name__ == '__main__':
     os.makedirs(out_dir, exist_ok=True)
 
     # Pair generation config
-    n_samples = 40_000
+    n_samples = 10_000
     B = int(args.batch_size)
-    assert n_samples % B == 0, "Choose batch-size that divides n_samples"
     K = S.num_support_sets
-    n_batches = n_samples // B // K
+    n_batches = n_samples // B // K + 1
 
     # PDE rollout length: match training (half_range = T // 2)
     half_range = S.num_support_timesteps // 2
@@ -211,12 +203,12 @@ if __name__ == '__main__':
     z_trunc = a.__dict__.get('z_truncation', None)
 
     all_labels = []
-
+    im_idx = 0
     for i in range(n_batches):
         print(f'Generating image pairs {i+1}/{n_batches} ...')
 
         # Sample batch z on device, with truncation if specified
-        z0 = sample_z(B, G.dim_z, device=device, truncation=z_trunc)
+        z0 = sample_z(B*K, G, device=device, truncation=1)
 
         # Optionally move to W space for StyleGAN2
         if a.__dict__.get('shift_in_w_space', False) and hasattr(G, 'get_w'):
@@ -229,8 +221,8 @@ if __name__ == '__main__':
         # Rollout by PDE: latent_{t+1} = latent_t + ∇_z u(latent_t, t)
         with torch.no_grad():
             for step in range(half_range):
-                t_b = torch.full((B, 1), float(step), device=device, dtype=z_cur.dtype)
-                z_cur, dz = S.inference(z_cur, t_b)  # returns (u, ∇u)
+                t_b = torch.full((B*K, 1), float(step), device=device, dtype=z_cur.dtype)
+                z_cur, dz = S.inference(z_cur.reshape(B,K, G.dim_z), t_b, dt=1.0)  # returns (u, ∇u)
                 if step==0:
                     z0_batch = z_cur.reshape(B*K, G.dim_z)
                 z_cur = z_cur + dz
@@ -254,17 +246,19 @@ if __name__ == '__main__':
         img1 = img1.clamp(-1, 1)
         img2 = img2.clamp(-1, 1)
         for j,(im1, im2) in enumerate(zip(img1, img2)):
+            if im_idx >= n_samples:
+                break
             a1 = im1.detach().cpu().numpy().transpose(1, 2, 0)  # HWC, RGB
             a2 = im2.detach().cpu().numpy().transpose(1, 2, 0)
             pair = np.concatenate([a1, a2], axis=1)
             pair = ((pair + 1.0) * 127.5).round().astype(np.uint8)
             pair = pair[:, :, ::-1]  # RGB -> BGR
             cv2.imwrite(
-                osp.join(out_dir, f'pair_{i * B + j:06d}.jpg'),
+                osp.join(out_dir, f'pair_{im_idx:06d}.jpg'),
                 pair,
                 [int(cv2.IMWRITE_JPEG_QUALITY), int(args.img_quality)]
             )
-
-    labels = np.concatenate(all_labels, axis=0)
+            im_idx += 1
+    labels = np.concatenate(all_labels, axis=0)[:im_idx]
     np.save(osp.join(out_dir, 'labels.npy'), labels)
-    print(f"Done. Saved {n_samples} pairs and labels.npy to {out_dir}")
+    print(f"Done. Saved {im_idx} pairs and labels.npy to {out_dir}")

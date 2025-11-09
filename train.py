@@ -64,7 +64,7 @@ def main():
     parser.add_argument('--only-potential', action='store_true', help="only train potential")
 
     # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-lr', type=float, default=3e-4,
+    parser.add_argument('--reconstructor-lr', type=float, default=1.5e-4,
                         help="set learning rate for reconstructor R optimization")
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
@@ -174,7 +174,7 @@ def main():
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
-                    lambdas={'fconvex': 1.0,'BB':2.0, 'g2orth': 1.0,  'ksd': 1.0},
+                    lambdas={'fconvex': 1.0,'BB':1.0, 'g2orth': 1.0,  'ksd': 1.0},
                     
                     )
 
@@ -192,7 +192,8 @@ def main():
     R = Reconstructor(reconstructor_type=args.reconstructor_type,
                       dim_index=S.num_support_sets,
                       dim_time=S.num_support_timesteps,
-                      channels=1 if args.gan_type == 'SNGAN_MNIST' else 3)
+                      channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
+                      pool_size=4 if args.gan_type == 'StyleGAN2' and args.stylegan2_resolution == 1024 else 1)
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in R.parameters() if p.requires_grad)))

@@ -31,9 +31,30 @@ from PIL import Image, ImageDraw
 #     else:
 #         return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
 
+def get_n_orthogonal_vectors(n, dim_z, device):
+    assert n <= dim_z, "n must be less than or equal to dim_z"
+    # Draw one random vector
+    z0 = torch.randn(dim_z, device=device)
+    norms = [z0.norm()]
+    z0 = z0 / (norms[0] + 1e-8)
+
+    # Create orthonormal basis (including z0 as the first vector)
+    basis = [z0]
+    for _ in range(1,  n):
+        v = torch.randn(dim_z, device=device)
+        norms.append(v.norm())
+        # Gram-Schmidt orthogonalization
+        for b in basis:
+            v = v - (v @ b) * b
+        v_norm = v.norm()
+        v = v / (v_norm+1e-8)
+        basis.append(v)
+    # Stack basis vectors
+    z = torch.stack(basis, dim=0)*torch.stack(norms, dim=0)
+    return z
 
 @torch.no_grad()
-def sample_z(batch_size, generator, params, device = torch.device('cuda')):
+def sample_z(batch_size, generator, params = None, device = torch.device('cuda'), w_center=None, truncation=None, shift_in_w_space=None):
     """
     Instead of sampling batch_size independent random vectors,
     sample one random vector and generate the rest as an orthonormal basis
@@ -41,37 +62,11 @@ def sample_z(batch_size, generator, params, device = torch.device('cuda')):
     """
     dim_z = generator.dim_z
 
-    # Draw one random vector
-    z0 = torch.randn(dim_z, device=device)
-    z0_norm = z0.norm()
-    z0 = z0 / (z0_norm + 1e-8)
-
-    # Create orthonormal basis (including z0 as the first vector)
-    basis = [z0]
-    for _ in range(1, min(batch_size, dim_z)):
-        v = torch.randn(dim_z, device=device)
-        # Gram-Schmidt orthogonalization
-        for b in basis:
-            v = v - (v @ b) * b
-        v_norm = v.norm()
-        if v_norm < 1e-8:
-            # If degenerate, resample
-            v = torch.randn(dim_z, device=device)
-            for b in basis:
-                v = v - (v @ b) * b
-            v_norm = v.norm()
-            if v_norm < 1e-8:
-                v = torch.zeros_like(v)
-        else:
-            v = v / v_norm
-        basis.append(v)
-    # Stack basis vectors
-    z = torch.stack(basis, dim=0)*z0_norm
-    # If batch_size > dim_z, pad with zeros
-    if batch_size > dim_z:
-        pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
-        z = torch.cat([z, pad], dim=0)
-    # If batch_size < dim_z, truncate
+    vectors = []
+    # If batch_size > dim_z, pad with random noise
+    for i in range(batch_size//dim_z+1):
+        vectors.append(get_n_orthogonal_vectors(dim_z, dim_z, device))
+    z = torch.cat(vectors, dim=0)
     if z.shape[0] > batch_size:
         z = z[:batch_size]
 
@@ -80,14 +75,20 @@ def sample_z(batch_size, generator, params, device = torch.device('cuda')):
         z = z.cuda(non_blocking=True)
 
     # Optionally shift in w-space and apply truncation
-    if getattr(generator, "shift_in_w_space", False):
+    if getattr(generator, "shift_in_w_space", False) or shift_in_w_space:
         z = generator.get_w(z)
-        if getattr(params, "z_truncation", None) is not None:
-            z_mean = z.mean(dim=0, keepdim=True)
+        if params is not None and getattr(params, "z_truncation", None) is not None:
+            z_mean = z.mean(dim=0, keepdim=True) if w_center is None else w_center.to(z.device)
             z = (z - z_mean) * params.z_truncation + z_mean
+        elif truncation is not None:
+            z_mean = z.mean(dim=0, keepdim=True) if w_center is None else w_center.to(z.device)
+            z = (z - z_mean) * truncation + z_mean
     else:
-        if getattr(params, "z_truncation", None) is not None:
+        if params is not None and getattr(params, "z_truncation", None) is not None:
             z = z * params.z_truncation
+        elif truncation is not None:
+            z = z * truncation
+
 
     return z
        

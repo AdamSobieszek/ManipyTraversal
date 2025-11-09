@@ -38,7 +38,7 @@ class MLP(nn.Module):
         self.layer_fusion = nn.Linear(n_in, n_in)
         self.activation3 = nn.Tanh()
         self.layer_out = nn.Linear(n_in, n_out)
-        self.activation4 = nn.Tanh()
+        self.activation4 = nn.Tanh()x
 
     def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         x = self.activation1(self.layer_x(x))

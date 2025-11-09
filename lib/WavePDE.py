@@ -114,19 +114,22 @@ class StackedSemanticPotential(nn.Module):
         self.final_activation = final_activation
 
         # zero convolution
-        self.c = nn.Parameter(torch.full((self.K, 1), .5))
+        self.c = nn.Parameter(torch.full((self.K, 1), 1.0))
         # self.c.data.normal_(std=0.1)
+
+        self.update_batchnorm = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B,K,D]
         h = self.act1(self.fc1(x))
         h = self.act2(self.fc2(h))
-        h = self.act3(self.fc3(h))
+        # h = self.act3(self.fc3(h))
         out = self.fc4(h)*self.c  + self.dir_linear(x)  # [B,K,1]
         # out = self.out_bn(out)
-        with torch.no_grad():   
-            self.running_mean.lerp_(out.mean(dim=0), 0.9)
-            self.running_std.lerp_(out.std(dim=0), 0.9)
+        if self.update_batchnorm and self.training:
+            with torch.no_grad():   
+                self.running_mean.lerp_(out.mean(dim=0), 0.9)
+                self.running_std.lerp_(out.std(dim=0), 0.9)
         return self.final_activation((out - self.running_mean) / (self.running_std + 1e-8))
 
 
@@ -268,7 +271,7 @@ class WavePDE(nn.Module):
         self._acc: Dict[str, torch.Tensor] = {}
 
     # ---- one step ----
-    def _per_step(self, z_bkd: torch.Tensor, dt: torch.Tensor, direction: int = +1):
+    def _per_step(self, z_bkd: torch.Tensor, dt: torch.Tensor=1.0, direction: int = +1):
         st = PDEState(
             f=self.F,
             psi=self.PSI,
@@ -296,7 +299,7 @@ class WavePDE(nn.Module):
         return st, x_next_noisy, L_sum, st.dt()
 
     # ---- unrolled training ----
-    def forward(self, z: torch.Tensor, t_index: torch.Tensor, dt: torch.Tensor, direction: int = +1):
+    def forward(self, z: torch.Tensor, t_index: torch.Tensor, dt: torch.Tensor, direction: int = +1, w_avg: torch.Tensor = None):
         """
         Returns:
           potential_preds: [B,K,1] (detached)
@@ -312,6 +315,8 @@ class WavePDE(nn.Module):
         i_target = torch.clamp(t_index, 0, T - 1).long().squeeze(-1)
         
         # expand once to K stacks
+        if w_avg is not None:
+            z = z - w_avg.reshape(1,D)
         z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
         potential_preds = []
         latent1_bk = None
@@ -321,6 +326,7 @@ class WavePDE(nn.Module):
         L_accum = None  # accumulate per-[B,K,1]
 
         step_iter = range(T)# if  else reversed(range(T))
+        self.F.update_batchnorm = True
         for i in step_iter:
             st, x_next, L_step, dt = self._per_step(z_curr, dt=dt, direction=direction)
 
@@ -341,6 +347,9 @@ class WavePDE(nn.Module):
             # advance
             z_curr = x_next
             last_st = st
+            # dont move the batchnorm at subsequent steps
+            self.F.update_batchnorm = False
+
 
         # average over steps
         L_total_per_bk = L_accum / float(T) if L_accum is not None else last_st.zeros()
@@ -355,13 +364,17 @@ class WavePDE(nn.Module):
             "L_mean": L_total_mean.detach(),
             **last_st.state["losses"],
         }
+
+        if w_avg is not None:
+            latent1_bk = latent1_bk + w_avg.reshape(1,1,D)
+            latent2_bk = latent2_bk + w_avg.reshape(1,1,D)
         return potential_preds, latent1_bk, latent2_bk, L_total_mean, last_st.delta_y().detach()
 
     def get_losses(self) -> Dict[str, torch.Tensor]:
         return self._acc
 
     @torch.enable_grad()
-    def inference(self, z: torch.Tensor, t_index: torch.Tensor = None, direction: int = +1) -> List[torch.Tensor]:
+    def inference(self, z: torch.Tensor, t_index: torch.Tensor = None, dt: torch.Tensor = 1.0, direction: int = +1) -> List[torch.Tensor]:
         if len(z.shape) == 3:
             B, K, D = z.shape
             z_curr = z
@@ -370,8 +383,6 @@ class WavePDE(nn.Module):
             K = self.num_support_sets
             z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
 
-        T = max(1, int(self.num_support_timesteps))
 
-
-        st, x_next, L_step, dt = self._per_step(z_curr, dt=1.0, direction=direction)
+        st, x_next, L_step, dt = self._per_step(z_curr, dt=dt, direction=direction)
         return z_curr, x_next-z_curr

@@ -1,2 +1,4 @@
 /models/pretrained/**/*
 /experiments/**/*
+*.jpg
+*.pkl

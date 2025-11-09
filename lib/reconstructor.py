@@ -7,13 +7,17 @@ def save_hook(module, input, output):
     setattr(module, 'output', output)
 
 
+
 class Reconstructor(nn.Module):
-    def __init__(self, reconstructor_type, dim_index, dim_time, channels=3):
+    def __init__(self, reconstructor_type, dim_index, dim_time, channels=3, pool_size=1):
         super(Reconstructor, self).__init__()
         self.reconstructor_type = reconstructor_type
         self.dim_index = dim_index
         self.dim_time = dim_time
         self.channels = channels
+        self.pool_size = pool_size
+        if self.pool_size > 1:
+            self.avg_pool = nn.AvgPool2d(kernel_size=(self.pool_size, self.pool_size), stride=self.pool_size)
 
         # === LeNet ===
         if self.reconstructor_type == 'LeNet':
@@ -70,6 +74,9 @@ class Reconstructor(nn.Module):
             self.shift_magnitudes = nn.Linear(512, 2)
 
     def forward(self, x1, x2):
+        if self.pool_size > 1:
+            x1 = self.avg_pool(x1)
+            x2 = self.avg_pool(x2)
         if self.reconstructor_type == 'LeNet':
             features = self.feature_extractor(torch.cat([x1, x2], dim=1))
             features = features.mean(dim=[-1, -2]).view(x1.shape[0], -1)

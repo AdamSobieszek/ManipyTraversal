@@ -158,7 +158,7 @@ class FConvex(PDELoss):
     """
     name = "fconvex"
     def _loss(self, st: PDEState) -> torch.Tensor:
-        q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
+        q = st.f_laplace(probes=int(self.ctx.get("probes", 4)))  # [B,K,1]
         margin = float(self.ctx.get("margin", 1e-3))
         return (margin - q).clamp_min(0.0).pow(2)
 
@@ -178,7 +178,7 @@ class GaussianKSD(PDELoss):
     with detached stats to avoid batch-coupled gradients.
 
     Ctx:
-      - whiten: bool (default True)
+      - mean_correction: bool (default True)
       - eps: float (default 1e-8)
       - bandwidth: Optional[float]  # if None, median heuristic per k
     """
@@ -186,16 +186,16 @@ class GaussianKSD(PDELoss):
 
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("eps", 1e-8))
-        whiten = bool(self.ctx.get("whiten", True))
+        mean_correction = bool(self.ctx.get("mean_correction", True))
         bandwidth = self.ctx.get("bandwidth", None)
 
         y = st.f()  # [B,K,1]
         z = y
-        if whiten:
+        if mean_correction:
             with torch.no_grad():
-                mu = y.mean(dim=0, keepdim=True)
-                std = y.std(dim=0, unbiased=False, keepdim=True).clamp_min(eps)
-            z = (y - mu) / std
+                running_mean = self.ctx.get("running_mean", torch.zeros_like(y[:1]))
+                running_mean.lerp_(y.mean(dim=0, keepdim=True), 0.95)
+            z = (y - running_mean)
 
         B, K, C = z.shape
         if B < 2:  # not enough pairs; return zeros

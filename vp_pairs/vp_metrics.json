@@ -1,0 +1,15 @@
+{
+  "vp_score_test_acc_percent": 89.3222,
+  "best_test_acc_percent": 92.0667,
+  "train_frac": 0.1,
+  "epochs": 600,
+  "batch_size": 32,
+  "lr": 0.005,
+  "K": 64,
+  "T": 6,
+  "reconstructor_type": "LeNet",
+  "device": "cuda",
+  "num_pairs_total": 10000,
+  "num_pairs_train": 1000,
+  "num_pairs_test": 9000
+}
