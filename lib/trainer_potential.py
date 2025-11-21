@@ -369,7 +369,7 @@ class TrainerPotential(object):
             z = sample_z(self.params.batch_size, generator, self.params, self.device)
 
             # Random step index per sample
-            dt = torch.randint(2_500, 7_00, (1, 1), device=self.device)/5_000
+            dt = torch.randint(4_500, 5_000, (1, 1), device=self.device)/5_000
             dt = dt.repeat(self.params.batch_size, 1)
             t_idx = torch.randint(1, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)
 
@@ -420,8 +420,8 @@ class TrainerPotential(object):
                     self.tb_writer.add_scalar("train/grad_norm/support_sets", gn_support, self.stat_tracker.global_opt_step)
                     self.tb_writer.add_scalar("train/grad_norm/reconstructor", gn_recon, self.stat_tracker.global_opt_step)
 
-                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=3.0)
-                torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=3.0)
+                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=1.0)
 
                 support_sets_optim.step(); reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True); reconstructor_optim.zero_grad(set_to_none=True)
