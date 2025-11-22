@@ -145,8 +145,9 @@ class TrainerPotential(object):
         # Classify
         logits, magnitudes = reconstructor(img1, img2)  # [B*K, K]
         logits0, magnitudes0 = reconstructor(img0, img1)
-        mse_loss = nn.MSELoss()(magnitudes.reshape(B, K, 2), potential_preds[:,:,-2:])
-        mse_loss = (mse_loss + nn.MSELoss()(magnitudes0.reshape(B, K, 2), potential_preds[:,:,[0,-2]]))/2
+        mse_loss = torch.zeros(1, device=self.device)
+        # mse_loss = nn.MSELoss()(magnitudes.reshape(B, K, 2), potential_preds[:,:,-2:])
+        # mse_loss = (mse_loss + nn.MSELoss()(magnitudes0.reshape(B, K, 2), potential_preds[:,:,[0,-2]]))/2
         cls_loss = (self.cross_entropy(logits, targets) + self.cross_entropy(logits0, targets))/2
 
 
@@ -158,10 +159,6 @@ class TrainerPotential(object):
             + self.params.lambda_pde * pde_loss
         )
         loss = loss / max(1, int(acc_denominator))
-        d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
-        # Asymmetric penalty: penalize d2 approaching 0 with a 1/x type penalty
-        # d2_penalty = 1.0 / (d2 + 1e-6)  # add epsilon for stability
-        loss = loss #+ 1.0 * d2_penalty  # 0.1 is a weighting factor; adjust as needed
 
         loss.backward()
 
@@ -173,6 +170,7 @@ class TrainerPotential(object):
             entropy = -(probs * (probs.clamp_min(1e-8).log())).sum(dim=1).mean()
 
             z_bk = z.unsqueeze(1).expand(B, K, D)
+            d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
             d1 = (latent1_bk - z_bk).norm(dim=-1).min()
 
             # reshape images back for visuals
@@ -222,7 +220,7 @@ class TrainerPotential(object):
 
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, support_sets, reconstructor, acc_steps: int):
-        support_set_wd = float(getattr(self.params, "support_set_wd", 0.01))
+        support_set_wd = float(getattr(self.params, "support_set_wd", 0.1))
         reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.001))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
@@ -236,7 +234,7 @@ class TrainerPotential(object):
         support_sets_optim = build_adamw(
             [
                 {"params": support_sets.PSI.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
-                {"params": support_sets.F.parameters(), "weight_decay": 0.5, "lr": self.params.support_set_lr},
+                {"params": support_sets.F.parameters(), "weight_decay": 0.25, "lr": self.params.support_set_lr},
                 {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
             ],
             lr=self.params.support_set_lr,
@@ -342,6 +340,7 @@ class TrainerPotential(object):
 
         # === Image logger (rotating) ===
         img_keep_last = int(getattr(self.params, "image_keep_last", 10))
+        img_logger = None
 
         if self.tensorboard and save_images:
             img_logger = ImageLogger(

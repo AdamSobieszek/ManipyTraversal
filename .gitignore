@@ -2,3 +2,14 @@
 /experiments/**/*
 *.jpg
 *.pkl
+*.pyc
+*.arrow
+*.pyc
+*.lock
+*.npz
+/data
+*.pyc
+/lib/__pycache__
+*.pt
+*.0
+*.pyc

@@ -131,6 +131,8 @@ def create_exp_dir(args, new_experiment=False):
         exp_dirs = [d for d in os.listdir("experiments/wip") if d.startswith(exp_dir)]
         # exclude folders that do not contain checkpoint.pt as a file in their recursive folder structure
         exp_dirs = [d for d in exp_dirs if osp.isfile(osp.join("experiments/wip", d, "models", "checkpoint.pt"))]
+        if not exp_dirs:
+            raise IndexError(f"No existing experiment found for {exp_dir}. Please run with --new-experiment to start a new one.")
         # sort by last modified time
         exp_dirs.sort(key=lambda x: os.path.getmtime(osp.join("experiments/wip", x)))
         #  set exp_dir to the newest folder

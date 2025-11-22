@@ -6,6 +6,10 @@ from torch import nn
 from torch.autograd import grad
 from torch.func import jvp as jvp_fwd
 
+from lib.pde_ops import PDEState
+from lib.pde_losses import build_losses 
+
+
 
 # ================================================================
 # Core stacked layers (vectorized over support-set axis K)
@@ -52,6 +56,169 @@ class StackedLinear(nn.Module):
 
 
 
+class OrthonormalRotationK(nn.Module):
+    """
+    Learnable orthonormal rotation acting along the K dimension.
+
+    Input:  x [B, K, C]
+    Output: y [B, K, C]
+
+    Internal parameter 'weight' is projected onto the set of orthonormal
+    matrices via a simple Gram–Schmidt procedure (no torch.linalg.qr).
+    """
+    def __init__(self, K: int, eps: float = 1e-8):
+        super().__init__()
+        self.K = int(K)
+        self.eps = eps
+        # Start at identity (no rotation initially)
+        self.weight = nn.Parameter(torch.eye(self.K))
+
+    @torch.no_grad()
+    def _orthonormalize_(self):
+        """
+        Classical Gram–Schmidt on columns of self.weight:
+        produces Q with Q^T Q = I (within numerical tolerance).
+        """
+        W = self.weight.data  # [K, K]
+        K = self.K
+
+        # We'll build Q column-by-column
+        Q = torch.zeros_like(W)
+
+        for i in range(K):
+            # Take current column
+            v = W[:, i]
+
+            if i > 0:
+                # Project v onto span of previous Q columns and subtract
+                # proj_coeffs shape: [i]
+                proj_coeffs = torch.matmul(Q[:, :i].T, v)          # [i]
+                v = v - torch.matmul(Q[:, :i], proj_coeffs)        # [K]
+
+            # Normalize
+            norm = v.norm(p=2)
+            if norm < self.eps:
+                # Degenerate direction: fall back to a standard basis vector
+                v = torch.zeros_like(v)
+                v[i] = 1.0
+                norm = 1.0
+
+            Q[:, i] = v / norm
+
+        self.weight.data.copy_(Q)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, K, C]
+        returns: [B, K, C]
+        """
+        # Re-orthonormalize before using the weight
+        self._orthonormalize_()
+
+        # Rotate along K: treat last dim C as 'channels', rotate K per channel.
+        # x: [B, K, C] -> [B, C, K]
+        x_bcK = x.transpose(1, 2)      # [B, C, K]
+        # Apply rotation: for each (B, C): x[b, c, :] @ R^T
+        y_bcK = x_bcK @ self.weight.T  # [B, C, K]
+        # Restore [B, K, C]
+        y = y_bcK.transpose(1, 2)
+        return y
+
+
+class StackedSemanticPotential(nn.Module):
+    """
+    Stacked scalar potentials F^k(x):
+      - x: [B, K, D_in]
+      - outputs: [B, K, n_out] (often n_out=1)
+    Only the final outputs are mean-centered per-k via running EMA.
+    After mean subtraction, we apply a learnable orthonormal rotation
+    along K to enable cross-potential gradients.
+    """
+    def __init__(
+        self,
+        K: int,
+        n_in: int,
+        n_out: int = 1,
+        n_hidden: int = 128,
+        activation: nn.Module = nn.Tanh(),
+        final_activation: nn.Module = nn.Identity(),
+    ):
+        super().__init__()
+        self.K = int(K)
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+        self.n_hidden = int(n_hidden)
+
+        # Shared shape convention: StackedLinear expects input [B, K, *]
+        self.fc1 = StackedLinear(self.K, self.n_in, self.n_in)
+        self.act1 = activation
+
+        self.fc2 = StackedLinear(self.K, self.n_in, self.n_hidden)
+        self.act2 = activation
+
+        self.fc3 = StackedLinear(self.K, self.n_hidden, self.n_hidden)
+        self.act3 = activation
+
+        self.fc4 = StackedLinear(self.K, self.n_hidden, self.n_out)
+
+        # Running mean (per k, per output channel), registered as buffer
+        self.register_buffer("running_mean", torch.zeros(self.K, self.n_out))
+        # If you ever want std again, register similarly:
+        # self.register_buffer("running_std", torch.ones(self.K, self.n_out))
+
+        # Additional linear component from input to output, initialized
+        # to small "coordinate-like" directions (per k).
+        self.dir_linear = StackedLinear(self.K, self.n_in, self.n_out, bias=False)
+        with torch.no_grad():
+            W = self.dir_linear.weight  # [K, n_out, n_in]
+            W.zero_()
+            for k in range(self.K):
+                W[k, 0, k % self.n_in] = 0.1
+            W.add_(torch.randn_like(W) * 1e-3)
+
+        # Scalar per-k gain on the fc4 branch
+        self.c = nn.Parameter(torch.full((self.K, 1), 1.0))
+
+        self.final_activation = final_activation
+        self.update_batchnorm = True
+
+        # NEW: Orthonormal rotation layer in the K dimension
+        self.rotation = OrthonormalRotationK(self.K)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, K, D_in]
+        returns: [B, K, n_out]
+        """
+        # Stacked MLP body
+        h = self.act1(self.fc1(x))             # [B, K, n_in]
+        h = self.act2(self.fc2(h))             # [B, K, n_hidden]
+        # If you want the extra depth, uncomment:
+        # h = self.act3(self.fc3(h))           # [B, K, n_hidden]
+
+        # Base potential + direct linear term
+        out_mlp = self.fc4(h) * self.c         # [B, K, n_out]
+        out_dir = self.dir_linear(x)           # [B, K, n_out]
+        out = out_mlp + out_dir                # [B, K, n_out]
+
+        # EMA mean update over batch (per k, per output channel)
+        if self.training and self.update_batchnorm:
+            with torch.no_grad():
+                batch_mean = out.mean(dim=0)   # [K, n_out]
+                # EMA: running_mean <- (1 - alpha)*running_mean + alpha*batch_mean
+                self.running_mean.lerp_(batch_mean, 0.1)  # use 0.1 or 0.9 as you like
+
+        # Zero-mean per k
+        out_centered = out - self.running_mean  # broadcasts [K, n_out] over batch
+
+        # NEW: Orthonormal rotation across K potentials
+        out_rot = self.rotation(out_centered)   # [B, K, n_out]
+
+        # Optional nonlinearity on final potentials
+        return self.final_activation(out_rot)
+
+
+
 class StackedSinusoidalPositionEmbeddings(nn.Module):
     """
     Sinusoidal embedding broadcast over K.
@@ -70,75 +237,6 @@ class StackedSinusoidalPositionEmbeddings(nn.Module):
         # t: [B,K,1]
         angles = t * self.freqs.view(1, 1, -1).to(t.dtype)  # [B,K,half]
         return torch.cat([angles.sin(), angles.cos()], dim=-1)  # [B,K,E]
-
-
-# ================================================================
-# Stacked potentials: f (SemanticPotential) and ψ (SliceEnergy)
-#   - Hidden layers have NO BatchNorm per your requirement
-#   - Only the FINAL output of f (and optionally ψ) is BatchNormed per-k
-# ================================================================
-class StackedSemanticPotential(nn.Module):
-    def __init__(self, K: int, n_in: int, n_out: int = 1, n_hidden: int = 128,  activation: nn.Module = nn.Tanh(), final_activation: nn.Module = nn.Identity()):
-        super().__init__()
-        self.K = int(K)
-        self.n_in = int(n_in)
-        self.n_out = int(n_out)
-        self.n_hidden = int(n_hidden)
-
-        self.fc1 = StackedLinear(self.K, self.n_in, self.n_in)
-        self.act1 = activation
-
-        self.fc2 = StackedLinear(self.K, self.n_in, self.n_hidden)
-        self.act2 = activation
-
-        self.fc3 = StackedLinear(self.K, self.n_hidden, self.n_hidden)
-        self.act3 = activation
-
-        self.fc4 = StackedLinear(self.K, self.n_hidden, self.n_out)
-        self.running_mean = torch.zeros(self.K, self.n_out)
-        self.running_std = torch.ones(self.K, self.n_out)
-
-        # Additional linear component from input to output, initialized to random unit directions (per k)
-        self.dir_linear = StackedLinear(self.K, self.n_in, self.n_out, bias=False)
-        with torch.no_grad():
-            W = self.dir_linear.weight.data  # [K, out(=1), in]
-            W.zero_()
-            for k in range(self.K):
-                W[k, 0, k%self.n_in] = .1
-
-            W.add_(torch.randn_like(W)*0.001)
-
-
-        # Output-only BatchNorm per k
-        # self.out_bn = nn.BatchNorm2d(self.K, self.n_out.)
-        self.final_activation = final_activation
-
-        # zero convolution
-        self.c = nn.Parameter(torch.full((self.K, 1), 1.0))
-        # self.c.data.normal_(std=0.1)
-
-        self.update_batchnorm = True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,K,D]
-        h = self.act1(self.fc1(x))
-        h = self.act2(self.fc2(h))
-        # h = self.act3(self.fc3(h))
-        out = self.fc4(h)*self.c  + self.dir_linear(x)  # [B,K,1]
-        # out = self.out_bn(out)
-        if self.update_batchnorm and self.training:
-            with torch.no_grad():   
-                self.running_mean.lerp_(out.mean(dim=0), 0.9)
-                self.running_std.lerp_(out.std(dim=0), 0.9)
-        return self.final_activation((out - self.running_mean) / (self.running_std + 1e-8))
-
-
-    def update_y_distributions(self, y: torch.Tensor):
-        """
-        Update the density estimates for each k. This should stay implementation-agnostic with a plug-in estimator class call.
-        """
-        pass
-
 
 class StackedSliceEnergy(nn.Module):
     def __init__(self, K: int, n_in: int, n_out: int = 1, n_hidden: int = 64, final_activation: nn.Module = nn.Identity(),
@@ -189,15 +287,6 @@ class SkipSliceEnergy(nn.Module):
 
     def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         return (torch.zeros_like(x)*x).sum(dim=-1, keepdim=True)
-
-# wave_pde.py
-import torch
-from torch import nn
-from typing import Dict, Optional, List
-
-from lib.pde_ops import PDEState
-from lib.pde_losses import build_losses 
-
 class WavePDE(nn.Module):
     """
     K-parallel WavePDE powered by PDEState and modular PDE losses.

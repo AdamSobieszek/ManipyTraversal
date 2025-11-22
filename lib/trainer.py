@@ -557,7 +557,7 @@ class Trainer(object):
         for micro_idx, iteration in enumerate(range(starting_micro, self.params.max_iter + 1), start=1):
             iter_t0 = time.time()
 
-            z = self.sample_z(self.params.batch_size)
+            z = sample_z(self.params.batch_size, generator, self.params, self.device)
 
             # Random step index per sample
             t_idx = torch.randint(0, max(1, half_range - 1), (self.params.batch_size, 1), device=self.device)

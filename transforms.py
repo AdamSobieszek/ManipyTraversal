@@ -48,7 +48,7 @@ class AddRandomTransformationDims(object):
             M = kornia.get_rotation_matrix2d(center, bsz_angles*0.0, bsz_scales * scale).to(x.device)
             x_t = kornia.warp_affine(x, M, dsize=(h, w))
         elif transform_type == 1:
-            M = kornia.get_rotation_matrix2d(center, bsz_angles * angle, bsz_scales).to(x.device)
+            M = kornia.geometry.transform.get_rotation_matrix2d(center, bsz_angles * angle, bsz_scales).to(x.device)
             x_t = kornia.warp_affine(x, M, dsize=(h, w))
         elif transform_type == 2:
             x_t = kornia.enhance.adjust_hue(x, bsz_colors * color)

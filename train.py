@@ -64,7 +64,7 @@ def main():
     parser.add_argument('--only-potential', action='store_true', help="only train potential")
 
     # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-lr', type=float, default=1.5e-4,
+    parser.add_argument('--reconstructor-lr', type=float, default=2e-4,
                         help="set learning rate for reconstructor R optimization")
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
@@ -75,7 +75,7 @@ def main():
     parser.add_argument('--accumulate-grad-steps', type=int, default=1, help="set number of steps to accumulate gradients")
     parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
     parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
-    parser.add_argument('--lambda-reg', type=float, default=1.00, help="regression loss weight")
+    parser.add_argument('--lambda-reg', type=float, default=1.0, help="regression loss weight")
     parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
@@ -174,7 +174,7 @@ def main():
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
-                    lambdas={'fconvex': 1.0,'BB':1.0, 'g2orth': 1.0,  'ksd': 1.0},
+                    lambdas={'fconvex': 1.0,'BB':.33, 'g2orth': 1.0},
                     
                     )
 

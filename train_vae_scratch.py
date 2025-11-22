@@ -67,34 +67,49 @@ def main():
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
+    parser.add_argument('--new-experiment', action='store_true', help="start a new experiment")
     parser.add_argument("--dsprites", type=bool, default=False)
-    # === CUDA ======================================================================================================= #
+    # === Device ===================================================================================================== #
     parser.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA during training")
     parser.add_argument('--no-cuda', dest='cuda', action='store_false', help="do NOT use CUDA during training")
-    parser.set_defaults(cuda=True)
+    parser.add_argument('--mps', dest='mps', action='store_true', help="use Apple Metal (MPS) backend")
+    parser.add_argument('--no-mps', dest='mps', action='store_false', help="do NOT use MPS backend")
+    parser.set_defaults(cuda=True, mps=False)
     # ================================================================================================================ #
 
     # Parse given arguments
     args = parser.parse_args()
 
     # Create output dir and save current arguments
-    exp_dir = create_exp_dir(args)
+    exp_dir = create_exp_dir(args, new_experiment=args.new_experiment)
 
-    # CUDA
-    use_cuda = False
-    multi_gpu = False
-    if torch.cuda.is_available():
-        if args.cuda:
-            use_cuda = True
-            torch.set_default_tensor_type('torch.cuda.FloatTensor')
-            if torch.cuda.device_count() > 1:
-                multi_gpu = True
-        else:
-            print("*** WARNING ***: It looks like you have a CUDA device, but aren't using CUDA.\n"
-                  "                 Run with --cuda for optimal training speed.")
-            torch.set_default_tensor_type('torch.FloatTensor')
+    # Device selection (CUDA > MPS > CPU)
+    cuda_available = torch.cuda.is_available()
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+    if args.cuda and not cuda_available:
+        print("*** WARNING ***: CUDA was requested but is not available. Falling back to CPU/MPS.\n"
+              "                 On Apple Silicon, try --mps if supported by your PyTorch build.")
+    if args.mps and not mps_available:
+        print("*** WARNING ***: MPS was requested but is not available. Falling back to CPU/CUDA.")
+    if cuda_available and not args.cuda:
+        print("*** WARNING ***: It looks like you have a CUDA device, but aren't using CUDA.\n"
+              "                 Run with --cuda for optimal training speed.")
+
+    use_cuda = args.cuda and cuda_available
+    use_mps = args.mps and mps_available
+    device = torch.device('cuda' if use_cuda else ('mps' if use_mps else 'cpu'))
+
+    # Set default tensor type for CUDA only (no MPS default tensor type exists)
+    if use_cuda:
+        torch.set_default_device(torch.device('cuda'))
+    elif use_mps:
+        torch.set_default_device(torch.device('mps'))
+        torch.set_default_dtype(torch.float32)
     else:
-        torch.set_default_tensor_type('torch.FloatTensor')
+        torch.set_default_device(torch.device('cpu'))
+
+    multi_gpu = use_cuda and (torch.cuda.device_count() > 1)
 
 
     # === DSPRITES or MNIST ===
@@ -146,15 +161,15 @@ def main():
                                      seq_len=config['n_transforms'],
                                      max_transform_len=config['max_transform_len'],
                                      batch_size=args.batch_size)
-        trn = TrainerVAEScratchDsprites(params=args, exp_dir=exp_dir, use_cuda=use_cuda, multi_gpu=multi_gpu,
+        trn = TrainerVAEScratchDsprites(params=args, exp_dir=exp_dir, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu,
                                 data_loader=data_loader)
     else:
         print("MNIST DATASET LOADING")
-        dataset = MNIST(root='/nfs/data_lambda/ysong/', train=True, transform=transforms.ToTensor(),download=False)
+        dataset = MNIST(root='./data', train=True, transform=transforms.ToTensor(),download=True)
         data_loader = DataLoader(
             dataset=dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
-            generator=torch.Generator(device='cuda'))
-        trn = TrainerVAEScratch(params=args, exp_dir=exp_dir, use_cuda=use_cuda, multi_gpu=multi_gpu,
+            generator=torch.Generator(device=device))
+        trn = TrainerVAEScratch(params=args, exp_dir=exp_dir, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu,
                                 data_loader=data_loader)
 
     # Training and Evaluation

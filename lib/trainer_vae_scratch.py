@@ -29,13 +29,15 @@ class DataParallelPassthrough(nn.DataParallel):
 
 
 class TrainerVAEScratch(object):
-    def __init__(self, params=None, exp_dir=None, use_cuda=False, multi_gpu=False,data_loader=None):
+    def __init__(self, params=None, exp_dir=None, use_cuda=False, use_mps=False, multi_gpu=False,data_loader=None):
         if params is None:
             raise ValueError("Cannot build a Trainer instance with empty params: params={}".format(params))
         else:
             self.params = params
         self.use_cuda = use_cuda
+        self.use_mps = use_mps
         self.multi_gpu = multi_gpu
+        self.device = torch.device('cuda' if use_cuda else ('mps' if use_mps else 'cpu'))
         self.data_loader=data_loader
 
         # Use TensorBoard
@@ -151,14 +153,9 @@ class TrainerVAEScratch(object):
 
         # Set `generator` to evaluation mode, `support_sets` and `reconstructor` to training mode, and upload
         # models to GPU if `self.use_cuda` is set (i.e., if args.cuda and torch.cuda.is_available is True).
-        if self.use_cuda:
-            generator.cuda().train()
-            support_sets.cuda().train()
-            reconstructor.cuda().train()
-        else:
-            generator.train()
-            support_sets.train()
-            reconstructor.train()
+        generator.to(self.device).train()
+        support_sets.to(self.device).train()
+        reconstructor.to(self.device).train()
 
         # Set support sets optimizer
         support_sets_optim = torch.optim.Adam(support_sets.parameters(), lr=self.params.support_set_lr)
@@ -208,14 +205,17 @@ class TrainerVAEScratch(object):
 
                 # Sample latent codes from standard (truncated) Gaussian -- torch.Size([batch_size, generator.dim_z])
                 #z = sample_z(batch_size=self.params.batch_size, dim_z=generator.latent_size, truncation=self.params.z_truncation)
-                if self.use_cuda:
-                    x = mnist_color(x.cuda())
+                x = x.to(self.device)
+                if not self.params.dsprites:
+                    x = mnist_color(x)
 
                 # Generate images the shifted latent codes
                 index = torch.randint(0,self.params.num_support_sets,(1,1),requires_grad=False)
                 half_range = self.params.num_support_timesteps // 2
-                time_stamp = torch.randint(0, half_range - 1, (1, 1), dtype=x.dtype,
-                                           requires_grad=True).repeat(self.params.batch_size, 1).to(x)
+                # Ensure upper bound is at least 1 (randint excludes upper bound)
+                upper_bound = max(1, half_range)
+                time_stamp = torch.randint(0, upper_bound, (1, 1), dtype=torch.float32,
+                                           requires_grad=True).repeat(self.params.batch_size, 1).to(x.device)
 
                 recon_x, mean, log_var, z = generator(x)
                 with torch.no_grad():
@@ -318,9 +318,9 @@ class TrainerVAEScratch(object):
         prior = Normal(0.0,1.0)
         for i, (x, y) in enumerate(self.data_loader):
             with torch.no_grad():
-                if self.use_cuda:
-                    x = x.cuda()
-                    x = mnist_color(x.cuda())
+                x = x.to(self.device)
+                if not self.params.dsprites:
+                    x = mnist_color(x)
                 recon_x, mean, log_var, z = generator(x)
                 std = torch.exp(log_var / 2.0)
                 q = Normal(mean, std)
