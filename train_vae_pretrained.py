@@ -170,7 +170,7 @@ def main():
         print("  \\__Type: dSprites ConvVAE")
         # vae = ConvVAE(num_channel=1, latent_size=15 * 15 + 1, img_size=64)
         vae = ConvVAE(num_channel=1, latent_size=64, img_size=64)
-        vae.load_state_dict(torch.load("vae_dsprites_conv.pt", map_location='cpu'))
+        vae.load_state_dict(torch.load("vae_dsprites_epoch_40.pt", map_location='cpu'))
     else:
         print("  \\__Type: MNIST ConvVAE")
         # vae = ConvVAE(num_channel=1, latent_size=18 * 18, img_size=28)

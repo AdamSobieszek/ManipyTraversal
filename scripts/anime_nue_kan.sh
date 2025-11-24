@@ -1,13 +1,11 @@
-#!/bin/bash
-
-gan_type="dSprites"
-num_support_sets=32
-num_support_timesteps=12
+gan_type="SNGAN_AnimeFaces"
+num_support_sets=64
+num_support_timesteps=6
 warmup_fraction=0.001
 accumulate_grad_steps=1
 reconstructor_type="LeNet"
 z_truncation=1.0
-batch_size=16
+batch_size=6
 max_iter=3000
 tensorboard=true
 new_experiment=true
@@ -24,9 +22,8 @@ if $new_experiment ; then
   new="--new-experiment"
 fi
 
-python train_vae_pretrained.py $tb \
+python train.py $tb \
                 --gan-type=${gan_type} \
-                --dsprites \
                 --reconstructor-type=${reconstructor_type} \
                 --num-support-sets=${num_support_sets} \
                 --num-support-timesteps=${num_support_timesteps} \
@@ -43,4 +40,5 @@ python train_vae_pretrained.py $tb \
                 --reset_weight_decay \
                 --reset_schedulers \
                 --only-potential \
+                --kanpde \
                 $new

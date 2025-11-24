@@ -1,6 +1,7 @@
 import argparse
 import torch
 from lib import *
+from lib.KanPDE import KanPDE
 from models.gan_load import build_biggan, build_proggan, build_stylegan2,build_stylegan2mps, build_sngan
 from torch import nn
 
@@ -62,6 +63,7 @@ def main():
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
     parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
     parser.add_argument('--only-potential', action='store_true', help="only train potential")
+    parser.add_argument('--kanpde', action='store_true', help="use KanPDE")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-lr', type=float, default=2e-4,
@@ -175,9 +177,11 @@ def main():
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
                     lambdas={'fconvex': 1.0,'BB':.33, 'g2orth': 1.0},
-                    
+                    ) if not args.kanpde else KanPDE(num_support_sets=args.num_support_sets,
+                    num_support_timesteps=args.num_support_timesteps,
+                    support_vectors_dim=G.dim_z,
+                    lambdas={'fconvex': 1.0,'BB':.33, 'g2orth': 1.0},
                     )
-
     # For stylegan remove the last activation layer otherwise the changes are too small
     # if args.gan_type != 'StyleGAN2':
     #     for i in range(S.num_support_sets):

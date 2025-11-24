@@ -19,7 +19,7 @@ TRANSITION_FRAMES = 10      # How fast to morph weights between training stages
 TRAINING_EPOCHS = 30        # Total "checkpoints" to show
 TRAINING_STEPS_PER_EPOCH = 200 # Gradient descent steps between checkpoints
 LEARNING_RATE = 0.001
-WD = 0.1
+WD = 0.
 
 # Global Device Configuration
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -194,9 +194,9 @@ def generate_training_stages():
     # Generate Targets Y: scaled sigmoid of linear combination + noise
     # y = sigmoid(w_true * x) * scale + noise
 
-    w_true = np.array([0.1, 0.8])
+    w_true = np.array([0.4, 0.8])
     linear_combination = X_raw @ w_true
-    Targets_np = 1.0 / (1.0 + np.exp(-linear_combination)) * 5.0 + 0.1 * np.random.randn(N_SAMPLES)
+    Targets_np = 1.0 / (1.0 + np.exp(-linear_combination*2)) * 5.0 + 0.5 * np.random.randn(N_SAMPLES)
     
     Xt = torch.tensor(Xt_np, dtype=torch.float32, device=DEVICE)
     Yt = torch.tensor(Yt_np, dtype=torch.float32, device=DEVICE)
