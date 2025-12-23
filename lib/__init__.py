@@ -8,7 +8,7 @@ from .config import GAN_RESOLUTIONS, GAN_WEIGHTS, RECONSTRUCTOR_TYPES, BIGGAN_CL
 from .WavePDE import WavePDE
 from .reconstructor import Reconstructor
 from .trainer import Trainer
-from .trainer_potential import TrainerPotential
+from .trainer_potential_nue import TrainerPotential
 from .trainer_vae import TrainerVAE
 from .trainer_vae_scratch import TrainerVAEScratch
 from .trainer_vae_scratch_dsprites import TrainerVAEScratchDsprites

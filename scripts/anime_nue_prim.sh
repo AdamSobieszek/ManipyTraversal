@@ -1,6 +1,6 @@
 gan_type="SNGAN_AnimeFaces"
-num_support_sets=64
-num_support_timesteps=6
+num_support_sets=32
+num_support_timesteps=20
 warmup_fraction=0.001
 accumulate_grad_steps=1
 reconstructor_type="LeNet"

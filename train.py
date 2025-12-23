@@ -176,7 +176,7 @@ def main():
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
-                    lambdas={'fconvex': 1.0,'BB':.33, 'g2orth': 1.0},
+                    lambdas={'BB':1.0, 'g2orth': 1.0},
                     ) if not args.kanpde else KanPDE(num_support_sets=args.num_support_sets,
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
