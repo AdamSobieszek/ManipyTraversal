@@ -94,7 +94,7 @@ class TrainerPotential(object):
 
     def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
         if step_idx > 1:
-            update_stdout(11)
+            update_stdout(10)
         stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
         total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
         update_progress(

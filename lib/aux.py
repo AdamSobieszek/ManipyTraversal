@@ -1,4 +1,3 @@
-import sys
 import os
 import os.path as osp
 import json
@@ -7,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import _LRScheduler
-
+import sys
 import math
 import time
 from scipy.stats import truncnorm
@@ -15,46 +14,104 @@ from PIL import Image, ImageDraw
 
 
 
-# def sample_z(batch_size, dim_z, truncation=None):
-#     """Sample a random latent code from multi-variate standard Gaussian distribution with/without truncation.
+def choose_device() -> torch.device:
+        # Device selection
+    cuda_available = torch.cuda.is_available()
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    device = torch.device('cuda' if cuda_available else ('mps' if mps_available else 'cpu'))
 
-#     Args:
-#         batch_size (int)   : batch size (number of latent codes)
-#         dim_z (int)        : latent space dimensionality
-#         truncation (float) : trufcatiof parameter
+    # Set default tensor type for CUDA only (no MPS default tensor type exists)
+    if cuda_available:
+        torch.set_default_device(torch.device('cuda'))
+    elif mps_available:
+        torch.set_default_device(torch.device('mps'))
+        torch.set_default_dtype(torch.float32)
+    else:
+        torch.set_default_device(torch.device('cpu'))
 
-#     Returns:
-#         z (torch.Tensor)   : batch of latent codes
-#     """
-#     if truncation is None or truncation == 1.0:
-#         return torch.randn(batch_size, dim_z)
-#     else:
-#         return torch.from_numpy(truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))).to(torch.float)
+    return device
 
-def get_n_orthogonal_vectors(n, dim_z, device):
-    assert n <= dim_z, "n must be less than or equal to dim_z"
-    # Draw one random vector
-    z0 = torch.randn(dim_z, device=device)
-    norms = [z0.norm()]
-    z0 = z0 / (norms[0] + 1e-8)
+import math
+from torch.optim.lr_scheduler import _LRScheduler
 
-    # Create orthonormal basis (including z0 as the first vector)
-    basis = [z0]
-    for _ in range(1,  n):
-        v = torch.randn(dim_z, device=device)
-        norms.append(v.norm())
-        # Gram-Schmidt orthogonalization
-        for b in basis:
-            v = v - (v @ b) * b
-        v_norm = v.norm()
-        v = v / (v_norm+1e-8)
-        basis.append(v)
-    # Stack basis vectors
-    z = torch.stack(basis, dim=0)*torch.stack(norms, dim=0)
-    return z
+class PhasedCosineWithRestarts(_LRScheduler):
+    """
+    Cosine LR with warmup + SGDR-style restarts + phase offset (radians).
+
+    For step s:
+      if s < warmup_steps:
+          lr = base_lr * (s+1)/warmup_steps
+      else:
+          let u = s - warmup_steps
+          cycle_len = T0 * (Tmult ** cycle_idx)
+          pos  = (u - sum_prev_cycles) / cycle_len   in [0,1)
+          lr   = min_lr + 0.5*(base_lr-min_lr) * (1 + cos(2π*pos + phase))
+
+    Notes:
+      • base_lrs are captured from the optimizer's param_groups at construction.
+      • min_lr can be scalar or per-group list (length == len(base_lrs)).
+      • phase is a scalar in radians (e.g., 0 for support, π for reconstructor).
+      • last_epoch is the *number of steps already taken* (PyTorch convention).
+    """
+    def __init__(self, optimizer,
+                 warmup_steps: int,
+                 T0: int,
+                 Tmult: float = 1.0,
+                 min_lr=1e-6,
+                 phase: float = 0.0,
+                 last_epoch: int = -1):
+        self.warmup_steps = int(max(0, warmup_steps))
+        self.T0 = int(max(1, T0))
+        self.Tmult = float(max(1.0, Tmult))
+        self.phase = float(phase)
+        self._cycle_boundaries = None  # built lazily
+        self.base_lrs = [g['lr'] for g in optimizer.param_groups]
+
+        if isinstance(min_lr, (list, tuple)):
+            assert len(min_lr) == len(self.base_lrs), "min_lr list must match number of param groups"
+            self.min_lrs = list(map(float, min_lr))
+        else:
+            self.min_lrs = [float(min_lr)] * len(self.base_lrs)
+
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def _locate_cycle(self, u: int):
+        # u = steps since warmup (>=0). Return (cycle_idx, pos_in_cycle[0,1), cycle_len)
+        if self._cycle_boundaries is None:
+            self._cycle_boundaries = []
+        # Expand boundaries until u is within range
+        total = 0
+        c = 0
+        while True:
+            L = int(round(self.T0 * (self.Tmult ** c)))
+            if u < total + L:
+                pos = (u - total) / max(1, L)
+                return c, pos, L
+            total += L
+            c += 1
+
+    def get_lr(self):
+        s = self.last_epoch  # steps completed
+        # Warmup
+        if s < self.warmup_steps:
+            scale = (s + 1) / max(1, self.warmup_steps)
+            return [base * scale for base in self.base_lrs]
+
+        # After warmup
+        u = s - self.warmup_steps
+        _, pos, _ = self._locate_cycle(u)
+        # Cosine with phase
+        cos_arg = 2.0 * math.pi * pos + self.phase
+        cval = 0.5 * (1.0 + math.cos(cos_arg))
+        # Per-group LR
+        lrs = []
+        for base, minlr in zip(self.base_lrs, self.min_lrs):
+            lrs.append(minlr + (base - minlr) * cval)
+        return lrs
+
 
 @torch.no_grad()
-def sample_z(batch_size, generator, params = None, device = torch.device('cuda'), w_center=None, truncation=None, shift_in_w_space=None):
+def sample_z(batch_size, generator, params, device = torch.device('cuda')):
     """
     Instead of sampling batch_size independent random vectors,
     sample one random vector and generate the rest as an orthonormal basis
@@ -62,11 +119,37 @@ def sample_z(batch_size, generator, params = None, device = torch.device('cuda')
     """
     dim_z = generator.dim_z
 
-    vectors = []
-    # If batch_size > dim_z, pad with random noise
-    for i in range(batch_size//dim_z+1):
-        vectors.append(get_n_orthogonal_vectors(dim_z, dim_z, device))
-    z = torch.cat(vectors, dim=0)
+    # Draw one random vector
+    z0 = torch.randn(dim_z, device=device)
+    z0_norm = z0.norm()
+    z0 = z0 / (z0_norm + 1e-8)
+
+    # Create orthonormal basis (including z0 as the first vector)
+    basis = [z0]
+    for _ in range(1, min(batch_size, dim_z)):
+        v = torch.randn(dim_z, device=device)
+        # Gram-Schmidt orthogonalization
+        for b in basis:
+            v = v - (v @ b) * b
+        v_norm = v.norm()
+        if v_norm < 1e-8:
+            # If degenerate, resample
+            v = torch.randn(dim_z, device=device)
+            for b in basis:
+                v = v - (v @ b) * b
+            v_norm = v.norm()
+            if v_norm < 1e-8:
+                v = torch.zeros_like(v)
+        else:
+            v = v / v_norm
+        basis.append(v)
+    # Stack basis vectors
+    z = torch.stack(basis, dim=0)*z0_norm
+    # If batch_size > dim_z, pad with zeros
+    if batch_size > dim_z:
+        pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
+        z = torch.cat([z, pad], dim=0)
+    # If batch_size < dim_z, truncate
     if z.shape[0] > batch_size:
         z = z[:batch_size]
 
@@ -75,20 +158,14 @@ def sample_z(batch_size, generator, params = None, device = torch.device('cuda')
         z = z.cuda(non_blocking=True)
 
     # Optionally shift in w-space and apply truncation
-    if getattr(generator, "shift_in_w_space", False) or shift_in_w_space:
+    if getattr(generator, "shift_in_w_space", False):
         z = generator.get_w(z)
-        if params is not None and getattr(params, "z_truncation", None) is not None:
-            z_mean = z.mean(dim=0, keepdim=True) if w_center is None else w_center.to(z.device)
+        if getattr(params, "z_truncation", None) is not None:
+            z_mean = z.mean(dim=0, keepdim=True)
             z = (z - z_mean) * params.z_truncation + z_mean
-        elif truncation is not None:
-            z_mean = z.mean(dim=0, keepdim=True) if w_center is None else w_center.to(z.device)
-            z = (z - z_mean) * truncation + z_mean
     else:
-        if params is not None and getattr(params, "z_truncation", None) is not None:
+        if getattr(params, "z_truncation", None) is not None:
             z = z * params.z_truncation
-        elif truncation is not None:
-            z = z * truncation
-
 
     return z
        
@@ -131,8 +208,6 @@ def create_exp_dir(args, new_experiment=False):
         exp_dirs = [d for d in os.listdir("experiments/wip") if d.startswith(exp_dir)]
         # exclude folders that do not contain checkpoint.pt as a file in their recursive folder structure
         exp_dirs = [d for d in exp_dirs if osp.isfile(osp.join("experiments/wip", d, "models", "checkpoint.pt"))]
-        if not exp_dirs:
-            raise IndexError(f"No existing experiment found for {exp_dir}. Please run with --new-experiment to start a new one.")
         # sort by last modified time
         exp_dirs.sort(key=lambda x: os.path.getmtime(osp.join("experiments/wip", x)))
         #  set exp_dir to the newest folder
@@ -293,7 +368,7 @@ def build_adamw(
 
 
 
-# Utils
+# aux.py
 
 def module_grad_norm(mod):
     total_sq = 0.0
@@ -307,7 +382,12 @@ def module_grad_norm(mod):
 @torch.no_grad()
 def _per_k_grad_norms(support_sets) -> np.ndarray:
     K = support_sets.num_support_sets
-    g2 = torch.zeros(K, dtype=torch.float32)
+    # Keep accumulation on the same device as gradients (prevents device sync/copies)
+    try:
+        dev = next(support_sets.parameters()).device
+    except StopIteration:
+        dev = torch.device("cpu")
+    g2 = torch.zeros(K, dtype=torch.float32, device=dev)
 
     for p in support_sets.parameters():
         g = p.grad
@@ -324,11 +404,11 @@ def _per_k_grad_norms(support_sets) -> np.ndarray:
         k_ax = axes_with_K[0]
         if k_ax != 0:
             g = g.movedim(k_ax, 0)  # put K in front
-        g2 += g.float().reshape(K, -1).pow(2).sum(dim=1)
-    return torch.sqrt(torch.clamp(g2, min=1e-12)).cpu().numpy()
+        g2 += g.reshape(K, -1).pow(2).sum(dim=1)
+    return torch.sqrt(torch.clamp(g2, min=1e-12)).detach().cpu().numpy()
 
     
-def _pack_BK(x_bk: torch.Tensor):
+def _pack_BK(x_bk: torch.Tensor, *, return_b_idx: bool = True):
     """
     Flatten [B,K,...] → [B*K,...] in a *known* order and return the mapping + targets.
     Order: (b=0,k=0..K-1), (b=1,k=0..K-1), ...
@@ -336,19 +416,15 @@ def _pack_BK(x_bk: torch.Tensor):
     assert x_bk.dim() >= 2, f"Expected [B,K,...], got {tuple(x_bk.shape)}"
     B, K = x_bk.shape[:2]
 
-    # Ensure [B,K,...] with K as dim=1 (guard against permuted tensors)
-    if x_bk.stride(1) == 1 and x_bk.is_contiguous(memory_format=torch.contiguous_format):
-        x_bk_c = x_bk
-    else:
-        x_bk_c = x_bk.contiguous()
-
-    flat = x_bk_c.view(B * K, *x_bk_c.shape[2:])
+    # Make contiguous only if needed; use reshape to avoid copies when possible.
+    x_bk_c = x_bk if x_bk.is_contiguous() else x_bk.contiguous()
+    flat = x_bk_c.reshape(B * K, *x_bk_c.shape[2:])
 
     # Mapping & targets (same device as input)
     dev = x_bk.device
-    b_idx = torch.arange(B, device=dev).repeat_interleave(K)     # [0,0,...,1,1,...]
     k_idx = torch.arange(K, device=dev).repeat(B)                # [0..K-1, 0..K-1, ...]
     targets = k_idx                                              # class k for row (b,k)
+    b_idx = torch.arange(B, device=dev).repeat_interleave(K) if return_b_idx else None  # [0,0,...,1,1,...]
 
     return flat, targets, (b_idx, k_idx), (B, K)
 
@@ -700,29 +776,66 @@ def create_summarizing_gif(imgs_root, gif_filename, num_imgs=None, gif_size=None
         duration=1000 // gif_fps)
 
 from typing import Iterable, Sequence, Union, Optional
-
-
+import math
+from torch.optim.lr_scheduler import _LRScheduler
+import math
+from torch.optim.lr_scheduler import _LRScheduler
 
 class CosineScheduleWithWarmup(_LRScheduler):
     """
-    A custom learning rate scheduler that implements a linear warmup followed
-    by a cosine decay. This avoids the need for the `transformers` library.
+    Linear warmup followed by a configurable decay (cosine by default).
+    Pickle-safe: no lambdas or local callables are stored.
     """
     def __init__(self, optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
-        self.num_warmup_steps = num_warmup_steps
-        self.num_training_steps = num_training_steps
+        self.num_warmup_steps = int(num_warmup_steps)
+        self.num_training_steps = int(num_training_steps)
+        # decay config (primitive types only -> pickle-safe)
+        self.decay_kind = 'cosine'
+        self.decay_power = 1.0
         super().__init__(optimizer, last_epoch)
 
-    def get_lr(self):
-        if self.last_epoch < self.num_warmup_steps:
-            progress = float(self.last_epoch) / float(max(1, self.num_warmup_steps))
-            return [base_lr * progress for base_lr in self.base_lrs]
-        
-        progress = float(self.last_epoch - self.num_warmup_steps) / float(max(1, self.num_training_steps - self.num_warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        
-        return [base_lr * cosine_decay for base_lr in self.base_lrs]
+    @staticmethod
+    def _clamp01(x: float) -> float:
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
+    def _decay_factor(self, p: float) -> float:
+        # p is in [0,1]
+        if self.decay_kind == 'cosine':
+            return 0.5 * (1.0 + math.cos(math.pi * p))   # 1 -> 0
+        elif self.decay_kind == 'linear':
+            return 1.0 - p                                # 1 -> 0
+        elif self.decay_kind == 'constant':
+            return 1.0                                    # hold LR
+        elif self.decay_kind == 'poly':
+            return (1.0 - p) ** float(self.decay_power)   # power decay
+        else:
+            raise ValueError(f"Unknown decay schedule '{self.decay_kind}'")
+
+    def get_lr(self):
+        # Warmup: 0 -> 1
+        if self.last_epoch < self.num_warmup_steps:
+            progress = self._clamp01(self.last_epoch / max(1, self.num_warmup_steps))
+            return [base_lr * progress for base_lr in self.base_lrs]
+
+        # Decay phase
+        denom = max(1, self.num_training_steps - self.num_warmup_steps)
+        p = self._clamp01((self.last_epoch - self.num_warmup_steps) / denom)
+        factor = self._decay_factor(p)
+        return [base_lr * factor for base_lr in self.base_lrs]
+
+    def set_decay(self, schedule: str = 'cosine', **kwargs):
+        """
+        Change post-warmup decay on the fly (pickle-safe).
+        schedule ∈ {'cosine', 'linear', 'constant', 'poly'}
+        For 'poly', you can pass power=2.0, etc.
+        """
+        schedule = (schedule or 'cosine').lower()
+        if schedule not in {'cosine', 'linear', 'constant', 'poly'}:
+            raise ValueError("schedule must be one of {'cosine','linear','constant','poly'}")
+
+        self.decay_kind = schedule
+        if schedule == 'poly':
+            self.decay_power = float(kwargs.get('power', 1.0))
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     return CosineScheduleWithWarmup(optimizer, num_warmup_steps, num_training_steps, last_epoch)
 
@@ -868,11 +981,13 @@ class ImageLogger:
         self.writer = writer
         self.keep_last_images = int(keep_last_images)
         self.downscale = downscale
+        # Ensure we can glob files reliably regardless of SummaryWriter implementation.
+        self._log_dir = Path(getattr(writer, "log_dir", ""))
 
     def _list_image_eventfiles(self):
         # PyTorch appends filename_suffix to event filename, so match *.images*
         return sorted(
-            [p for p in self.writer.log_dir.glob("events.out.tfevents.*.images*") if p.is_file()],
+            [p for p in self._log_dir.glob("events.out.tfevents.*.images*") if p.is_file()],
             key=lambda p: p.stat().st_mtime
         )
 
@@ -899,3 +1014,249 @@ class ImageLogger:
         # self._prune_old_images()
         
     def close(self): self.writer.close()
+
+# =========================
+# TensorBoard server + ngrok
+# =========================
+def tb_start(exp_dir: str):
+    """
+    Starts TensorBoard programmatically and optionally opens an ngrok tunnel.
+    Uses env vars:
+      TB_HOST, TB_PORT,
+      NGROK_AUTHTOKEN, NGROK_DOMAIN, NGROK_BASIC_AUTH, NGROK_REGION
+    Returns: (tb_writer, tb_url, tb_obj, run_logdir)
+    """
+    from tensorboard import program
+    from torch.utils.tensorboard import SummaryWriter
+    import os
+
+    exp_root, run_name = exp_dir.split("__")
+    tb_dir = os.path.join("experiments", "tensorboard", "wip", exp_root)
+    run_dir = os.path.join(tb_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    tb_host = os.getenv("TB_HOST", "0.0.0.0")
+    tb_port = int(os.getenv("TB_PORT", "6006"))
+
+    tb = program.TensorBoard()
+    tb.configure(argv=[
+        None,
+        "--logdir", tb_dir,
+        "--host", tb_host,
+        "--port", str(tb_port),
+        "--reload_interval", "5",
+    ])
+    local_url = tb.launch()
+
+    public_url = None
+    ngrok_token = os.getenv("NGROK_AUTHTOKEN")
+    if ngrok_token:
+        try:
+            from pyngrok import ngrok, conf
+            cfg = conf.PyngrokConfig(auth_token=ngrok_token)
+            conf.set_default(cfg)
+
+            # Close any old tunnel on this port (useful for restarts)
+            for t in ngrok.get_tunnels():
+                if t.config.get("addr", "").endswith(f":{tb_port}"):
+                    ngrok.disconnect(t.public_url)
+
+            ngrok_hostname = os.getenv("NGROK_DOMAIN")   # reserved domain (premium)
+            ngrok_auth = os.getenv("NGROK_BASIC_AUTH")   # "user:pass"
+            ngrok_region = os.getenv("NGROK_REGION")     # e.g. "eu", "us"
+            if ngrok_region:
+                cfg.region = ngrok_region
+
+            connect_kwargs = {"proto": "http", "addr": tb_port}
+            if ngrok_hostname:
+                connect_kwargs["hostname"] = ngrok_hostname
+            if ngrok_auth:
+                connect_kwargs["auth"] = ngrok_auth
+
+            tunnel = ngrok.connect(**connect_kwargs)
+            public_url = tunnel.public_url
+        except Exception as e:
+            print(f"[ngrok] Failed to create tunnel: {e}")
+
+    tb_url = public_url or local_url
+    print(f"#. TensorBoard local: {local_url}")
+    if public_url:
+        print(f"#. TensorBoard public: {public_url}", "\n" * 8)
+    else:
+        print("#. (No ngrok tunnel; set NGROK_AUTHTOKEN to expose publicly)")
+
+    writer = SummaryWriter(log_dir=run_dir)
+    return writer, tb_url, tb, run_dir
+
+
+# =========================
+# dt sampling (toggleable)
+# =========================
+@torch.no_grad()
+def dt_temperature(step: int, total_opt_steps: int, start: float, end: float,
+                   schedule: str = "cosine", anneal_fraction: float = 1.0) -> float:
+    schedule = (schedule or "cosine").lower()
+    anneal_steps = max(1, int(round(total_opt_steps * max(0.0, min(1.0, anneal_fraction)))))
+    p = min(1.0, max(0.0, step / float(anneal_steps)))
+    if schedule == "linear":
+        return float(start + (end - start) * p)
+    # cosine default
+    cos_p = 0.5 * (1.0 + math.cos(math.pi * p))  # 1 -> 0
+    return float(end + (start - end) * cos_p)
+
+
+@torch.no_grad()
+def sample_dt_legacy_uniform(B: int, device, half_range: int,
+                             low: int = 4000, high: int = 5500) -> torch.Tensor:
+    dt = torch.randint(low, high, (1, 1), device=device) / 5000.0
+    dt_scale = 2.0 / max(1, (half_range - 1))
+    dt = dt * dt_scale
+    return dt.repeat(B, 1)
+
+
+@torch.no_grad()
+def sample_dt_chi_temp(B: int, device, *, step: int, total_opt_steps: int, half_range: int,
+                       temp_start: float = 1.0, temp_end: float = 0.05,
+                       schedule: str = "cosine", anneal_fraction: float = 1.0,
+                       clip_max: float = 5.0, dtype=torch.float32) -> torch.Tensor:
+    base_a = math.sqrt(math.pi / 8.0)
+    temp = dt_temperature(step, total_opt_steps, temp_start, temp_end, schedule, anneal_fraction)
+    a = float(base_a * temp)
+
+    x = torch.randn((B, 3), device=device, dtype=dtype).mul_(a)
+    dt_raw = x.norm(dim=1, keepdim=True)  # [B,1]
+    if clip_max is not None and clip_max > 0:
+        dt_raw = dt_raw.clamp(max=float(clip_max))
+
+    dt_scale = 2.0 / max(1, (half_range - 1))
+    return dt_raw.mul(dt_scale)
+
+
+# =========================
+# analytics helpers (short calls)
+# =========================
+@torch.no_grad()
+def batch_acc_from_logits(logits: torch.Tensor, B: int, K: int, device) -> tuple[float, torch.Tensor]:
+    preds = torch.argmax(logits, dim=1).view(B, K)
+    true_2d = torch.arange(K, device=device).unsqueeze(0).expand(B, K)
+    acc = float((preds == true_2d).float().mean().item())
+    return acc, preds
+
+
+@torch.no_grad()
+def entropy_from_logits(logits: torch.Tensor) -> float:
+    probs = torch.softmax(logits, dim=1)
+    ent = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1).mean()
+    return float(ent.item())
+
+
+@torch.no_grad()
+def collect_wave_stats(support_sets, potential_preds: torch.Tensor) -> dict:
+    wave_dict = support_sets.get_losses()
+    wave_dict["potential_std"] = float(potential_preds.std().item())
+    if "xf_now" in wave_dict and torch.is_tensor(wave_dict["xf_now"]):
+        wave_dict["xf_now"] = float(wave_dict["xf_now"].norm(dim=-1).mean().item())
+    # normalize to python floats
+    out = {}
+    for k, v in wave_dict.items():
+        if torch.is_tensor(v):
+            out[k] = float(v.item()) if v.numel() == 1 else v
+        else:
+            out[k] = float(v) if isinstance(v, (int, float)) else v
+    return out
+
+
+# =========================
+# TB logging blocks (short names)
+# =========================
+def tb_scalars(writer, step: int, win_means: dict, stat_tracker):
+    for k, v in win_means.items():
+        writer.add_scalar(f"train/{k}", float(v), step)
+    writer.add_scalar("train/support_sets_lr", float(stat_tracker.last_support_lr), step)
+    writer.add_scalar("train/reconstructor_lr", float(stat_tracker.last_recon_lr), step)
+
+
+def tb_grad_norms(writer, step: int, support_sets, reconstructor):
+    gn_support = module_grad_norm(support_sets.PSI) + module_grad_norm(support_sets.F)
+    gn_recon = module_grad_norm(reconstructor)
+    writer.add_scalar("train/grad_norm/support_sets", gn_support, step)
+    writer.add_scalar("train/grad_norm/reconstructor", gn_recon, step)
+
+
+def tb_hists(writer, step: int, *, logits_det: torch.Tensor,
+             potential_preds_det: torch.Tensor | None,
+             K: int, log_potential: bool = True):
+    writer.add_histogram("train/logits", logits_det, step)
+    if log_potential and potential_preds_det is not None:
+        for k in range(K):
+            writer.add_histogram(
+                f"potential_distribution/{k}",
+                potential_preds_det[:, k].reshape(-1).detach(),
+                step
+            )
+
+
+def tb_figs(writer, step: int, stat_tracker, K: int, log_freq: int):
+    # snapshot history only when we're logging figures
+    stat_tracker.snapshot_per_k_history(step)
+
+    if len(stat_tracker.ema_history) >= 2:
+        hist_mat = np.stack(stat_tracker.ema_history, axis=1)[:, -30:]
+        fig = ImageViz.plot_heatmap(
+            hist_mat, K=K,
+            title="Per-MLP EMA Accuracy over Time",
+            xlabel="optimizer step snapshot",
+            ylabel="MLP index k",
+        )
+        writer.add_figure("per_mlp/accuracy_heatmap", fig, global_step=step)
+        plt.close(fig)
+
+        fig_c = ImageViz.plot_confusion(stat_tracker.confusion, K=K)
+        writer.add_figure("classifier/confusion_matrix", fig_c, global_step=step)
+        plt.close(fig_c)
+
+
+@torch.no_grad()
+def tb_images(img_logger, step: int, *, generator, z_first: torch.Tensor,
+              img1_bk: torch.Tensor, img2_bk: torch.Tensor, n_vis: int):
+    first_img = generator(z_first)  # [1,C,H,W]
+    img_logger.log_triplet(
+        tag_prefix="images",
+        x0=img1_bk, x1=img2_bk, x2=first_img,
+        step=step,
+        n_vis=n_vis,
+    )
+
+
+def json_append_by_step(path: str, step: int, rec: dict):
+    """Load a JSON dict (if exists), set rec at key=step (int), and write back."""
+    os.makedirs(osp.dirname(path), exist_ok=True)
+    if osp.isfile(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    data[str(int(step))] = rec
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def torch_append_by_step(path: str, step: int, payload: dict):
+    """
+    Load a torch-saved dict (if exists), set payload at key=step (int), and save back.
+    NOTE: payload should already be moved to CPU + detached.
+    """
+    os.makedirs(osp.dirname(path), exist_ok=True)
+    if osp.isfile(path):
+        try:
+            data = torch.load(path, map_location="cpu")
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    data[int(step)] = payload
+    torch.save(data, path)

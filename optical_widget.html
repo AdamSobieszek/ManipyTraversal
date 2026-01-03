@@ -1,0 +1,1123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Optico-Mechanical Rays — Interactive Widget</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(','\\)'], ['$', '$']], displayMath: [['\\[','\\]']] },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
+  <style>
+    :root { --size: 760px; }
+    body{
+      margin:0; min-height:100vh; display:flex; justify-content:center; background:#fff;
+      font-family: Georgia, "Times New Roman", Times, serif;
+    }
+    .layout{
+      width:min(1650px, 98vw);
+      display:grid;
+      grid-template-columns: minmax(340px, 480px) minmax(560px, 1fr);
+      gap: 18px;
+      align-items:start;
+      padding: 20px 16px 32px;
+      box-sizing:border-box;
+    }
+    .col-left, .col-center, .col-right{
+      display:flex;
+      flex-direction:column;
+      gap: 10px;
+    }
+    .col-center{ align-items:center; }
+    @media (max-width: 1100px){
+      .layout{
+        grid-template-columns: 1fr;
+      }
+    }
+    .wrap{
+      position:relative; width:min(var(--size)*1.70, 98vw); max-width: 1280px; aspect-ratio: 2 / 1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      margin: 12px auto 6px;
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .canvasRow{
+      position:absolute; inset:0;
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 8px 10px 12px;
+      box-sizing:border-box;
+      align-items:stretch;
+    }
+    .canvasRow canvas{
+      width:100%;
+      height:100%;
+      aspect-ratio: 1 / 1;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
+    }
+
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto 1fr; justify-items:center;
+      padding-top:4%;
+    }
+    .title{
+      text-align:center; font-size:clamp(18px,2.7vw,32px);
+      line-height:1.12; margin:0 10%;
+      transform: translateY(-6px);
+    }
+
+    .panel{
+      position:sticky;
+      top: 12px;
+      width: 100%;
+      pointer-events:auto;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.95);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 16px;
+      padding: 12px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .panel h3{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+    }
+    .row{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin: 8px 0;
+    }
+    .row label{
+      font-size: 12px;
+      color: rgba(0,0,0,0.72);
+      white-space:nowrap;
+    }
+    .row input[type="range"]{ width: 170px; }
+    .row .val{
+      width: 64px;
+      text-align:right;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: rgba(0,0,0,0.78);
+    }
+    .btns{
+      display:flex; gap:8px; flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    button{
+      appearance:none; border:1px solid rgba(0,0,0,0.18);
+      border-radius: 999px;
+      padding: 8px 10px;
+      background: #fff;
+      font-size: 12px;
+      cursor:pointer;
+    }
+    button:hover{ background: rgba(0,0,0,0.04); }
+
+    .subtitleCard{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      color: rgba(0,0,0,0.78);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .subtitleCard h4{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+      color: rgba(0,0,0,0.85);
+    }
+    .mathBlock{
+      margin: 6px 0;
+    }
+
+    .info{
+      position:static;
+      pointer-events:none;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      line-height: 1.25;
+      color: rgba(0,0,0,0.84);
+      background: rgba(255,255,255,0.94);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      min-width: 240px;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      width: 100%;
+      box-sizing:border-box;
+    }
+    .infoRow{
+      display:flex;
+      justify-content:flex-start;
+      margin-top: 12px;
+      width: 100%;
+    }
+    .belowCols{
+      width:100%;
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .info .row2{
+      display:flex;
+      justify-content:space-between;
+      gap: 12px;
+      white-space:nowrap;
+    }
+    .info .k{ color: rgba(0,0,0,0.62); }
+    .info .v{ font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="col-left">
+      <div class="panel" id="panel">
+        <h3>Controls</h3>
+
+        <div class="row">
+          <label>Render quality</label>
+          <input id="res" type="range" min="1" max="3" step="0.1" value="1.6" />
+          <div class="val" id="resVal">1.6</div>
+        </div>
+
+        <div class="row">
+          <label>Number of rays</label>
+          <input id="rays" type="range" min="5" max="40" step="1" value="17" />
+          <div class="val" id="raysVal">17</div>
+        </div>
+
+        <div class="row">
+          <label>κ (Busemann strength)</label>
+          <input id="kappa" type="range" min="0.00" max="5.00" step="0.05" value="1.10" />
+          <div class="val" id="kappaVal">1.10</div>
+        </div>
+
+        <div class="row">
+          <label>A (rotation amplitude)</label>
+          <input id="rot" type="range" min="0.00" max="5.00" step="0.05" value="1.40" />
+          <div class="val" id="rotVal">1.40</div>
+        </div>
+
+        <div class="row">
+          <label>Time horizon</label>
+          <input id="tmax" type="range" min="0.8" max="6.0" step="0.05" value="2.60" />
+          <div class="val" id="tmaxVal">2.60</div>
+        </div>
+
+        <div class="row">
+          <label>Wavefront count</label>
+          <input id="waves" type="range" min="4" max="60" step="1" value="30" />
+          <div class="val" id="wavesVal">30</div>
+        </div>
+
+        <div class="btns">
+          <button id="rand">Randomize palette</button>
+          <button id="reset">Reset</button>
+        </div>
+      </div>
+      <div class="subtitleCard">
+        <h4>Model equations</h4>
+        <div class="mathBlock">
+          \[
+            \rho_t(z)=\varphi_t(z)\,\psi_t(z),
+            \quad
+            U_t(z)=-\frac{\varepsilon(t)}{2}\log\frac{\varphi_t(z)}{\psi_t(z)},
+            \quad
+            v=K_t-\nabla_{\mathrm{hyp}}U_t
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            \nabla_g f=g^{-1}\nabla_E f,
+            \qquad
+            g^{-1}(z)=\frac{(1-|z|^2)^2}{4}I
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            \varphi_0(z)\propto \exp(\kappa\,b_\xi(z)),
+            \qquad
+            b_\xi(z)=\log\frac{1-|z|^2}{|z-\xi|^2}
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            \psi_t(z)\approx \exp\!\Big(-\frac{d_g(z,z_0)^2}{4\,\Sigma_{\mathrm{rem}}(t)}\Big),
+            \quad z_0=\Phi(x_0),
+            \quad
+            \Sigma_{\mathrm{rem}}(t)=\int_t^{\infty}\varepsilon(u)\,du
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            b^+=K_t+2\varepsilon(t)\nabla_g\log\varphi_t,
+            \qquad
+            b^-=K_t-2\varepsilon(t)\nabla_g\log\psi_t
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            K_{A,Z}(z)=Az-\langle Z,z\rangle z+\tfrac12(1+|z|^2)Z,\quad A^\top=-A
+          \]
+        </div>
+      </div>
+    </div>
+
+    <div class="col-center">
+      <div class="wrap" id="wrap">
+        <div class="canvasRow">
+          <canvas id="cEucl" aria-label="Ambient lift view"></canvas>
+          <canvas id="cPoinc" aria-label="Poincaré disk view"></canvas>
+        </div>
+
+        <div class="overlay">
+          <div class="title">
+            Optico-Mechanical Rays<br/>
+            <span style="font-style:italic;">ML wavefronts + Killing flow + Busemann target</span>
+          </div>
+          <div></div>
+        </div>
+      </div>
+      <div class="infoRow">
+        <div class="info" id="info"></div>
+      </div>
+
+      <div class="belowCols">
+        <div class="subtitleCard">
+          <h4>What you are seeing — ambient lift</h4>
+          <div>
+            Rays are characteristics of the hyperbolic flow \(\dot z = K_t(z) - \nabla_{\mathrm{hyp}}U_t(z)\),
+            with \(U_t=-(\varepsilon(t)/2)\log(\varphi_t/\psi_t)\).
+            The Busemann factor \(\varphi_0\) anchors \(t=0\), while
+            \(\psi_t\approx \exp(-d_g(z,z_0)^2/(4\Sigma_{\mathrm{rem}}(t)))\) sharpens as
+            \(\Sigma_{\mathrm{rem}}(t)=\int_t^{\infty}\varepsilon(u)\,du\) shrinks.
+            Through the log-ratio this yields a time-weighted repulsion of size \(\varepsilon/\Sigma_{\mathrm{rem}}\).
+            The result is then lifted
+            to the ambient plane by
+            \(\;x=\frac{2\,\operatorname{artanh}(|z|)}{|z|}z\).
+            Dashed curves are ML wavefronts: rays are reparameterized by hyperbolic arclength,
+            matched at common \(\tau\), and averaged across perturbations.
+          </div>
+        </div>
+        <div class="subtitleCard">
+          <h4>What you are seeing — Poincaré disk</h4>
+          <div>
+            The same dynamics drawn in the disk itself. Early times are dominated by the Busemann boundary
+            factor \(\varphi_0\), mid-time by the solenoidal Killing field \(K_t\), and late times by the
+            bridge-to-\(z_0\) factor \(\psi_t\) as \(\Sigma_{\mathrm{rem}}\) contracts.
+            Dotted circles are horocycles (Busemann level sets), and the dashed radius shows the direction to \(\xi\).
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const TAU = Math.PI * 2;
+    const EPS = 1e-6;
+    const START_R = 0.18;
+    const EPSILON0 = 0.75;
+    const ALPHA = 2.1;
+    const BOOST_SCALE = 0.65;
+    const XI = [1, 0];
+    const Z0_RADIUS = 0.62; // terminal bridge point in disk (Phi(x0))
+    const EXIT_R = 0.965; // disk radius used to estimate exit direction
+    const WAVE_STEP_MULT = 2.2;
+    const WAVE_RAY_MULT = 2.4;
+    const WAVE_PERTURB = 7;
+    const WAVE_PERTURB_ANGLE = 0.035;
+    const WAVE_PERTURB_RADIUS = 0.012;
+    const WAVE_MIN_STEPS = 900;
+    const WAVE_MAX_STEPS = 3600;
+    const WAVE_MIN_RAYS = 48;
+    const WAVE_MAX_RAYS = 90;
+    const Z0 = [Z0_RADIUS * XI[0], Z0_RADIUS * XI[1]];
+
+    // --- helpers ---
+    function clamp(x, a, b){ return Math.min(b, Math.max(a, x)); }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function hsvToRgb(h,s,v){
+      h = ((h%1)+1)%1;
+      const i = Math.floor(h*6);
+      const f = h*6 - i;
+      const p = v*(1-s);
+      const q = v*(1-f*s);
+      const t = v*(1-(1-f)*s);
+      let r,g,b;
+      switch(i%6){
+        case 0: r=v; g=t; b=p; break;
+        case 1: r=q; g=v; b=p; break;
+        case 2: r=p; g=v; b=t; break;
+        case 3: r=p; g=q; b=v; break;
+        case 4: r=t; g=p; b=v; break;
+        case 5: r=v; g=p; b=q; break;
+      }
+      return {r:Math.round(r*255), g:Math.round(g*255), b:Math.round(b*255)};
+    }
+    function format(num, digits=2){ return num.toFixed(digits); }
+
+    // --- elements ---
+    const wrap = document.getElementById("wrap");
+    const canvasE = document.getElementById("cEucl");
+    const canvasP = document.getElementById("cPoinc");
+    const ctxE = canvasE.getContext("2d", { alpha: true });
+    const ctxP = canvasP.getContext("2d", { alpha: true });
+    const info = document.getElementById("info");
+
+    const controls = {
+      res: document.getElementById("res"),
+      rays: document.getElementById("rays"),
+      kappa: document.getElementById("kappa"),
+      rot: document.getElementById("rot"),
+      tmax: document.getElementById("tmax"),
+      waves: document.getElementById("waves"),
+      rand: document.getElementById("rand"),
+      reset: document.getElementById("reset"),
+    };
+    const vals = {
+      resVal: document.getElementById("resVal"),
+      raysVal: document.getElementById("raysVal"),
+      kappaVal: document.getElementById("kappaVal"),
+      rotVal: document.getElementById("rotVal"),
+      tmaxVal: document.getElementById("tmaxVal"),
+      wavesVal: document.getElementById("wavesVal"),
+    };
+
+    let paletteSeed = Math.random();
+
+    function state(){
+      return {
+        quality: Number(controls.res.value),
+        nRays: Math.round(Number(controls.rays.value)),
+        kappa: Number(controls.kappa.value),
+        rot: Number(controls.rot.value),
+        tMax: Number(controls.tmax.value),
+        nWave: Math.round(Number(controls.waves.value)),
+        xi: XI,
+        z0: Z0,
+      };
+    }
+
+    function reset(){
+      controls.res.value = 1.6;
+      controls.rays.value = 17;
+      controls.kappa.value = 1.1;
+      controls.rot.value = 1.4;
+      controls.tmax.value = 2.6;
+      controls.waves.value = 30;
+      paletteSeed = Math.random();
+      syncLabels();
+      render();
+    }
+
+    function syncLabels(){
+      vals.resVal.textContent = format(Number(controls.res.value),1);
+      vals.raysVal.textContent = String(Math.round(Number(controls.rays.value)));
+      vals.kappaVal.textContent = format(Number(controls.kappa.value),2);
+      vals.rotVal.textContent = format(Number(controls.rot.value),2);
+      vals.tmaxVal.textContent = format(Number(controls.tmax.value),2);
+      vals.wavesVal.textContent = String(Math.round(Number(controls.waves.value)));
+    }
+
+    Object.values(controls).forEach(el => {
+      if (el.type === "range") el.addEventListener("input", () => { syncLabels(); render(); });
+    });
+    controls.rand.onclick = () => { paletteSeed = Math.random(); render(); };
+    controls.reset.onclick = reset;
+
+    function geomCanvas(el){
+      const rect = el.getBoundingClientRect();
+      const pad = 10;
+      const R = Math.max(12, Math.min(rect.width, rect.height)/2 - pad);
+      return {w: rect.width, h: rect.height, R, cx: rect.width/2, cy: rect.height/2};
+    }
+
+    function resize(){
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      [canvasE, canvasP].forEach((el, idx) => {
+        const rect = el.getBoundingClientRect();
+        el.width  = Math.round(rect.width  * dpr);
+        el.height = Math.round(rect.height * dpr);
+        const ctx = idx === 0 ? ctxE : ctxP;
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+      });
+      render();
+    }
+    window.addEventListener("resize", resize);
+
+    // --- dynamics: hyperbolic flow + action (SB proxy) ---
+    function clampToDisk(zx, zy){
+      const r2 = zx*zx + zy*zy;
+      const maxR = 1 - 1e-4;
+      if (r2 > maxR*maxR){
+        const f = maxR / Math.sqrt(r2);
+        return [zx*f, zy*f];
+      }
+      return [zx, zy];
+    }
+
+    function diskToAmbient(zx, zy){
+      const r = Math.hypot(zx, zy);
+      if (r < 1e-9) return {x:0,y:0};
+      const rho = 2 * Math.atanh(Math.min(0.999999, r));
+      const f = rho / r;
+      return {x: zx*f, y: zy*f};
+    }
+
+    function eta(t, tMax){
+      const scale = Math.max(0.5 * tMax, EPS);
+      const centered = (t - 0.5 * tMax) / scale;
+      return 0.5 * (1 + Math.tanh(ALPHA * centered));
+    }
+
+    function bump(t, tMax){
+      const e = eta(t, tMax);
+      return 4 * e * (1 - e);
+    }
+
+    function epsilonSchedule(t, tMax){
+      const s = t / Math.max(tMax, EPS);
+      return EPSILON0 * (0.45 + 0.55 * (1 - s));
+    }
+
+    function sampleAt(t, t0, dt, arr){
+      const idx = clamp((t - t0) / dt, 0, arr.length - 1);
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, arr.length - 1);
+      return lerp(arr[i0], arr[i1], idx - i0);
+    }
+
+    function buildTimeContext(tMax, steps){
+      const dt = tMax / steps;
+      const t0 = 0;
+      const epsArr = new Float32Array(steps+1);
+      const sigArr = new Float32Array(steps+1);
+      for (let i=0;i<=steps;i++){
+        const t = t0 + i*dt;
+        epsArr[i] = epsilonSchedule(t, tMax);
+      }
+      sigArr[steps] = EPS * tMax;
+      for (let i=steps-1;i>=0;i--){
+        sigArr[i] = sigArr[i+1] + epsArr[i] * dt;
+      }
+      return {t0, dt, epsArr, sigArr};
+    }
+
+    function mulberry32(seed){
+      let t = seed >>> 0;
+      return function(){
+        t += 0x6D2B79F5;
+        let r = t;
+        r = Math.imul(r ^ (r >>> 15), r | 1);
+        r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+        return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function randn(rng){
+      let u = 0;
+      let v = 0;
+      while (u === 0) u = rng();
+      while (v === 0) v = rng();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
+    }
+
+    function findSegment(arr, value){
+      if (value <= arr[0]) return 0;
+      const last = arr.length - 1;
+      if (value >= arr[last]) return last - 1;
+      let lo = 0;
+      let hi = last;
+      while (hi - lo > 1){
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] < value) lo = mid;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    function sampleByTau(ray, tauLevel){
+      const arr = ray.tau;
+      const i0 = findSegment(arr, tauLevel);
+      if (i0 < 0) return null;
+      const t0 = arr[i0];
+      const t1 = arr[i0+1];
+      const w = Math.abs(t1 - t0) > EPS ? (tauLevel - t0) / (t1 - t0) : 0;
+      return {
+        x: lerp(ray.zx[i0], ray.zx[i0+1], w),
+        y: lerp(ray.zy[i0], ray.zy[i0+1], w),
+      };
+    }
+
+    function hyperbolicDistance(zx, zy, z0x, z0y){
+      const dx = zx - z0x;
+      const dy = zy - z0y;
+      const D = dx*dx + dy*dy;
+      if (D < EPS){
+        return {d: 0, gradD2: [0,0]};
+      }
+      const r2 = zx*zx + zy*zy;
+      const r02 = z0x*z0x + z0y*z0y;
+      const A = Math.max(1 - r2, EPS);
+      const B = Math.max(1 - r02, EPS);
+      const C = 1 + (2 * D) / (A * B);
+      const cSafe = Math.max(1 + EPS, C);
+      const d = Math.acosh(cSafe);
+      const sqrtTerm = Math.sqrt(Math.max(cSafe*cSafe - 1, EPS));
+      const scale = (4 / (B * A * A)) / Math.max(sqrtTerm, EPS);
+      const gx = scale * (A * dx + D * zx);
+      const gy = scale * (A * dy + D * zy);
+      return {d, gradD2: [2 * d * gx, 2 * d * gy]};
+    }
+
+    function busemann(zx, zy, r2, xi){
+      const dx = zx - xi[0];
+      const dy = zy - xi[1];
+      const dist2 = Math.max(dx*dx + dy*dy, EPS);
+      const num = Math.max(1 - r2, EPS);
+      return Math.log(num / dist2);
+    }
+
+    function gradBusemann(zx, zy, r2, xi){
+      const dx = zx - xi[0];
+      const dy = zy - xi[1];
+      const dist2 = Math.max(dx*dx + dy*dy, EPS);
+      const denom = Math.max(1 - r2, EPS);
+      return [
+        -2 * zx / denom - 2 * dx / dist2,
+        -2 * zy / denom - 2 * dy / dist2,
+      ];
+    }
+
+    function gradHypU(t, z, params, ctx){
+      const zx = z[0], zy = z[1];
+      const r2 = Math.min(zx*zx + zy*zy, 0.999999);
+      const eps = sampleAt(t, ctx.t0, ctx.dt, ctx.epsArr);
+      const sigma = Math.max(sampleAt(t, ctx.t0, ctx.dt, ctx.sigArr), EPS);
+      const logPhi = params.kappa * busemann(zx, zy, r2, params.xi);
+      const gradLogPhi = gradBusemann(zx, zy, r2, params.xi);
+      gradLogPhi[0] *= params.kappa;
+      gradLogPhi[1] *= params.kappa;
+
+      const dist = hyperbolicDistance(zx, zy, params.z0[0], params.z0[1]);
+      const logPsi = -(dist.d * dist.d) / (4 * sigma);
+      const gradLogPsi = [-dist.gradD2[0] / (4 * sigma), -dist.gradD2[1] / (4 * sigma)];
+
+      const logRatio = logPhi - logPsi;
+      const U = -0.5 * eps * logRatio;
+      const gradUx = -0.5 * eps * (gradLogPhi[0] - gradLogPsi[0]);
+      const gradUy = -0.5 * eps * (gradLogPhi[1] - gradLogPsi[1]);
+      const hyp = ((1 - r2) * (1 - r2)) / 4;
+      return {gradHyp: [gradUx * hyp, gradUy * hyp], U};
+    }
+
+    function killingField(t, z, params){
+      const zx = z[0], zy = z[1];
+      const r2 = zx*zx + zy*zy;
+      const m = bump(t, params.tMax);
+      const a = params.rot;
+      const boost = params.rot * BOOST_SCALE;
+      const Zx = boost * params.xi[0];
+      const Zy = boost * params.xi[1];
+      const dot = Zx*zx + Zy*zy;
+      const Ax = -a * zy;
+      const Ay = a * zx;
+      const kx = Ax - dot*zx + 0.5 * (1 + r2) * Zx;
+      const ky = Ay - dot*zy + 0.5 * (1 + r2) * Zy;
+      return [m * kx, m * ky];
+    }
+
+    function flow(t, z, params, ctx){
+      const K = killingField(t, z, params);
+      const {gradHyp, U} = gradHypU(t, z, params, ctx);
+      return {v: [K[0] - gradHyp[0], K[1] - gradHyp[1]], K, gradHyp, U};
+    }
+
+    function lagrangian(z, v, K, U){
+      const r2 = Math.min(z[0]*z[0] + z[1]*z[1], 0.999999);
+      const denom = Math.max((1 - r2) * (1 - r2), EPS);
+      const gFactor = 4 / denom;
+      const wx = v[0] - K[0];
+      const wy = v[1] - K[1];
+      return 0.5 * gFactor * (wx*wx + wy*wy) - U;
+    }
+
+    function stepRK4(z, t, dt, params, ctx){
+      const k1 = flow(t, z, params, ctx).v;
+      const z2 = [ z[0]+0.5*dt*k1[0], z[1]+0.5*dt*k1[1] ];
+      const k2 = flow(t + 0.5*dt, z2, params, ctx).v;
+      const z3 = [ z[0]+0.5*dt*k2[0], z[1]+0.5*dt*k2[1] ];
+      const k3 = flow(t + 0.5*dt, z3, params, ctx).v;
+      const z4 = [ z[0]+dt*k3[0], z[1]+dt*k3[1] ];
+      const k4 = flow(t + dt, z4, params, ctx).v;
+      const zx = z[0] + (dt/6)*(k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
+      const zy = z[1] + (dt/6)*(k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
+      return clampToDisk(zx, zy);
+    }
+
+    function integrateWaveRay(r0, phi0, steps, ctx, params){
+      let z = [r0 * Math.cos(phi0), r0 * Math.sin(phi0)];
+      const zx = new Float32Array(steps+1);
+      const zy = new Float32Array(steps+1);
+      const tau = new Float32Array(steps+1);
+      zx[0] = z[0];
+      zy[0] = z[1];
+      tau[0] = 0;
+      let s = 0;
+      let exitAngle = Math.atan2(z[1], z[0]);
+      let exitSet = false;
+      const exitR2 = EXIT_R * EXIT_R;
+      for (let i=1;i<=steps;i++){
+        const t = ctx.t0 + (i-1) * ctx.dt;
+        const parts = flow(t, z, params, ctx);
+        const r2 = Math.min(z[0]*z[0] + z[1]*z[1], 0.999999);
+        const denom = Math.max((1 - r2) * (1 - r2), EPS);
+        const gFactor = 4 / denom;
+        const speed = Math.sqrt(gFactor * (parts.v[0]*parts.v[0] + parts.v[1]*parts.v[1]));
+        s += speed * ctx.dt;
+        tau[i] = s;
+        z = stepRK4(z, t, ctx.dt, params, ctx);
+        zx[i] = z[0];
+        zy[i] = z[1];
+        if (!exitSet && (zx[i]*zx[i] + zy[i]*zy[i]) >= exitR2){
+          exitSet = true;
+          exitAngle = Math.atan2(zy[i], zx[i]);
+        }
+      }
+      if (s > EPS){
+        for (let i=0;i<=steps;i++){
+          tau[i] /= s;
+        }
+      }
+      if (!exitSet){
+        exitAngle = Math.atan2(zy[steps], zx[steps]);
+      }
+      return {zx, zy, tau, exitAngle};
+    }
+
+    function integrate(params){
+      const {nRays, tMax, quality} = params;
+      const steps = Math.max(300, Math.round(650 * quality * (tMax/2.6)));
+      const baseCtx = buildTimeContext(tMax, steps);
+      const dt = baseCtx.dt;
+      const t0 = baseCtx.t0;
+      const phis = [];
+      for (let i=0;i<nRays;i++){
+        phis.push(lerp(-Math.PI, Math.PI, i/(Math.max(nRays-1,1))));
+      }
+
+      const raysRaw = [];
+      let maxR = 1;
+      let minS = Infinity;
+      let maxS = -Infinity;
+      const startAmbientRadius = 2 * Math.atanh(START_R);
+
+      for (const phi0 of phis){
+        let z = [START_R * Math.cos(phi0), START_R * Math.sin(phi0)];
+        const zx = new Float32Array(steps+1);
+        const zy = new Float32Array(steps+1);
+        const S = new Float32Array(steps+1);
+
+        S[0] = 0;
+        minS = Math.min(minS, S[0]);
+        maxS = Math.max(maxS, S[0]);
+
+        zx[0] = z[0];
+        zy[0] = z[1];
+        const a0 = diskToAmbient(z[0], z[1]);
+        maxR = Math.max(maxR, Math.hypot(a0.x, a0.y));
+
+        for (let i=1;i<=steps;i++){
+          const t = t0 + (i-1)*dt;
+          const parts = flow(t, z, params, baseCtx);
+          const L = lagrangian(z, parts.v, parts.K, parts.U);
+          S[i] = S[i-1] + L * dt;
+          minS = Math.min(minS, S[i]);
+          maxS = Math.max(maxS, S[i]);
+          z = stepRK4(z, t, dt, params, baseCtx);
+          zx[i] = z[0];
+          zy[i] = z[1];
+          const a = diskToAmbient(z[0], z[1]);
+          maxR = Math.max(maxR, Math.hypot(a.x, a.y));
+        }
+
+        raysRaw.push({zx, zy, S});
+      }
+
+      const waveCount = Math.max(2, params.nWave);
+      const waveSteps = clamp(Math.round(steps * WAVE_STEP_MULT), WAVE_MIN_STEPS, WAVE_MAX_STEPS);
+      const waveRays = clamp(Math.round(nRays * WAVE_RAY_MULT), WAVE_MIN_RAYS, WAVE_MAX_RAYS);
+      const waveCtx = buildTimeContext(tMax, waveSteps);
+      const wavePhis = [];
+      for (let i=0;i<waveRays;i++){
+        wavePhis.push(lerp(-Math.PI, Math.PI, i/(Math.max(waveRays-1,1))));
+      }
+
+      // ML wavefronts from perturbed rays matched by reparameterized time (hyperbolic arclength).
+      const wavefrontsRaw = Array.from({length: waveCount}, () => ({xs: [], ys: []}));
+      const exitAngles = [];
+      const seed =
+        (Math.floor(params.kappa * 1000) ^ Math.floor(params.rot * 1000) ^
+         Math.floor(params.tMax * 1000) ^ (waveRays << 3) ^ (waveSteps << 1)) >>> 0;
+      const rng = mulberry32(seed);
+      for (const basePhi of wavePhis){
+        const perts = [];
+        for (let p=0;p<WAVE_PERTURB;p++){
+          const dPhi = randn(rng) * WAVE_PERTURB_ANGLE;
+          const dR = randn(rng) * WAVE_PERTURB_RADIUS;
+          const r0 = clamp(START_R + dR, 0.02, 0.98);
+          const phi0 = basePhi + dPhi;
+          const ray = integrateWaveRay(r0, phi0, waveSteps, waveCtx, params);
+          perts.push(ray);
+          exitAngles.push(ray.exitAngle);
+        }
+        for (let w=0; w<waveCount; w++){
+          const tauLevel = (w + 1) / (waveCount + 1);
+          let sumx = 0;
+          let sumy = 0;
+          let count = 0;
+          for (const ray of perts){
+            const sample = sampleByTau(ray, tauLevel);
+            if (sample){
+              sumx += sample.x;
+              sumy += sample.y;
+              count += 1;
+            }
+          }
+          if (count > 0){
+            wavefrontsRaw[w].xs.push(sumx / count);
+            wavefrontsRaw[w].ys.push(sumy / count);
+          }
+        }
+      }
+
+      // Rotate the whole view to undo the observed net rotation (exit alignment).
+      let alignAngle = 0;
+      if (exitAngles.length){
+        let sx = 0;
+        let sy = 0;
+        for (const a of exitAngles){
+          sx += Math.cos(a);
+          sy += Math.sin(a);
+        }
+        if (Math.hypot(sx, sy) > EPS){
+          const meanAngle = Math.atan2(sy, sx);
+          const target = Math.atan2(params.xi[1], params.xi[0]);
+          alignAngle = target - meanAngle;
+        }
+      }
+      const ca = Math.cos(alignAngle);
+      const sa = Math.sin(alignAngle);
+      const rays = [];
+      for (const ray of raysRaw){
+        const zx = new Float32Array(steps+1);
+        const zy = new Float32Array(steps+1);
+        const ax = new Float32Array(steps+1);
+        const ay = new Float32Array(steps+1);
+        for (let i=0;i<=steps;i++){
+          const rx = ca * ray.zx[i] - sa * ray.zy[i];
+          const ry = sa * ray.zx[i] + ca * ray.zy[i];
+          zx[i] = rx;
+          zy[i] = ry;
+          const a = diskToAmbient(rx, ry);
+          ax[i] = a.x;
+          ay[i] = a.y;
+        }
+        rays.push({zx, zy, ax, ay, S: ray.S});
+      }
+
+      const wavefronts = [];
+      for (const wf of wavefrontsRaw){
+        if (wf.xs.length > 1){
+          const xs = [];
+          const ys = [];
+          for (let i=0;i<wf.xs.length;i++){
+            const rx = ca * wf.xs[i] - sa * wf.ys[i];
+            const ry = sa * wf.xs[i] + ca * wf.ys[i];
+            xs.push(rx);
+            ys.push(ry);
+          }
+          wavefronts.push({xs, ys});
+        }
+      }
+
+      return {rays, wavefronts, maxR, steps, dt, t0, startAmbientRadius};
+    }
+
+    function palette(k, total){
+      const h = ((k/Math.max(total,1)) + paletteSeed) % 1;
+      const s = 0.60 + 0.18*Math.sin(2*Math.PI*h);
+      const v = 0.86;
+      return hsvToRgb(h, s, v);
+    }
+
+    function renderBackground(ctx, w, h){
+      const grad = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.max(w,h)/1.1);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(1, "rgba(236,241,252,0.95)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0,0,w,h);
+    }
+
+    function tickStep(maxR){
+      if (maxR > 12) return 2;
+      if (maxR > 7) return 1;
+      if (maxR > 3.5) return 0.5;
+      return 0.25;
+    }
+
+    function renderEuclideanView(ctx, geom, data, params){
+      const {w,h,cx,cy} = geom;
+      renderBackground(ctx, w, h);
+
+      const pad = 0.12 * data.maxR;
+      const scale = 0.45 * Math.min(w,h) / (data.maxR + pad);
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(1,-1);
+
+      // wavefronts
+      ctx.lineWidth = 1.9 * params.quality;
+      ctx.setLineDash([5,4]);
+      ctx.shadowColor = "rgba(70,85,150,0.30)";
+      ctx.shadowBlur = 8;
+      data.wavefronts.forEach((wf, idx) => {
+        const fade = Math.pow(idx / data.wavefronts.length, 0.7);
+        ctx.strokeStyle = `rgba(40,60,120,${0.30 + 0.45*fade})`;
+        ctx.beginPath();
+        const p0 = diskToAmbient(wf.xs[0], wf.ys[0]);
+        ctx.moveTo(p0.x*scale, p0.y*scale);
+        for (let i=1;i<wf.xs.length;i++){
+          const p = diskToAmbient(wf.xs[i], wf.ys[i]);
+          ctx.lineTo(p.x*scale, p.y*scale);
+        }
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+      ctx.shadowColor = "transparent";
+
+      // rays
+      ctx.lineWidth = 1.6 * params.quality;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      data.rays.forEach((ray, i) => {
+        const col = palette(i, data.rays.length);
+        ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.92)`;
+        ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},0.30)`;
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.moveTo(ray.ax[0]*scale, ray.ay[0]*scale);
+        for (let j=1;j<ray.ax.length;j++){
+          ctx.lineTo(ray.ax[j]*scale, ray.ay[j]*scale);
+        }
+        ctx.stroke();
+      });
+      ctx.shadowColor = "transparent";
+
+      // starting ring in ambient lift
+      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath();
+      ctx.arc(0,0, data.startAmbientRadius*scale, 0, TAU);
+      ctx.stroke();
+
+      // axes
+      ctx.strokeStyle = "rgba(0,0,0,0.08)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-w,0); ctx.lineTo(w,0);
+      ctx.moveTo(0,-h); ctx.lineTo(0,h);
+      ctx.stroke();
+
+      // axis ticks for scale
+      const step = tickStep(data.maxR);
+      const tick = 5;
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let t=step; t<=data.maxR; t+=step){
+        const p = t * scale;
+        ctx.moveTo(p, -tick);
+        ctx.lineTo(p, tick);
+        ctx.moveTo(-p, -tick);
+        ctx.lineTo(-p, tick);
+        ctx.moveTo(-tick, p);
+        ctx.lineTo(tick, p);
+        ctx.moveTo(-tick, -p);
+        ctx.lineTo(tick, -p);
+      }
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function drawHorocycles(ctx, R, xi){
+      const levels = [1.5, 3, 6, 12];
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4,6]);
+      ctx.strokeStyle = "rgba(45,60,115,0.16)";
+      for (const k of levels){
+        const r = 1 / (1 + k);
+        const cx = xi[0] * (1 - r) * R;
+        const cy = xi[1] * (1 - r) * R;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * R, 0, TAU);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      ctx.fillStyle = "rgba(25,30,45,0.95)";
+      ctx.beginPath();
+      ctx.arc(xi[0] * (R - 0.5), xi[1] * (R - 0.5), 3.2, 0, TAU);
+      ctx.fill();
+    }
+
+    function drawBusemannDirection(ctx, R, xi){
+      ctx.save();
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6,6]);
+      ctx.strokeStyle = "rgba(0,0,0,0.85)";
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.lineTo(xi[0] * (R - 0.8), xi[1] * (R - 0.8));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    function renderPoincareView(ctx, geom, data, params){
+      const {w,h,R,cx,cy} = geom;
+      renderBackground(ctx, w, h);
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(1,-1);
+
+      // clip to disk
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(0,0,R-0.5,0,TAU);
+      ctx.clip();
+
+      // fill disk softly
+      const g = ctx.createRadialGradient(0,0,0,0,0,R);
+      g.addColorStop(0,"rgba(255,255,255,0.96)");
+      g.addColorStop(1,"rgba(240,244,252,0.95)");
+      ctx.fillStyle = g;
+      ctx.fillRect(-R,-R,2*R,2*R);
+
+      // horocycles and ideal point
+      drawHorocycles(ctx, R, params.xi);
+      drawBusemannDirection(ctx, R, params.xi);
+
+      // starting ring
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.12)";
+      ctx.beginPath();
+      ctx.arc(0,0, START_R * R, 0, TAU);
+      ctx.stroke();
+
+      // wavefronts
+      ctx.lineWidth = 1.9 * params.quality;
+      ctx.setLineDash([5,4]);
+      ctx.shadowColor = "rgba(70,85,150,0.30)";
+      ctx.shadowBlur = 8;
+      data.wavefronts.forEach((wf, idx) => {
+        const fade = Math.pow(idx / data.wavefronts.length, 0.7);
+        ctx.strokeStyle = `rgba(40,60,120,${0.30 + 0.45*fade})`;
+        ctx.beginPath();
+        ctx.moveTo(wf.xs[0]*R, wf.ys[0]*R);
+        for (let i=1;i<wf.xs.length;i++){
+          ctx.lineTo(wf.xs[i]*R, wf.ys[i]*R);
+        }
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+      ctx.shadowColor = "transparent";
+
+      // rays
+      ctx.lineWidth = 1.6 * params.quality;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      data.rays.forEach((ray, i) => {
+        const col = palette(i, data.rays.length);
+        ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.92)`;
+        ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},0.30)`;
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.moveTo(ray.zx[0]*R, ray.zy[0]*R);
+        for (let j=1;j<ray.zx.length;j++){
+          ctx.lineTo(ray.zx[j]*R, ray.zy[j]*R);
+        }
+        ctx.stroke();
+      });
+      ctx.shadowColor = "transparent";
+
+      ctx.restore(); // end clip
+
+      // boundary
+      ctx.lineWidth = 2.0;
+      ctx.strokeStyle = "rgba(0,0,0,0.80)";
+      ctx.beginPath();
+      ctx.arc(0,0,R-0.5,0,TAU);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    let lastStats = {maxR:0, steps:0};
+    function render(){
+      const params = state();
+      const data = integrate(params);
+      lastStats.maxR = data.maxR;
+      lastStats.steps = data.steps;
+
+      const gE = geomCanvas(canvasE);
+      const gP = geomCanvas(canvasP);
+
+      renderEuclideanView(ctxE, gE, data, params);
+      renderPoincareView(ctxP, gP, data, params);
+      updateInfo(params, data.maxR, data.steps);
+    }
+
+    function updateInfo(params, maxR, steps){
+      info.innerHTML =
+        `<div class="row2"><span class="k">κ</span><span class="v">${format(params.kappa,2)}</span></div>` +
+        `<div class="row2"><span class="k">A</span><span class="v">${format(params.rot,2)}</span></div>` +
+        `<div class="row2"><span class="k">Rays</span><span class="v">${params.nRays}</span></div>` +
+        `<div class="row2"><span class="k">Wavefronts</span><span class="v">${params.nWave}</span></div>` +
+        `<div class="row2"><span class="k">t span</span><span class="v">[0, ${format(params.tMax,2)}]</span></div>` +
+        `<div class="row2"><span class="k">Max |x|</span><span class="v">${format(maxR,2)}</span></div>` +
+        `<div class="row2"><span class="k">Steps</span><span class="v">${steps}</span></div>`;
+    }
+
+    // init
+    syncLabels();
+    resize();
+  </script>
+</body>
+</html>

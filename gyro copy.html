@@ -635,6 +635,18 @@
     const Wh = widthHFromAlpha(alpha);
     const rhoH = hypRadiusFromEucl(rho);
 
+    // Reference point + orthogonal gyroline (red): compute footpoint first so it can be used
+    // as the envelope center / phase reference.
+    let refM = null;
+    let refm = 0.5;
+    let ptsRef = null;
+    if (viz.ref){
+      refm = referenceFootpointOnDiameter(refP, dirU, nU);
+      refM = scale(dirU, refm);
+      const gRef = geodesicFromTwoPoints(refP, refM);
+      ptsRef = sampleGeodesic(gRef, 520);
+    }
+
     // update right-panel stats
     setText(statDirection, `${deg.toFixed(1)}°`);
     setText(statRho, rho.toFixed(3));
@@ -753,15 +765,7 @@
     }
 
     // Reference point + orthogonal gyroline (dotted red), like gyro.html styling
-    // This draws the unique geodesic through refP that meets the diameter geodesic through 0→ζ orthogonally.
-    let refM = null;
-    let refm = 0.5;
-    if (viz.ref){
-      refm = referenceFootpointOnDiameter(refP, dirU, nU);
-      refM = scale(dirU, refm);
-
-      const gRef = geodesicFromTwoPoints(refP, refM);
-      const ptsRef = sampleGeodesic(gRef, 520);
+    if (viz.ref && ptsRef){
       ctx.save();
       ctx.lineWidth = 3.2;
       ctx.lineCap = "round";

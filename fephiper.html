@@ -1,0 +1,1394 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Noisy Hyperbolic Natural-Gradient Descent (Poisson Kernel + Tunable Saddle)</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <style>
+    :root{
+      --canvas-max: 107.5em;
+      --content-max: 120em;
+      --gap: 28px;
+      --bg: #f6f6f6;
+      --card: rgba(255,255,255,0.92);
+      --border: rgba(20,20,20,0.14);
+      --ink: #0b0b0b;
+      --muted: rgba(0,0,0,0.70);
+    }
+    body{
+      margin:0;
+      min-height:100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", Times, serif;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding: clamp(14px, 2.4vw, 32px);
+    }
+    .app{
+      width: min(var(--content-max), 96vw);
+      display:grid;
+      grid-template-columns: 3fr 1fr;
+      gap: var(--gap);
+      align-items:start;
+    }
+    @media (max-width: 980px){
+      .app{ grid-template-columns: 1fr; }
+    }
+    .left{ display:flex; justify-content:center; }
+    .wrap{
+      position:relative;
+      width: min(var(--canvas-max), 100%);
+      aspect-ratio:1/1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      overflow:hidden;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.10);
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto auto 1fr; justify-items:center;
+      padding-top:6%;
+    }
+    .title{
+      text-align:center;
+      font-size:clamp(18px, 3.0vw, 34px);
+      line-height:1.15;
+      margin:0 10%;
+    }
+    .subtitle{
+      margin-top:10px;
+      font-size:clamp(13px, 1.9vw, 19px);
+      font-family: "KaTeX_Main","Latin Modern Roman","CMU Serif",Georgia,"Times New Roman",Times,serif;
+      opacity:0.90;
+      text-align:center;
+      margin-left: 10%;
+      margin-right: 10%;
+    }
+    .side{ position:relative; }
+    .stack{ display:flex; flex-direction:column; gap: 16px; }
+    .card{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px 18px 16px;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .cardTitle{
+      font-size: 18px;
+      letter-spacing: 0.2px;
+      margin: 0 0 12px;
+    }
+    .statGrid{
+      display:grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px 14px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      line-height: 1.35;
+      color: var(--muted);
+    }
+    .statKey{ color: rgba(0,0,0,0.72); }
+    .statVal{
+      color: rgba(0,0,0,0.86);
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+      text-align:right;
+    }
+    .divider{
+      height: 1px;
+      background: rgba(0,0,0,0.10);
+      margin: 14px 0 12px;
+    }
+    .noteTitle{
+      margin: 0 0 8px;
+      font-size: 14px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color: rgba(0,0,0,0.80);
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+    }
+    .noteText{
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: rgba(0,0,0,0.80);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    }
+    .noteText:last-child{ margin-bottom: 0; }
+
+    .controlGrid{ display:grid; gap: 12px; margin-top: 10px; }
+    .toggleRow{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 14px;
+      padding: 10px 12px;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.55);
+    }
+    .toggleLabel{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      color: rgba(0,0,0,0.78);
+      line-height: 1.25;
+    }
+    .toggleHint{
+      display:block;
+      margin-top: 4px;
+      font-size: 12px;
+      color: rgba(0,0,0,0.55);
+    }
+    .switch{
+      position:relative;
+      width: 44px;
+      height: 26px;
+      flex: 0 0 auto;
+    }
+    .switch input{
+      appearance:none;
+      -webkit-appearance:none;
+      width: 44px;
+      height: 26px;
+      margin: 0;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.16);
+      border: 1px solid rgba(0,0,0,0.14);
+      cursor:pointer;
+      transition: background 160ms ease, border-color 160ms ease;
+      outline: none;
+    }
+    .switch input::after{
+      content:"";
+      position:absolute;
+      top: 3px;
+      left: 3px;
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.95);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+      transform: translateX(0);
+      transition: transform 160ms ease;
+    }
+    .switch input:checked{
+      background: rgba(0,0,0,0.78);
+      border-color: rgba(0,0,0,0.25);
+    }
+    .switch input:checked::after{ transform: translateX(18px); }
+
+    .sliderRow{
+      padding: 10px 12px;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.55);
+    }
+    .sliderTop{
+      display:flex;
+      align-items:baseline;
+      justify-content:space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .sliderLabel{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      color: rgba(0,0,0,0.78);
+    }
+    .sliderVal{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 13px;
+      color: rgba(0,0,0,0.62);
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+    }
+    input[type="range"]{
+      width: 100%;
+      accent-color: rgba(0,0,0,0.85);
+    }
+    .btnRow{ display:flex; gap: 10px; margin-top: 10px; }
+    button{
+      border: 1px solid rgba(0,0,0,0.16);
+      background: rgba(255,255,255,0.70);
+      padding: 10px 12px;
+      border-radius: 14px;
+      cursor:pointer;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 13px;
+      color: rgba(0,0,0,0.80);
+      flex: 1 1 auto;
+    }
+    button:active{ transform: translateY(1px); }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="left">
+      <div class="wrap" id="wrap">
+        <canvas id="c"></canvas>
+
+        <div class="overlay">
+          <div class="title">
+            Noisy hyperbolic natural-gradient descent with a tunable saddle
+          </div>
+          <div class="subtitle" id="subtitle">
+            Drag \( \zeta \) on the boundary. Drag \( r \) on the mean ray to change “signal” (precision \( \alpha \)).
+            The black ✕ is a saddle fixed point: stable along the ray, unstable transverse. Tune SNR to make trajectories linger/escape.
+          </div>
+          <div></div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="stack">
+        <div class="card">
+          <div class="cardTitle">Statistics</div>
+          <div class="statGrid" aria-live="polite">
+            <div class="statKey">Direction (deg)</div>
+            <div class="statVal" id="statDirection">—</div>
+
+            <div class="statKey">Control radius \( r \)</div>
+            <div class="statVal" id="statRho">—</div>
+
+            <div class="statKey">Precision \( \alpha \)</div>
+            <div class="statVal" id="statAlpha">—</div>
+
+            <div class="statKey">Warp exponent \( p \)</div>
+            <div class="statVal" id="statWarp">—</div>
+
+            <div class="statKey">Saddle radius \( r_s \)</div>
+            <div class="statVal" id="statRs">—</div>
+
+            <div class="statKey">SNR (signal/noise)</div>
+            <div class="statVal" id="statSNR">—</div>
+
+            <div class="statKey">Estimated noise \( \sigma \)</div>
+            <div class="statVal" id="statSigma">—</div>
+
+            <div class="statKey">Mean dwell near saddle (steps)</div>
+            <div class="statVal" id="statDwell">—</div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="noteTitle">What you are seeing</div>
+          <p class="noteText">
+            The drift is a <i>time-warped</i> hyperbolic natural-gradient ascent of the Poisson kernel toward the boundary point \( \zeta \),
+            plus a local saddle correction that cancels the longitudinal drift at \( w_s \) (so \( w_s \) is a true saddle fixed point).
+          </p>
+          <p class="noteText">
+            Noise is injected in the (Euclidean) tangent approximation and scaled by your SNR knob. Lower SNR → easier transverse escape; higher SNR → trajectories stick to the stable manifold and pass through.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="cardTitle">Controls</div>
+          <div class="controlGrid">
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Run simulation
+                <span class="toggleHint">Pause/resume the noisy descent</span>
+              </div>
+              <label class="switch" aria-label="Toggle run">
+                <input id="toggleRun" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Add noise
+                <span class="toggleHint">If off, you see deterministic flow + saddle</span>
+              </div>
+              <label class="switch" aria-label="Toggle noise">
+                <input id="toggleNoise" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Flowing batches (timed)
+                <span class="toggleHint">Batch spawn + fade; off keeps original look</span>
+              </div>
+              <label class="switch" aria-label="Toggle flowing batches">
+                <input id="toggleFlow" type="checkbox">
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Mean ray
+                <span class="toggleHint">Dashed diameter from \(0\) toward \( \zeta \)</span>
+              </div>
+              <label class="switch" aria-label="Toggle mean ray">
+                <input id="toggleMean" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Saddle cross
+                <span class="toggleHint">Shows stable (ray) and unstable (transverse) directions</span>
+              </div>
+              <label class="switch" aria-label="Toggle saddle">
+                <input id="toggleSaddle" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Symmetric saddle
+                <span class="toggleHint">Mirror a second saddle across the center</span>
+              </div>
+              <label class="switch" aria-label="Toggle symmetric saddle">
+                <input id="toggleSymSaddle" type="checkbox">
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Saddle grid
+                <span class="toggleHint">Fading coordinate mesh shows depth cues</span>
+              </div>
+              <label class="switch" aria-label="Toggle saddle grid">
+                <input id="toggleSaddleGrid" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Grid sign colors
+                <span class="toggleHint">Warm/cool cues for positive vs negative height</span>
+              </div>
+              <label class="switch" aria-label="Toggle grid sign colors">
+                <input id="toggleGridColor" type="checkbox">
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Deterministic reference path
+                <span class="toggleHint">One noiseless trajectory from \(0\)</span>
+              </div>
+              <label class="switch" aria-label="Toggle deterministic">
+                <input id="toggleDet" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">SNR</div>
+                <div class="sliderVal" id="valSNR">—</div>
+              </div>
+              <input id="sliderSNR" type="range" min="0.5" max="50" step="0.1" value="8">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Control radius \(r\)</div>
+                <div class="sliderVal" id="valRho">—</div>
+              </div>
+              <input id="sliderRho" type="range" min="0" max="0.98" step="0.005" value="0.50">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Saddle radius \(r_s\)</div>
+                <div class="sliderVal" id="valRs">—</div>
+              </div>
+              <input id="sliderRs" type="range" min="0" max="0.92" step="0.01" value="0.58">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Saddle stiffness \(k_\parallel\)</div>
+                <div class="sliderVal" id="valKpar">—</div>
+              </div>
+              <input id="sliderKpar" type="range" min="0" max="40" step="0.1" value="12">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Unstable ratio \(k_\perp/k_\parallel\)</div>
+                <div class="sliderVal" id="valKratio">—</div>
+              </div>
+              <input id="sliderKratio" type="range" min="0" max="6" step="0.05" value="2.0">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Time-warp exponent \(p\)</div>
+                <div class="sliderVal" id="valWarp">—</div>
+              </div>
+              <input id="sliderWarp" type="range" min="0" max="2.5" step="0.05" value="1.0">
+            </div>
+
+            <div class="btnRow">
+              <button id="btnReset">Reset particles</button>
+              <button id="btnClear">Clear trails</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+<script>
+(() => {
+  const TAU = Math.PI * 2;
+  const EPS = 1e-10;
+
+  // ---------- basic vector helpers ----------
+  const add = (a,b)=>({x:a.x+b.x,y:a.y+b.y});
+  const sub = (a,b)=>({x:a.x-b.x,y:a.y-b.y});
+  const scale = (v,s)=>({x:v.x*s,y:v.y*s});
+  const dot = (a,b)=>a.x*b.x+a.y*b.y;
+  const norm2 = (v)=>v.x*v.x+v.y*v.y;
+  const norm = (v)=>Math.hypot(v.x,v.y);
+  const unit = (v)=>{ const r=norm(v); return r<EPS?{x:1,y:0}:scale(v,1/r); };
+  const perp = (v)=>({x:-v.y,y:v.x});
+  const clamp01 = (x)=>Math.max(0,Math.min(1,x));
+  function mobiusAdd(a,b){
+    const a2 = norm2(a);
+    const b2 = norm2(b);
+    const ab = dot(a,b);
+    const denom = 1 + 2*ab + a2*b2;
+    const term1 = scale(a, 1 + 2*ab + b2);
+    const term2 = scale(b, 1 - a2);
+    return scale(add(term1, term2), 1/Math.max(1e-9, denom));
+  }
+  function expMap(p, v){
+    const vNorm = norm(v);
+    if (vNorm < 1e-9) return p;
+    const lambda = 2 / Math.max(1e-9, 1 - norm2(p));
+    const t = Math.tanh((lambda * vNorm) / 2);
+    const vScaled = scale(v, t / vNorm);
+    return mobiusAdd(p, vScaled);
+  }
+
+  function clampToDisk(v, maxR=0.999){
+    const r=norm(v);
+    return r<=maxR ? v : scale(v, maxR/r);
+  }
+
+  // ---------- RNG ----------
+  function randn(){
+    const u1 = Math.max(1e-12, Math.random());
+    const u2 = Math.random();
+    return Math.sqrt(-2*Math.log(u1))*Math.cos(TAU*u2);
+  }
+  function randn2(){ return {x: randn(), y: randn()}; }
+
+  // ---------- canvas + geometry ----------
+  const wrap = document.getElementById("wrap");
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  function geom(){
+    const w = wrap.getBoundingClientRect().width;
+    const h = wrap.getBoundingClientRect().height;
+    const pad = 20;
+    const R = Math.min(w,h)/2 - pad;
+    return {w,h,R,cx:w/2,cy:h/2};
+  }
+  function diskToPx(v){
+    const {R,cx,cy}=geom();
+    return {x: cx + v.x*R, y: cy - v.y*R};
+  }
+  function pxToDisk(p){
+    const {R,cx,cy}=geom();
+    return {x: (p.x-cx)/R, y: (cy-p.y)/R};
+  }
+  function pointerPos(ev){
+    const r = wrap.getBoundingClientRect();
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top;
+    return {x,y};
+  }
+
+  function resize(){
+    const rect = wrap.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width  = Math.round(rect.width  * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------- UI elements ----------
+  const statDirection = document.getElementById("statDirection");
+  const statRho = document.getElementById("statRho");
+  const statAlpha = document.getElementById("statAlpha");
+  const statWarp = document.getElementById("statWarp");
+  const statRs = document.getElementById("statRs");
+  const statSNR = document.getElementById("statSNR");
+  const statSigma = document.getElementById("statSigma");
+  const statDwell = document.getElementById("statDwell");
+
+  const toggleRun = document.getElementById("toggleRun");
+  const toggleNoise = document.getElementById("toggleNoise");
+  const toggleFlow = document.getElementById("toggleFlow");
+  const toggleMean = document.getElementById("toggleMean");
+  const toggleSaddle = document.getElementById("toggleSaddle");
+  const toggleSymSaddle = document.getElementById("toggleSymSaddle");
+  const toggleSaddleGrid = document.getElementById("toggleSaddleGrid");
+  const toggleGridColor = document.getElementById("toggleGridColor");
+  const toggleDet = document.getElementById("toggleDet");
+
+  const sliderSNR = document.getElementById("sliderSNR");
+  const sliderRho = document.getElementById("sliderRho");
+  const sliderRs = document.getElementById("sliderRs");
+  const sliderKpar = document.getElementById("sliderKpar");
+  const sliderKratio = document.getElementById("sliderKratio");
+  const sliderWarp = document.getElementById("sliderWarp");
+
+  const valSNR = document.getElementById("valSNR");
+  const valRho = document.getElementById("valRho");
+  const valRs = document.getElementById("valRs");
+  const valKpar = document.getElementById("valKpar");
+  const valKratio = document.getElementById("valKratio");
+  const valWarp = document.getElementById("valWarp");
+
+  const btnReset = document.getElementById("btnReset");
+  const btnClear = document.getElementById("btnClear");
+
+  function setText(el, text){ if (el) el.textContent = text; }
+
+  // ---------- model state ----------
+  // boundary point ζ stored as angle
+  let theta = 0.25; // radians
+  function zeta(){ return {x: Math.cos(theta), y: Math.sin(theta)}; }
+
+  // interior control point on ray toward ζ
+  let rho = 0.50; // in [0,1)
+  function precisionPoint(){ return scale(unit(zeta()), rho); }
+
+  // precision mapping (kept from your widget; just used as a "signal" knob)
+  function atanhSafe(x){ return Math.atanh(Math.max(0, Math.min(0.999999, x))); }
+  function alphaFromR(r){
+    const rMax = 0.98;
+    const s = atanhSafe(r) / atanhSafe(rMax);
+    const alphaMin = 0.7;
+    const alphaMax = 30.0;
+    return alphaMin + (alphaMax - alphaMin) * (s*s);
+  }
+
+  // ---------- Hyperbolic natural-gradient (Poisson kernel, d=2) ----------
+  // For d=2, exponent (d-1)=1. We use:
+  // ∇_w log P(w,ζ) = 2[(ζ-w)/||w-ζ||^2 - w/(1-||w||^2)]
+  // grad_hyp = ((1-||w||^2)^2 / 4) * ∇ (conformal metric in Poincaré disk)
+  function gradHypLogPoisson(w, z){
+    const w2 = norm2(w);
+    const oneMinus = Math.max(1e-9, 1 - w2);
+
+    const diff = sub(z, w);
+    const d2 = Math.max(1e-9, norm2(sub(w, z)));
+
+    const term1 = scale(diff, 1/d2);
+    const term2 = scale(w, 1/oneMinus);
+    const gradLog = scale(sub(term1, term2), 2.0);
+
+    const factor = (oneMinus*oneMinus) / 4.0;
+    return scale(gradLog, factor);
+  }
+
+  // "time warp" to make boundary approach visually finite-time-ish
+  function warpFactor(r, p){
+    // (1-r)^{-p} with a soft floor
+    const u = Math.max(1e-3, 1 - r);
+    return Math.pow(u, -p);
+  }
+
+  // ---------- Saddle construction ----------
+  // We build a saddle potential in local coordinates around w_s:
+  // V = 0.5 k_par x^2 - 0.5 k_per y^2 - b x
+  // Drift contribution (gradient descent) is: -grad_hyp V
+  // We choose b so that longitudinal drift cancels the Poisson drift at w_s (making w_s a saddle fixed point).
+  function saddleDrift(w, dirU, nU, wS, kPar, kPer, cancelB){
+    const oneMinus = Math.max(1e-9, 1 - norm2(w));
+    const factor = (oneMinus*oneMinus) / 4.0;
+
+    const d = sub(w, wS);
+    const x = dot(d, dirU);
+    const y = dot(d, nU);
+
+    // Euclidean gradient of V in the (dirU, nU) basis:
+    // ∇V = (kPar*x - b)*dirU + (-kPer*y)*nU
+    const b = cancelB;
+    const gradV = add(scale(dirU, (kPar*x - b)), scale(nU, (-kPer*y)));
+
+    // Hyperbolic gradient descent drift: -factor * ∇V
+    return scale(gradV, -factor);
+  }
+
+  function saddlePotential(x, y, kPar, kPer){
+    return 0.5 * (kPar * x * x - kPer * y * y);
+  }
+
+  function buildSaddle(wS, dirU, nU, z, gain, kPar, kPer, warpP){
+    const gS = gradHypLogPoisson(wS, z);
+    const oneMinusS = Math.max(1e-9, 1 - norm2(wS));
+    const factorS = (oneMinusS*oneMinusS) / 4.0;
+    const driftSignalAtS = scale(gS, gain * warpFactor(norm(wS), warpP));
+    const signalPar = dot(driftSignalAtS, dirU);
+    let cancelB = -signalPar / Math.max(1e-9, factorS);
+    cancelB = Math.max(-80, Math.min(80, cancelB));
+    return {pos: wS, dir: dirU, n: nU, kPar, kPer, cancelB};
+  }
+
+  function buildSaddles(dirU, nU, z, gain){
+    const kPar = ctrl.kPar;
+    const kPer = ctrl.kPar * ctrl.kRatio;
+    const saddles = [];
+    const wS = scale(dirU, ctrl.rS);
+    saddles.push(buildSaddle(wS, dirU, nU, z, gain, kPar, kPer, ctrl.warpP));
+
+    if (sim.symmetricSaddle && ctrl.rS > 1e-4){
+      const dirU2 = scale(dirU, -1);
+      const nU2 = scale(nU, -1);
+      const wS2 = scale(dirU2, ctrl.rS);
+      saddles.push(buildSaddle(wS2, dirU2, nU2, z, gain, kPar, kPer, ctrl.warpP));
+    }
+    return saddles;
+  }
+
+  function saddleDriftSum(w, saddles){
+    let total = {x:0,y:0};
+    for (const s of saddles){
+      total = add(total, saddleDrift(w, s.dir, s.n, s.pos, s.kPar, s.kPer, s.cancelB));
+    }
+    return total;
+  }
+
+  function isNearSaddle(w, saddles, tol=0.05){
+    for (const s of saddles){
+      const d = sub(w, s.pos);
+      const x = dot(d, s.dir);
+      const y = dot(d, s.n);
+      if (Math.abs(x) < tol && Math.abs(y) < tol) return true;
+    }
+    return false;
+  }
+
+  // ---------- particles / simulation ----------
+  const sim = {
+    running: true,
+    noise: true,
+    flowing: false,
+    showMean: true,
+    showSaddle: true,
+    symmetricSaddle: false,
+    showSaddleGrid: true,
+    showGridColor: false,
+    showDet: true,
+  };
+
+  function syncViz(){
+    sim.running = !!toggleRun?.checked;
+    sim.noise = !!toggleNoise?.checked;
+    sim.flowing = !!toggleFlow?.checked;
+    sim.showMean = !!toggleMean?.checked;
+    sim.showSaddle = !!toggleSaddle?.checked;
+    sim.symmetricSaddle = !!toggleSymSaddle?.checked;
+    sim.showSaddleGrid = !!toggleSaddleGrid?.checked;
+    sim.showGridColor = !!toggleGridColor?.checked;
+    sim.showDet = !!toggleDet?.checked;
+  }
+  [toggleRun, toggleNoise, toggleFlow, toggleMean, toggleSaddle, toggleSymSaddle, toggleSaddleGrid, toggleGridColor, toggleDet].forEach(el=>{
+    if (!el) return;
+    el.addEventListener("change", ()=>{
+      syncViz();
+      if (el === toggleFlow) resetParticles();
+    });
+  });
+  syncViz();
+
+  const ctrl = {
+    snr: parseFloat(sliderSNR.value),
+    rS: parseFloat(sliderRs.value),
+    kPar: parseFloat(sliderKpar.value),
+    kRatio: parseFloat(sliderKratio.value),
+    warpP: parseFloat(sliderWarp.value),
+  };
+
+  function syncRhoDisplay(){
+    setText(valRho, rho.toFixed(3));
+    if (sliderRho){
+      sliderRho.value = rho.toFixed(3);
+    }
+  }
+
+  function syncSliders(){
+    ctrl.snr = parseFloat(sliderSNR.value);
+    ctrl.rS = parseFloat(sliderRs.value);
+    ctrl.kPar = parseFloat(sliderKpar.value);
+    ctrl.kRatio = parseFloat(sliderKratio.value);
+    ctrl.warpP = parseFloat(sliderWarp.value);
+
+    setText(valSNR, ctrl.snr.toFixed(1));
+    setText(valRs, ctrl.rS.toFixed(2));
+    setText(valKpar, ctrl.kPar.toFixed(1));
+    setText(valKratio, ctrl.kRatio.toFixed(2));
+    setText(valWarp, ctrl.warpP.toFixed(2));
+    syncRhoDisplay();
+  }
+  [sliderSNR, sliderRs, sliderKpar, sliderKratio, sliderWarp].forEach(el=>{
+    el.addEventListener("input", ()=>syncSliders());
+  });
+  if (sliderRho){
+    sliderRho.addEventListener("input", ()=>{
+      rho = parseFloat(sliderRho.value);
+      syncRhoDisplay();
+    });
+  }
+  syncSliders();
+
+  // Classic mode defaults
+  const K = 28;           // number of particles
+  const TRAIL = 160;      // trail length
+  const DT = 0.010;       // simulation timestep (in "discrete time")
+  const MAXR = 0.999;     // disk clamp
+  const HITR = 0.995;     // respawn threshold
+
+  // Flowing batch mode defaults (when toggleFlow is on)
+  const FLOW_TOTAL_PARTICLES = 28;   // target population for steady state
+  const FLOW_INITIAL_BATCHES = 6;    // number of initial batches
+  const FLOW_BATCH_INTERVAL = 5.0;   // seconds between batch spawns
+  const FLOW_LIFE = 30.0;            // active life (seconds) before fade
+  const FLOW_FADE = 5.0;             // fade-out duration (seconds)
+  const FLOW_BATCH_SIZE = 4;         // particles per spawned batch after initial fill
+
+  let particles = [];
+  let batches = [];
+  let detTrail = [];
+  let simTime = 0;
+  let nextSpawnTime = FLOW_BATCH_INTERVAL;
+
+  function spawnParticle(){
+    // start near origin with tiny transverse jitter
+    const z = unit(zeta());
+    const n = unit(perp(z));
+    const jitter = scale(n, 0.02 * randn());
+    const p0 = clampToDisk(add({x:0,y:0}, jitter), 0.25);
+    return {pos: p0, trail: [p0], dwell: 0};
+  }
+
+  // Flowing mode helpers
+  function flowInitialBatchSize(i){
+    const base = Math.floor(FLOW_TOTAL_PARTICLES / FLOW_INITIAL_BATCHES);
+    const rem = FLOW_TOTAL_PARTICLES % FLOW_INITIAL_BATCHES;
+    return i < rem ? base + 1 : base;
+  }
+
+  function spawnBatch(startTime, lifeSec, fadeSec, count){
+    const batch = {startTime, life: lifeSec, fade: fadeSec, particles: []};
+    for (let i=0;i<count;i++) batch.particles.push(spawnParticle());
+    batches.push(batch);
+  }
+
+  function resetClassic(){
+    particles = [];
+    for (let i=0;i<K;i++) particles.push(spawnParticle());
+    detTrail = [{x:0,y:0}];
+  }
+
+  function resetFlowing(){
+    batches = [];
+    detTrail = [{x:0,y:0}];
+    simTime = 0;
+    nextSpawnTime = FLOW_BATCH_INTERVAL;
+    for (let i=0;i<FLOW_INITIAL_BATCHES;i++){
+      const life = Math.max(1, FLOW_LIFE - 5*i); // shorter for early batches
+      const count = flowInitialBatchSize(i);
+      spawnBatch(0, life, FLOW_FADE, count);
+    }
+  }
+
+  function resetParticles(){
+    if (sim.flowing){
+      resetFlowing();
+    } else {
+      resetClassic();
+    }
+  }
+
+  function clearTrails(){
+    if (sim.flowing){
+      batches.forEach(b => b.particles.forEach(p => p.trail = [p.pos]));
+    } else {
+      particles.forEach(p => p.trail = [p.pos]);
+    }
+    detTrail = [detTrail.length ? detTrail[detTrail.length-1] : {x:0,y:0}];
+  }
+
+  btnReset.addEventListener("click", ()=>resetParticles());
+  btnClear.addEventListener("click", ()=>clearTrails());
+  resetParticles();
+
+  // ---------- drawing ----------
+  function drawDiskBoundary(){
+    const {w,h,R,cx,cy} = geom();
+    ctx.save();
+    ctx.clearRect(0,0,w,h);
+    ctx.lineWidth = 2.2;
+    ctx.strokeStyle = "#000";
+    ctx.beginPath();
+    ctx.arc(cx,cy,R,0,TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawPoint(v, rPx, fillStyle){
+    const p = diskToPx(v);
+    ctx.save();
+    ctx.fillStyle = fillStyle;
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,rPx,0,TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawCross(v, sizePx, color){
+    const p = diskToPx(v);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.6;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(p.x - sizePx, p.y - sizePx);
+    ctx.lineTo(p.x + sizePx, p.y + sizePx);
+    ctx.moveTo(p.x - sizePx, p.y + sizePx);
+    ctx.lineTo(p.x + sizePx, p.y - sizePx);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawPolyline(pts, alpha=0.28, width=1.6){
+    if (!pts || pts.length<2) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.strokeStyle = "#000";
+    const p0 = diskToPx(pts[0]);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    for (let i=1;i<pts.length;i++){
+      const p = diskToPx(pts[i]);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSaddleCross(saddle){
+    const crossLen = 0.22;
+    const step = 0.04;
+    const steps = Math.max(2, Math.ceil((2 * crossLen) / step));
+
+    function linePoints(axis){
+      const pts = [];
+      for (let i=0;i<=steps;i++){
+        const t = -crossLen + (2 * crossLen) * (i / steps);
+        pts.push(expMap(saddle.pos, scale(axis, t)));
+      }
+      return pts;
+    }
+
+    function strokeLine(pts){
+      if (pts.length < 2) return;
+      const p0 = diskToPx(pts[0]);
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      for (let i=1;i<pts.length;i++){
+        const p = diskToPx(pts[i]);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+
+    // stable direction: solid geodesic
+    ctx.save();
+    ctx.lineWidth = 3.0;
+    ctx.strokeStyle = "#000";
+    strokeLine(linePoints(saddle.dir));
+    ctx.restore();
+
+    // unstable direction: dotted geodesic
+    ctx.save();
+    ctx.lineWidth = 3.0;
+    ctx.setLineDash([3,7]);
+    ctx.strokeStyle = "#000";
+    strokeLine(linePoints(saddle.n));
+    ctx.restore();
+
+    // saddle marker
+    drawCross(saddle.pos, 9, "#000");
+  }
+
+  function drawSaddleGrid(saddles, useColor){
+    if (!saddles || !saddles.length) return;
+    const gridSpacing = 0.22;
+    const gridExtent = 0.90;
+    const step = gridSpacing / 3;
+    const maxK = Math.max(ctrl.kPar, ctrl.kPar * ctrl.kRatio);
+    const heightScale = Math.max(1e-6, 0.5 * maxK * gridExtent * gridExtent);
+    const densityScale = saddles.length > 1 ? 0.76 : 1.0;
+
+    function styleFor(height, distLocal, globalR){
+      const hNorm = Math.max(-1, Math.min(1, height / heightScale));
+      const pos = Math.max(0, hNorm);
+      const neg = Math.max(0, -hNorm);
+      const localFade = clamp01(1 - Math.pow(distLocal / (gridExtent * 1.05), 2));
+      const edgeFade = clamp01(1 - Math.pow(globalR / 0.99, 9));
+      const fade = localFade * (0.3 + 0.7 * edgeFade);
+      let alpha = (0.08 + 0.42 * pos) * (1 - 0.85 * neg) * fade * densityScale;
+      if (alpha < 0.02) return null;
+      alpha = Math.min(0.55, alpha);
+      let width = (0.7 + 2.5 * pos) * (1 - 0.6 * neg);
+      width = Math.max(0.32, width);
+      const color = useColor ? (hNorm >= 0 ? "rgb(186, 80, 26)" : "rgb(28, 98, 168)") : "#000";
+      return {alpha, width, color};
+    }
+
+    ctx.save();
+    ctx.lineCap = "round";
+
+    for (const saddle of saddles){
+      const dirU = saddle.dir;
+      const nU = saddle.n;
+      const origin = saddle.pos;
+
+      function toDisk(x, y){
+        const v = add(scale(dirU, x), scale(nU, y));
+        return expMap(origin, v);
+      }
+
+      function drawLine(x0, y0, x1, y1){
+        const dist = Math.hypot(x1 - x0, y1 - y0);
+        const segments = Math.max(2, Math.ceil(dist / step));
+        for (let i=0;i<segments;i++){
+          const t0 = i / segments;
+          const t1 = (i + 1) / segments;
+          const xA = x0 + (x1 - x0) * t0;
+          const yA = y0 + (y1 - y0) * t0;
+          const xB = x0 + (x1 - x0) * t1;
+          const yB = y0 + (y1 - y0) * t1;
+          const midX = (xA + xB) / 2;
+          const midY = (yA + yB) / 2;
+          const height = saddlePotential(midX, midY, saddle.kPar, saddle.kPer);
+          const midGlobal = toDisk(midX, midY);
+          const style = styleFor(height, Math.hypot(midX, midY), norm(midGlobal));
+          if (!style) continue;
+          const p0 = diskToPx(toDisk(xA, yA));
+          const p1 = diskToPx(toDisk(xB, yB));
+          ctx.globalAlpha = style.alpha;
+          ctx.lineWidth = style.width;
+          ctx.strokeStyle = style.color;
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.stroke();
+        }
+      }
+
+      for (let x=-gridExtent; x<=gridExtent+1e-6; x+=gridSpacing){
+        drawLine(x, -gridExtent, x, gridExtent);
+      }
+      for (let y=-gridExtent; y<=gridExtent+1e-6; y+=gridSpacing){
+        drawLine(-gridExtent, y, gridExtent, y);
+      }
+    }
+    ctx.restore();
+  }
+
+  // ---------- interaction: dragging boundary ζ, interior ρ, or saddle w_s ----------
+  let dragging = null; // "zeta" | "rho" | "saddle" | null
+
+  function hitTest(ptPx){
+    const dirU = unit(zeta());
+    const z = scale(dirU, 0.999);
+    const p = precisionPoint();
+    const wS = scale(dirU, ctrl.rS);
+    const zPx = diskToPx(z);
+    const pPx = diskToPx(p);
+    const sPx = diskToPx(wS);
+
+    const dz = Math.hypot(ptPx.x - zPx.x, ptPx.y - zPx.y);
+    const dp = Math.hypot(ptPx.x - pPx.x, ptPx.y - pPx.y);
+    const ds = Math.hypot(ptPx.x - sPx.x, ptPx.y - sPx.y);
+    const hitR = 18;
+    const hitS = 16;
+    let best = null;
+    let bestD = Infinity;
+    if (dz < hitR && dz < bestD){ best = "zeta"; bestD = dz; }
+    if (dp < hitR && dp < bestD){ best = "rho"; bestD = dp; }
+    if (ds < hitS && ds < bestD){ best = "saddle"; bestD = ds; }
+    return best;
+  }
+
+  function setZetaFromPointer(ptPx){
+    const v = pxToDisk(ptPx);
+    theta = Math.atan2(v.y, v.x);
+  }
+  function setRhoFromPointer(ptPx){
+    const v = pxToDisk(ptPx);
+    const d = unit(zeta());
+    let r = dot(v, d);
+    r = Math.max(0, Math.min(0.98, r));
+    rho = r;
+    syncRhoDisplay();
+  }
+  function setSaddleFromPointer(ptPx){
+    const v = pxToDisk(ptPx);
+    const d = unit(zeta());
+    let r = dot(v, d);
+    r = Math.max(0, Math.min(0.98, r));
+    ctrl.rS = r;
+    if (sliderRs){
+      sliderRs.value = r.toFixed(2);
+    }
+    setText(valRs, r.toFixed(2));
+  }
+
+  // Mouse
+  wrap.addEventListener("mousedown", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "zeta") setZetaFromPointer(p);
+    if (dragging === "rho")  setRhoFromPointer(p);
+    if (dragging === "saddle") setSaddleFromPointer(p);
+    e.preventDefault();
+  });
+  window.addEventListener("mouseup", ()=> dragging=null);
+
+  // Touch
+  wrap.addEventListener("touchstart", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchmove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "zeta") setZetaFromPointer(p);
+    if (dragging === "rho")  setRhoFromPointer(p);
+    if (dragging === "saddle") setSaddleFromPointer(p);
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchend", ()=> dragging=null);
+
+  // ---------- one simulation step ----------
+  function stepSystem(){
+    if (sim.flowing){
+      simTime += DT;
+      // schedule new batches (no fade-in; fixed interval)
+      while (simTime >= nextSpawnTime - 1e-9){
+        spawnBatch(simTime, FLOW_LIFE, FLOW_FADE, FLOW_BATCH_SIZE);
+        nextSpawnTime += FLOW_BATCH_INTERVAL;
+      }
+    }
+
+    const z = zeta();
+    const dirU = unit(z);
+    const nU = unit(perp(dirU));
+
+    const alpha = alphaFromR(rho);
+    const gain = 0.55 * Math.sqrt(alpha); // signal magnitude knob
+    const saddles = buildSaddles(dirU, nU, z, gain);
+
+    // stats accumulator
+    let avgSigma = 0;
+    let totalDwell = 0;
+    let particleCount = 0;
+
+    // deterministic reference
+    if (sim.showDet){
+      const w = detTrail[detTrail.length-1] || {x:0,y:0};
+      const r = norm(w);
+
+      const drift0 = scale(gradHypLogPoisson(w, z), gain * warpFactor(r, ctrl.warpP));
+      const driftS = saddleDriftSum(w, saddles);
+      let wNext = add(w, scale(add(drift0, driftS), DT));
+      wNext = clampToDisk(wNext, MAXR);
+      detTrail.push(wNext);
+      if (detTrail.length > TRAIL) detTrail.shift();
+      if (norm(wNext) > HITR) detTrail = [{x:0,y:0}];
+    }
+
+    if (sim.flowing){
+      // particles by batch
+      const activeBatches = [];
+      for (const batch of batches){
+        const age = simTime - batch.startTime;
+        if (age > batch.life + batch.fade + EPS) continue; // fully expired
+
+        const fadePart = age > batch.life ? clamp01((batch.life + batch.fade - age) / Math.max(batch.fade, 1e-6)) : 1;
+        batch.alpha = fadePart;
+        activeBatches.push(batch);
+
+        for (const p of batch.particles){
+          const w = p.pos;
+          const r = norm(w);
+
+          const driftSignal = scale(gradHypLogPoisson(w, z), gain * warpFactor(r, ctrl.warpP));
+          const driftS = saddleDriftSum(w, saddles);
+          const drift = add(driftSignal, driftS);
+
+          const sigMag = Math.max(1e-6, norm(driftSignal));
+          const sigma = (sigMag / Math.max(0.5, ctrl.snr)) + 0.003;
+          avgSigma += sigma;
+          particleCount += 1;
+
+          let wNext = add(w, scale(drift, DT));
+          if (sim.noise){
+            const n = randn2();
+            const dW = scale(n, sigma * Math.sqrt(DT));
+            wNext = add(wNext, dW);
+          }
+          wNext = clampToDisk(wNext, MAXR);
+
+          const near = isNearSaddle(wNext, saddles);
+          if (near) p.dwell += 1;
+
+          p.pos = wNext;
+          p.trail.push(wNext);
+          if (p.trail.length > TRAIL) p.trail.shift();
+
+          if (norm(wNext) > HITR){
+            const fresh = spawnParticle();
+            p.pos = fresh.pos;
+            p.trail = fresh.trail;
+          }
+
+          totalDwell += p.dwell;
+        }
+      }
+      batches = activeBatches;
+    } else {
+      // classic particles
+      for (const p of particles){
+        const w = p.pos;
+        const r = norm(w);
+
+        const driftSignal = scale(gradHypLogPoisson(w, z), gain * warpFactor(r, ctrl.warpP));
+        const driftS = saddleDriftSum(w, saddles);
+        const drift = add(driftSignal, driftS);
+
+        const sigMag = Math.max(1e-6, norm(driftSignal));
+        const sigma = (sigMag / Math.max(0.5, ctrl.snr)) + 0.003;
+        avgSigma += sigma;
+        particleCount += 1;
+
+        let wNext = add(w, scale(drift, DT));
+        if (sim.noise){
+          const n = randn2();
+          const dW = scale(n, sigma * Math.sqrt(DT));
+          wNext = add(wNext, dW);
+        }
+        wNext = clampToDisk(wNext, MAXR);
+
+        const near = isNearSaddle(wNext, saddles);
+        if (near) p.dwell += 1;
+
+        p.pos = wNext;
+        p.trail.push(wNext);
+        if (p.trail.length > TRAIL) p.trail.shift();
+
+        if (norm(wNext) > HITR){
+          p.pos = spawnParticle().pos;
+          p.trail = [p.pos];
+        }
+
+        totalDwell += p.dwell;
+      }
+    }
+
+    avgSigma = particleCount ? (avgSigma / particleCount) : 0;
+    const meanDwell = particleCount ? (totalDwell / particleCount) : 0;
+
+    // update stats
+    const deg = ((theta*180/Math.PI)%360+360)%360;
+    setText(statDirection, `${deg.toFixed(1)}°`);
+    setText(statRho, rho.toFixed(3));
+    setText(statAlpha, alpha.toFixed(2));
+    setText(statWarp, ctrl.warpP.toFixed(2));
+    setText(statRs, ctrl.rS.toFixed(3));
+    setText(statSNR, ctrl.snr.toFixed(1));
+    setText(statSigma, particleCount ? avgSigma.toFixed(4) : "—");
+    setText(statDwell, particleCount ? meanDwell.toFixed(1) : "—");
+
+    // draw
+    drawFrame(saddles, dirU, nU);
+  }
+
+  function drawFrame(saddles, dirU, nU){
+    const {w,h,R,cx,cy} = geom();
+    drawDiskBoundary();
+
+    // clip inside disk
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx,cy,R-0.5,0,TAU);
+    ctx.clip();
+
+    if (sim.showSaddleGrid){
+      drawSaddleGrid(saddles, sim.showGridColor);
+    }
+
+    if (sim.showMean){
+      ctx.save();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = "#000";
+      ctx.setLineDash([6,6]);
+      const a0 = diskToPx({x:0,y:0});
+      const a1 = diskToPx(scale(dirU, 0.999));
+      ctx.beginPath();
+      ctx.moveTo(a0.x,a0.y);
+      ctx.lineTo(a1.x,a1.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // deterministic reference path
+    if (sim.showDet){
+      drawPolyline(detTrail, 0.58, 2.2);
+    }
+
+    // particle trails
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#000";
+    if (sim.flowing){
+      for (const batch of batches){
+        const trailAlpha = 0.28 * (batch.alpha ?? 1);
+        if (trailAlpha <= 0) continue;
+        ctx.save();
+        ctx.globalAlpha = trailAlpha;
+        for (const p of batch.particles){
+          const pts = p.trail;
+          if (!pts || pts.length < 2) continue;
+          const p0 = diskToPx(pts[0]);
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          for (let i=1;i<pts.length;i++){
+            const q = diskToPx(pts[i]);
+            ctx.lineTo(q.x, q.y);
+          }
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    } else {
+      ctx.save();
+      ctx.globalAlpha = 0.28;
+      for (const p of particles){
+        const pts = p.trail;
+        if (!pts || pts.length < 2) continue;
+        const p0 = diskToPx(pts[0]);
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        for (let i=1;i<pts.length;i++){
+          const q = diskToPx(pts[i]);
+          ctx.lineTo(q.x, q.y);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // saddle cross directions (stable along ray, unstable transverse)
+    if (sim.showSaddle){
+      saddles.forEach(saddle => drawSaddleCross(saddle));
+    }
+
+    ctx.restore(); // end clip
+
+    // draw draggable points (only anchor controls, not flowing particle dots)
+    drawPoint(scale(dirU, 0.999), 9, "#000");
+    drawPoint(precisionPoint(), 8, "#000");
+
+    // labels
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.textBaseline = "middle";
+
+    const zPx = diskToPx(scale(dirU, 0.999));
+    const pPx = diskToPx(precisionPoint());
+
+    ctx.font = "italic 22px Georgia, Times, serif";
+    ctx.fillText("ζ", zPx.x + 14, zPx.y - 14);
+
+    ctx.font = "italic 22px Georgia, Times, serif";
+    ctx.fillText("r", pPx.x + 14, pPx.y + 16);
+
+    // saddle label
+    if (sim.showSaddle){
+      saddles.forEach((saddle, idx) => {
+        const sPx = diskToPx(saddle.pos);
+        const label = idx === 0 ? "wₛ" : "wₛ2";
+        const offsetX = idx === 0 ? 12 : -30;
+        ctx.font = "italic 18px Georgia, Times, serif";
+        ctx.fillText(label, sPx.x + offsetX, sPx.y + 14);
+      });
+    }
+
+    ctx.restore();
+  }
+
+  // ---------- animation loop ----------
+  function tick(){
+    syncSliders();
+    syncViz();
+    if (sim.running){
+      stepSystem();
+    } else {
+      // still redraw (so dragging updates view)
+      const z = zeta();
+      const dirU = unit(z);
+      const nU = unit(perp(dirU));
+      const alpha = alphaFromR(rho);
+      const gain = 0.55 * Math.sqrt(alpha);
+      const saddles = buildSaddles(dirU, nU, z, gain);
+      drawFrame(saddles, dirU, nU);
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script>
+  window.addEventListener("DOMContentLoaded", () => {
+    if (!window.renderMathInElement) return;
+    window.renderMathInElement(document.body, {
+      delimiters: [
+        {left: "\\(", right: "\\)", display: false},
+        {left: "\\[", right: "\\]", display: true},
+        {left: "$", right: "$", display: false},
+        {left: "$$", right: "$$", display: true},
+      ],
+    });
+  });
+</script>
+</body>
+</html>

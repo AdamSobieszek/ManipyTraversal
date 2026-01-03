@@ -182,19 +182,18 @@ class StackedSemanticPotential(nn.Module):
         self.final_activation = final_activation
         self.update_batchnorm = True
 
-        # NEW: Orthonormal rotation layer in the K dimension
-        self.rotation = OrthonormalRotationK(self.K)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, K, D_in]
         returns: [B, K, n_out]
         """
         # Stacked MLP body
-        h = self.act1(self.fc1(x))             # [B, K, n_in]
-        h = self.act2(self.fc2(h))             # [B, K, n_hidden]
-        # If you want the extra depth, uncomment:
-        # h = self.act3(self.fc3(h))           # [B, K, n_hidden]
+        h = self.fc1(x)
+        h = self.act1(h) + h
+        h = self.fc2(h)
+        h = self.act2(h) + h
+        h = self.fc3(h)
+        h = self.act3(h)
 
         # Base potential + direct linear term
         out_mlp = self.fc4(h) * self.c         # [B, K, n_out]
@@ -211,11 +210,8 @@ class StackedSemanticPotential(nn.Module):
         # Zero-mean per k
         out_centered = out - self.running_mean  # broadcasts [K, n_out] over batch
 
-        # NEW: Orthonormal rotation across K potentials
-        out_rot = self.rotation(out_centered)   # [B, K, n_out]
-
         # Optional nonlinearity on final potentials
-        return self.final_activation(out_rot)
+        return self.final_activation(out_centered)
 
 
 
@@ -378,13 +374,15 @@ class WavePDE(nn.Module):
         x_next = st.x_next()
 
         # (optional) same small step noise as before
-        with torch.no_grad():
-            step_delta_norms = (x_next - st.x()).norm(dim=-1, keepdim=True)
-            latent_noise = torch.randn_like(x_next)
-            latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
-            latent_noise = latent_noise * (step_delta_norms.clamp_min(step_delta_norms.mean().item()/3) / 5.0)
-        x_next_noisy = x_next + latent_noise
-
+        if self.training:
+            with torch.no_grad():
+                step_delta_norms = (x_next - st.x()).norm(dim=-1, keepdim=True)
+                latent_noise = torch.randn_like(x_next)
+                latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
+                latent_noise = latent_noise * (step_delta_norms.clamp_min(step_delta_norms.mean().item()/3) / 5.0)
+            x_next_noisy = x_next + latent_noise
+        else:
+            x_next_noisy = x_next
         return st, x_next_noisy, L_sum, st.dt()
 
     # ---- unrolled training ----

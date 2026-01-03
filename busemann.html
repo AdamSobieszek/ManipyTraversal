@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Busemann Potentials (Poincaré Disk) – Points at Infinity + Precision</title>
+  <style>
+    :root { --size: 760px; }
+    body{
+      margin:0; min-height:100vh; display:flex; justify-content:center; background:#fff;
+      font-family: Georgia, "Times New Roman", Times, serif;
+    }
+    .layout{
+      width:min(1500px, 98vw);
+      display:grid;
+      grid-template-columns: minmax(260px, 320px) minmax(560px, 1fr) minmax(260px, 320px);
+      gap: 18px;
+      align-items:start;
+      padding: 20px 16px 32px;
+      box-sizing:border-box;
+    }
+    .col-left, .col-center, .col-right{
+      display:flex;
+      flex-direction:column;
+      gap: 10px;
+    }
+    .col-center{ align-items:center; }
+    @media (max-width: 1100px){
+      .layout{
+        grid-template-columns: 1fr;
+      }
+    }
+    .wrap{
+      position:relative; width:min(var(--size), 86vw); max-width: 860px; aspect-ratio:1/1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      margin: 18px auto 6px;
+      transform: translateY(12px); /* lower the sphere so the title overlaps less */
+    }
+    canvas{ width:100%; height:100%; display:block; }
+
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto 1fr; justify-items:center;
+      padding-top:10%;
+    }
+    .title{
+      text-align:center; font-size:clamp(18px,2.8vw,32px);
+      line-height:1.12; margin:0 10%;
+    }
+    .subtitleCard{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      color: rgba(0,0,0,0.78);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .subtitleCard h4{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+      color: rgba(0,0,0,0.85);
+    }
+
+    .panel{
+      position:sticky;
+      top: 12px;
+      width: 100%;
+      pointer-events:auto;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.95);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 16px;
+      padding: 12px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .panel h3{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+    }
+    .row{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin: 8px 0;
+    }
+    .row label{
+      font-size: 12px;
+      color: rgba(0,0,0,0.72);
+      white-space:nowrap;
+    }
+    .row input[type="range"]{ width: 170px; }
+    .row .val{
+      width: 64px;
+      text-align:right;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: rgba(0,0,0,0.78);
+    }
+    .btns{
+      display:flex; gap:8px; flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    button{
+      appearance:none; border:1px solid rgba(0,0,0,0.18);
+      border-radius: 999px;
+      padding: 8px 10px;
+      background: #fff;
+      font-size: 12px;
+      cursor:pointer;
+    }
+    button:hover{ background: rgba(0,0,0,0.04); }
+    .potList{
+      margin-top: 10px;
+      display:grid;
+      gap: 10px;
+      max-height: min(360px, 46vh);
+      overflow:auto;
+      padding-right: 6px;
+    }
+    .pot{
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 14px;
+      padding: 10px 10px;
+    }
+    .potHeader{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin-bottom: 8px;
+    }
+    .chip{
+      display:inline-flex; align-items:center; gap:8px;
+      font-size: 12px; font-weight: 650;
+    }
+    .swatch{
+      width: 14px; height: 14px; border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.15);
+      flex: 0 0 auto;
+    }
+    .miniBtn{
+      padding: 5px 8px;
+      font-size: 11px;
+    }
+
+    .hint{
+      position:absolute; left:50%; transform:translateX(-50%); bottom:10px;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size:12px; color:#333; pointer-events:none; opacity:.85;
+      background: rgba(255,255,255,0.85);
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 999px;
+      padding: 6px 10px;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+    }
+
+    .info{
+      position:static;
+      pointer-events:none;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      line-height: 1.25;
+      color: rgba(0,0,0,0.84);
+      background: rgba(255,255,255,0.94);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      min-width: 240px;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      width: 100%;
+      box-sizing:border-box;
+    }
+    .infoRow{
+      display:flex;
+      justify-content:flex-start;
+      margin-top: 12px;
+    }
+    .info .row2{
+      display:flex;
+      justify-content:space-between;
+      gap: 12px;
+      white-space:nowrap;
+    }
+    .info .k{ color: rgba(0,0,0,0.62); }
+    .info .v{ font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="col-left">
+      <div class="panel" id="panel">
+        <h3>Controls</h3>
+
+        <div class="row">
+          <label>Render quality</label>
+          <input id="res" type="range" min="220" max="720" step="10" value="420" />
+          <div class="val" id="resVal">420</div>
+        </div>
+
+        <div class="row">
+          <label>Softmax temperature</label>
+          <input id="temp" type="range" min="0.25" max="3.00" step="0.01" value="1.00" />
+          <div class="val" id="tempVal">1.00</div>
+        </div>
+
+        <div class="row">
+          <label>Alpha power</label>
+          <input id="apow" type="range" min="0.5" max="3.0" step="0.05" value="1.35" />
+          <div class="val" id="apowVal">1.35</div>
+        </div>
+
+        <div class="row">
+          <label>Boundary pull (κx squash)</label>
+          <input id="kappa" type="range" min="0.15" max="2.50" step="0.01" value="0.85" />
+          <div class="val" id="kappaVal">0.85</div>
+        </div>
+
+        <div class="btns">
+          <button id="add">Add potential</button>
+          <button id="rem">Remove last</button>
+          <button id="rand">Randomize directions</button>
+          <button id="reset">Reset</button>
+        </div>
+
+        <div class="potList" id="potList"></div>
+      </div>
+    </div>
+
+    <div class="col-center">
+      <div class="wrap" id="wrap">
+        <canvas id="c"></canvas>
+
+        <div class="overlay">
+          <div class="title">
+            Busemann Potentials on the Poincaré Disk<br/>
+            <span style="font-style:italic;">points at infinity</span> + <span style="font-style:italic;">precision</span>
+          </div>
+          <div></div>
+        </div>
+
+        <div class="hint">Drag colored boundary points (targets at infinity). Drag inside disk to “probe” visually.</div>
+      </div>
+      <div class="infoRow">
+        <div class="info" id="info"></div>
+      </div>
+    </div>
+
+    <div class="col-right">
+      <div class="subtitleCard">
+        <h4>How to read the field</h4>
+        <div>Drag boundary targets. White = maximal uncertainty; stronger color means more confidence (alpha encodes certainty).</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ----------------- helpers -----------------
+    const EPS = 1e-12;
+    const TAU = Math.PI*2;
+
+    function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+    function norm2(v){ return v.x*v.x + v.y*v.y; }
+    function norm(v){ return Math.hypot(v.x, v.y); }
+    function dot(a,b){ return a.x*b.x + a.y*b.y; }
+    function add(a,b){ return {x:a.x+b.x, y:a.y+b.y}; }
+    function sub(a,b){ return {x:a.x-b.x, y:a.y-b.y}; }
+    function scale(v,s){ return {x:v.x*s, y:v.y*s}; }
+    function unit(v){
+      const r = norm(v);
+      if (r < EPS) return {x:1, y:0};
+      return scale(v, 1/r);
+    }
+
+    // Evenly spaced, distinct-ish colors (HSV -> RGB)
+    function hsvToRgb(h,s,v){
+      h = ((h%1)+1)%1;
+      const i = Math.floor(h*6);
+      const f = h*6 - i;
+      const p = v*(1-s);
+      const q = v*(1-f*s);
+      const t = v*(1-(1-f)*s);
+      let r,g,b;
+      switch(i%6){
+        case 0: r=v; g=t; b=p; break;
+        case 1: r=q; g=v; b=p; break;
+        case 2: r=p; g=v; b=t; break;
+        case 3: r=p; g=q; b=v; break;
+        case 4: r=t; g=p; b=v; break;
+        case 5: r=v; g=p; b=q; break;
+      }
+      return {r:Math.round(r*255), g:Math.round(g*255), b:Math.round(b*255)};
+    }
+
+    // ----------------- Poincaré ball utilities -----------------
+    // Busemann function (up to additive constant):
+    // b_ξ(y) = log( (1 - ||y||^2) / ||y - ξ||^2 ),  with ξ on boundary (||ξ||=1).
+    // At y=0, b=0 for all ξ. As y -> ξ on boundary, b -> +∞.
+    function busemann(y, xi){
+      const y2 = norm2(y);
+      const num = Math.max(1 - y2, EPS);
+      const d = sub(y, xi);
+      const den = Math.max(norm2(d), EPS);
+      return Math.log(num / den);
+    }
+
+    // Embed x-plane (canvas disk coords) to ball coords:
+    // Here x is already inside disk; we optionally apply a squash that makes "far in R^n"
+    // correspond to near-boundary: y = tanh(kappa * atanh(r)) * x/r. (Monotone radial.)
+    function squashToBall(x, kappa){
+      const r = norm(x);
+      if (r < 1e-9) return {x:0, y:0};
+      // map r∈[0,1) -> ρ=atanh(r) then scale and map back
+      const rho = 0.5 * Math.log((1+r)/(1-r)); // atanh(r)
+      const rho2 = kappa * rho;
+      const r2 = Math.tanh(rho2);
+      return scale(x, r2 / r);
+    }
+
+    // Softmax with temperature
+    function softmax(logits, temp){
+      let max = -Infinity;
+      for (let i=0;i<logits.length;i++) if (logits[i] > max) max = logits[i];
+      let sum = 0;
+      const exps = new Array(logits.length);
+      const invT = 1/Math.max(temp, 1e-6);
+      for (let i=0;i<logits.length;i++){
+        const e = Math.exp((logits[i]-max)*invT);
+        exps[i]=e; sum += e;
+      }
+      const p = new Array(logits.length);
+      for (let i=0;i<p.length;i++) p[i]=exps[i]/Math.max(sum, EPS);
+      return p;
+    }
+
+    function entropy(p){
+      let h=0;
+      for (let i=0;i<p.length;i++){
+        const pi = p[i];
+        if (pi>0) h -= pi*Math.log(pi);
+      }
+      return h;
+    }
+
+    // ----------------- canvas setup -----------------
+    const canvas = document.getElementById("c");
+    const wrap = document.getElementById("wrap");
+    const ctx = canvas.getContext("2d", { alpha: true });
+
+    const info = document.getElementById("info");
+    const potList = document.getElementById("potList");
+
+    const resEl = document.getElementById("res");
+    const tempEl = document.getElementById("temp");
+    const apowEl = document.getElementById("apow");
+    const kappaEl = document.getElementById("kappa");
+    const resVal = document.getElementById("resVal");
+    const tempVal = document.getElementById("tempVal");
+    const apowVal = document.getElementById("apowVal");
+    const kappaVal = document.getElementById("kappaVal");
+
+    // Offscreen render for speed (low-res image scaled up)
+    const off = document.createElement("canvas");
+    const offCtx = off.getContext("2d", { alpha: true });
+
+    function geom(){
+      const w = wrap.getBoundingClientRect().width;
+      const h = wrap.getBoundingClientRect().height;
+      const pad = 18;
+      const R = Math.min(w,h)/2 - pad;
+      return {w,h,R,cx:w/2,cy:h/2, pad};
+    }
+    function diskToPx(v){
+      const {R,cx,cy} = geom();
+      return { x: cx + v.x*R, y: cy - v.y*R };
+    }
+    function pxToDisk(p){
+      const {R,cx,cy} = geom();
+      return { x: (p.x - cx)/R, y: (cy - p.y)/R };
+    }
+    function pointerPos(ev){
+      const r = wrap.getBoundingClientRect();
+      const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left;
+      const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top;
+      return {x,y};
+    }
+
+    function resize(){
+      const rect = wrap.getBoundingClientRect();
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width  = Math.round(rect.width  * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0); // draw in CSS px
+      requestRender();
+    }
+    window.addEventListener("resize", resize);
+
+    // ----------------- model state -----------------
+    // A "potential" is: boundary direction xi (unit), precision kappaP, bias b0.
+    // logits_k(y) = κk * (busemann(y, xi_k) - b0_k)
+    // Higher => more likely.
+    let potentials = [];
+
+    function defaultPotentials(K=4){
+      potentials = [];
+      for (let k=0;k<K;k++){
+        const ang = (k/K)*TAU + 0.12;
+        potentials.push({
+          xi: {x: Math.cos(ang), y: Math.sin(ang)},  // ideal point on boundary
+          prec: 2.2,                                  // precision (cone tightness)
+          bias: 0.35,                                 // upward/downward shift (recognizability threshold)
+          color: hsvToRgb(k/K, 0.78, 0.92),
+        });
+      }
+    }
+
+    // ----------------- UI wiring -----------------
+    function rebuildPotList(){
+      potList.innerHTML = "";
+      potentials.forEach((pot, idx) => {
+        const div = document.createElement("div");
+        div.className = "pot";
+
+        const header = document.createElement("div");
+        header.className = "potHeader";
+
+        const chip = document.createElement("div");
+        chip.className = "chip";
+        const sw = document.createElement("span");
+        sw.className = "swatch";
+        sw.style.background = `rgb(${pot.color.r},${pot.color.g},${pot.color.b})`;
+        const name = document.createElement("span");
+        name.textContent = `Potential ${idx+1}`;
+        chip.appendChild(sw);
+        chip.appendChild(name);
+
+        const kill = document.createElement("button");
+        kill.className = "miniBtn";
+        kill.textContent = "Delete";
+        kill.onclick = () => { potentials.splice(idx,1); recolor(); rebuildPotList(); requestRender(); };
+
+        header.appendChild(chip);
+        header.appendChild(kill);
+        div.appendChild(header);
+
+        // Precision slider
+        const r1 = document.createElement("div"); r1.className="row";
+        const l1 = document.createElement("label"); l1.textContent="Precision κ";
+        const s1 = document.createElement("input");
+        s1.type="range"; s1.min="0.10"; s1.max="12.0"; s1.step="0.05"; s1.value=pot.prec;
+        const v1 = document.createElement("div"); v1.className="val"; v1.textContent=Number(pot.prec).toFixed(2);
+        s1.oninput = () => { pot.prec = Number(s1.value); v1.textContent = pot.prec.toFixed(2); requestRender(); };
+        r1.appendChild(l1); r1.appendChild(s1); r1.appendChild(v1);
+        div.appendChild(r1);
+
+        // Bias slider
+        const r2 = document.createElement("div"); r2.className="row";
+        const l2 = document.createElement("label"); l2.textContent="Bias b₀";
+        const s2 = document.createElement("input");
+        s2.type="range"; s2.min="-2.0"; s2.max="2.0"; s2.step="0.01"; s2.value=pot.bias;
+        const v2 = document.createElement("div"); v2.className="val"; v2.textContent=Number(pot.bias).toFixed(2);
+        s2.oninput = () => { pot.bias = Number(s2.value); v2.textContent = pot.bias.toFixed(2); requestRender(); };
+        r2.appendChild(l2); r2.appendChild(s2); r2.appendChild(v2);
+        div.appendChild(r2);
+
+        // Nudge angle buttons
+        const r3 = document.createElement("div"); r3.className="row";
+        const l3 = document.createElement("label"); l3.textContent="Direction";
+        const left = document.createElement("button"); left.className="miniBtn"; left.textContent="⟲";
+        const right = document.createElement("button"); right.className="miniBtn"; right.textContent="⟳";
+        const angVal = document.createElement("div"); angVal.className="val";
+        const ang = Math.atan2(pot.xi.y, pot.xi.x); angVal.textContent = (ang*180/Math.PI).toFixed(0)+"°";
+        left.onclick = () => { rotatePot(idx, -6*Math.PI/180); rebuildPotList(); requestRender(); };
+        right.onclick = () => { rotatePot(idx, +6*Math.PI/180); rebuildPotList(); requestRender(); };
+        r3.appendChild(l3);
+        const wrapBtn = document.createElement("div");
+        wrapBtn.style.display="flex"; wrapBtn.style.gap="6px"; wrapBtn.appendChild(left); wrapBtn.appendChild(right);
+        r3.appendChild(wrapBtn);
+        r3.appendChild(angVal);
+        div.appendChild(r3);
+
+        potList.appendChild(div);
+      });
+    }
+
+    function recolor(){
+      const K = potentials.length;
+      for (let k=0;k<K;k++){
+        potentials[k].color = hsvToRgb(k/Math.max(K,1), 0.78, 0.92);
+      }
+    }
+
+    function rotatePot(idx, dAng){
+      const pot = potentials[idx];
+      const a = Math.atan2(pot.xi.y, pot.xi.x) + dAng;
+      pot.xi = {x: Math.cos(a), y: Math.sin(a)};
+    }
+
+    document.getElementById("add").onclick = () => {
+      const K = potentials.length;
+      const ang = (K/Math.max(K+1,1))*TAU + 0.2;
+      potentials.push({ xi:{x:Math.cos(ang), y:Math.sin(ang)}, prec:2.2, bias:0.35, color:{r:0,g:0,b:0} });
+      recolor(); rebuildPotList(); requestRender();
+    };
+    document.getElementById("rem").onclick = () => {
+      potentials.pop();
+      recolor(); rebuildPotList(); requestRender();
+    };
+    document.getElementById("rand").onclick = () => {
+      potentials.forEach(p => {
+        const ang = Math.random()*TAU;
+        p.xi = {x:Math.cos(ang), y:Math.sin(ang)};
+      });
+      rebuildPotList(); requestRender();
+    };
+    document.getElementById("reset").onclick = () => {
+      defaultPotentials(4);
+      recolor();
+      rebuildPotList();
+      requestRender();
+    };
+
+    function syncTopControls(){
+      resVal.textContent = String(resEl.value);
+      tempVal.textContent = Number(tempEl.value).toFixed(2);
+      apowVal.textContent = Number(apowEl.value).toFixed(2);
+      kappaVal.textContent = Number(kappaEl.value).toFixed(2);
+    }
+    [resEl,tempEl,apowEl,kappaEl].forEach(el => el.addEventListener("input", () => {
+      syncTopControls();
+      requestRender();
+    }));
+
+    // ----------------- rendering -----------------
+    let needsRender = true;
+    let lastStats = {avgEntropy:0, avgMaxP:0};
+
+    function requestRender(){
+      needsRender = true;
+      draw();
+    }
+
+    function drawDiskBoundary(){
+      const {w,h,R,cx,cy} = geom();
+      ctx.save();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = "#000";
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, TAU);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function renderField(){
+      const {w,h,R,cx,cy} = geom();
+      const N = Number(resEl.value);
+      off.width = N;
+      off.height = N;
+
+      const img = offCtx.createImageData(N, N);
+      const data = img.data;
+
+      const K = potentials.length;
+      const temp = Number(tempEl.value);
+      const apow = Number(apowEl.value);
+      const kappa = Number(kappaEl.value);
+
+      // Fill white background first (we'll use alpha in ImageData)
+      for (let i=0;i<data.length;i+=4){
+        data[i]=255; data[i+1]=255; data[i+2]=255; data[i+3]=255;
+      }
+
+      // Stats
+      let entSum=0, maxPSum=0, count=0;
+
+      // Render only the disk
+      // Map pixel -> disk coordinate in [-1,1]^2
+      for (let py=0; py<N; py++){
+        const y = (1 - 2*(py+0.5)/N); // +1 top, -1 bottom
+        for (let px=0; px<N; px++){
+          const x = (2*(px+0.5)/N - 1);
+          const r2 = x*x + y*y;
+          const idx = (py*N + px)*4;
+          if (r2 >= 1.0){
+            // outside disk: keep white
+            continue;
+          }
+
+          // interpret this pixel as x-space point, squash to ball
+          const xd = {x, y};
+          const yd = squashToBall(xd, kappa);
+
+          // logits from Busemann potentials
+          const logits = new Array(K);
+          for (let k=0;k<K;k++){
+            const pot = potentials[k];
+            const b = busemann(yd, pot.xi);
+            logits[k] = pot.prec * (b - pot.bias);
+          }
+
+          const p = softmax(logits, temp);
+
+          // uncertainty via normalized entropy
+          const H = entropy(p);
+          const Hmax = Math.log(Math.max(K,1));
+          const u = (Hmax > 0) ? (H / Hmax) : 0;          // in [0,1]
+          const conf = 1 - u;                              // in [0,1]
+          const alpha = Math.pow(clamp01(conf), apow);      // emphasize certainty
+
+          // argmax color + second-best for boundary accent
+          let kStar = 0;
+          let k2 = 0;
+          let pStar = p[0] ?? 1;
+          let p2 = 0;
+          for (let k=1;k<K;k++){
+            const pk = p[k];
+            if (pk > pStar){
+              p2 = pStar; k2 = kStar;
+              pStar = pk; kStar = k;
+            }else if (pk > p2){
+              p2 = pk; k2 = k;
+            }
+          }
+
+          // boundary accent: when top-2 are close, boost saturation slightly
+          const gap = Math.max(pStar - p2, 0);
+          const boundaryBoost = Math.pow(clamp01((0.30 - gap) / 0.30), 1.35); // strong only on sharp transitions
+
+          // White background + slightly mixed color near boundaries
+          const col1 = potentials[kStar]?.color ?? {r:0,g:0,b:0};
+          const col2 = potentials[k2]?.color ?? col1;
+          const mixW = (K >= 2) ? 0.25 * boundaryBoost : 0;
+          const col = {
+            r: Math.round(col1.r*(1-mixW) + col2.r*mixW),
+            g: Math.round(col1.g*(1-mixW) + col2.g*mixW),
+            b: Math.round(col1.b*(1-mixW) + col2.b*mixW),
+          };
+
+          // Set pixel to color with alpha scaled by confidence;
+          // keep disk boundary readable by slightly lowering alpha near edge
+          const edgeFade = clamp01((1 - r2) * 6.0); // near boundary smaller, but not zero
+          const baseA = alpha * (0.55 + 0.45*edgeFade);
+          const a = clamp01(baseA * (1 + 0.18*boundaryBoost));
+
+          // blend color over white in-place (premultiply):
+          // result = a*color + (1-a)*white
+          data[idx]   = Math.round(a*col.r + (1-a)*255);
+          data[idx+1] = Math.round(a*col.g + (1-a)*255);
+          data[idx+2] = Math.round(a*col.b + (1-a)*255);
+          data[idx+3] = 255;
+
+          entSum += u;
+          maxPSum += pStar;
+          count++;
+        }
+      }
+
+      offCtx.putImageData(img, 0, 0);
+
+      // draw scaled to main canvas
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+
+      // Fill white
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0,0,w,h);
+
+      // Clip to disk and draw the field
+      ctx.beginPath();
+      ctx.arc(cx, cy, R-0.5, 0, TAU);
+      ctx.clip();
+
+      ctx.drawImage(off, cx-R, cy-R, 2*R, 2*R);
+
+      ctx.restore();
+
+      lastStats.avgEntropy = count ? (entSum/count) : 0;
+      lastStats.avgMaxP = count ? (maxPSum/count) : 0;
+    }
+
+    function drawBoundaryTargets(){
+      const {R,cx,cy} = geom();
+      const handleR = 9;
+      potentials.forEach((pot) => {
+        const pos = scale(pot.xi, 0.999); // almost on boundary
+        const p = diskToPx(pos);
+
+        // colored handle
+        ctx.save();
+        ctx.fillStyle = `rgb(${pot.color.r},${pot.color.g},${pot.color.b})`;
+        ctx.strokeStyle = "rgba(0,0,0,0.55)";
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, handleR, 0, TAU);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+
+        // small radial tick inward
+        const inward = scale(pot.xi, -1);
+        const t1 = {x: p.x + inward.x*10, y: p.y - inward.y*10};
+        const t0 = {x: p.x + inward.x*2,  y: p.y - inward.y*2};
+        ctx.save();
+        ctx.strokeStyle = "rgba(0,0,0,0.35)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(t0.x, t0.y);
+        ctx.lineTo(t1.x, t1.y);
+        ctx.stroke();
+        ctx.restore();
+      });
+    }
+
+    function updateInfo(){
+      const K = potentials.length;
+      info.innerHTML =
+        `<div class="row2"><span class="k">Potentials</span><span class="v">${K}</span></div>` +
+        `<div class="row2"><span class="k">Temp</span><span class="v">${Number(tempEl.value).toFixed(2)}</span></div>` +
+        `<div class="row2"><span class="k">Avg uncertainty (entropy)</span><span class="v">${lastStats.avgEntropy.toFixed(3)}</span></div>` +
+        `<div class="row2"><span class="k">Avg max p</span><span class="v">${lastStats.avgMaxP.toFixed(3)}</span></div>` +
+        `<div class="row2"><span class="k">Busemann</span><span class="v">bξ(y)=log((1−‖y‖²)/‖y−ξ‖²)</span></div>`;
+    }
+
+    function draw(){
+      if (!needsRender) return;
+      needsRender = false;
+
+      // field
+      renderField();
+
+      // boundary circle
+      drawDiskBoundary();
+
+      // targets at infinity
+      drawBoundaryTargets();
+
+      updateInfo();
+    }
+
+    // ----------------- interaction: drag boundary targets -----------------
+    let dragging = null; // index or null
+
+    function hitTestTargets(ptPx){
+      const hitR = 16;
+      for (let i=0;i<potentials.length;i++){
+        const pos = scale(potentials[i].xi, 0.999);
+        const p = diskToPx(pos);
+        const d = Math.hypot(ptPx.x - p.x, ptPx.y - p.y);
+        if (d < hitR) return i;
+      }
+      return null;
+    }
+
+    function setDraggedTarget(i, ptPx){
+      const v = pxToDisk(ptPx);
+      // project to unit circle (ideal point direction)
+      const xi = unit(v);
+      potentials[i].xi = xi;
+      requestRender();
+      rebuildPotList(); // update angle readouts
+    }
+
+    // Mouse
+    wrap.addEventListener("mousedown", (e) => {
+      const p = pointerPos(e);
+      const h = hitTestTargets(p);
+      if (h !== null){ dragging = h; e.preventDefault(); }
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (dragging === null) return;
+      setDraggedTarget(dragging, pointerPos(e));
+    });
+    window.addEventListener("mouseup", () => dragging = null);
+
+    // Touch
+    wrap.addEventListener("touchstart", (e) => {
+      const p = pointerPos(e);
+      const h = hitTestTargets(p);
+      if (h !== null){ dragging = h; e.preventDefault(); }
+    }, {passive:false});
+    window.addEventListener("touchmove", (e) => {
+      if (dragging === null) return;
+      setDraggedTarget(dragging, pointerPos(e));
+      e.preventDefault();
+    }, {passive:false});
+    window.addEventListener("touchend", () => dragging = null);
+
+    // ----------------- init -----------------
+    defaultPotentials(4);
+    recolor();
+    syncTopControls();
+    rebuildPotList();
+    resize();
+  </script>
+</body>
+</html>

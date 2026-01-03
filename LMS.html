@@ -1,0 +1,1402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LMS Kuramoto in the Hyperbolic Ball (z,w,ζ,Z) + Noise/SNR</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <style>
+    :root{
+      --canvas-max: 107.5em;
+      --content-max: 120em;
+      --gap: 28px;
+      --bg: #f6f6f6;
+      --card: rgba(255,255,255,0.92);
+      --border: rgba(20,20,20,0.14);
+      --ink: #0b0b0b;
+      --muted: rgba(0,0,0,0.70);
+    }
+    body{
+      margin:0;
+      min-height:100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", Times, serif;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding: clamp(14px, 2.4vw, 32px);
+    }
+    .app{
+      width: min(var(--content-max), 96vw);
+      display:grid;
+      grid-template-columns: minmax(240px, 1.1fr) minmax(0, 3fr) minmax(240px, 1.1fr);
+      gap: var(--gap);
+      align-items:start;
+    }
+    @media (max-width: 1180px){
+      .app{ grid-template-columns: 1fr; }
+    }
+    .left{ display:flex; justify-content:center; }
+    .wrap{
+      position:relative;
+      width: min(var(--canvas-max), 100%);
+      aspect-ratio:1/1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      overflow:hidden;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.10);
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto auto 1fr; justify-items:center;
+      padding-top:6%;
+    }
+    .title{
+      text-align:center;
+      font-size:clamp(18px, 3.0vw, 34px);
+      line-height:1.15;
+      margin:0 10%;
+    }
+    .subtitle{
+      margin-top:10px;
+      font-size:clamp(13px, 1.9vw, 19px);
+      font-family: "KaTeX_Main","Latin Modern Roman","CMU Serif",Georgia,"Times New Roman",Times,serif;
+      opacity:0.90;
+      text-align:center;
+      margin-left: 10%;
+      margin-right: 10%;
+    }
+    .side{ position:relative; }
+    .stack{ display:flex; flex-direction:column; gap: 16px; }
+    .card{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px 18px 16px;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .cardTitle{
+      font-size: 18px;
+      letter-spacing: 0.2px;
+      margin: 0 0 12px;
+    }
+    .statGrid{
+      display:grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px 14px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      line-height: 1.35;
+      color: var(--muted);
+    }
+    .statKey{ color: rgba(0,0,0,0.72); }
+    .statVal{
+      color: rgba(0,0,0,0.86);
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+      text-align:right;
+    }
+    .divider{
+      height: 1px;
+      background: rgba(0,0,0,0.10);
+      margin: 14px 0 12px;
+    }
+    .noteTitle{
+      margin: 0 0 8px;
+      font-size: 14px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color: rgba(0,0,0,0.80);
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+    }
+    .noteText{
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: rgba(0,0,0,0.80);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    }
+    .noteText:last-child{ margin-bottom: 0; }
+
+    .metricsWrap{
+      width: 100%;
+      height: clamp(220px, 32vh, 360px);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.62);
+      border: 1px solid rgba(0,0,0,0.08);
+      overflow:hidden;
+    }
+    .metricsWrap canvas{ width:100%; height:100%; display:block; }
+    .metricsLegend{
+      display:grid;
+      gap: 6px;
+      margin-top: 10px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      color: rgba(0,0,0,0.62);
+    }
+    .legendItem{ display:flex; align-items:center; gap: 8px; }
+    .legendSwatch{
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #111;
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.2) inset;
+    }
+    .legendSwatch.r{ background: rgba(20,60,90,0.9); }
+    .legendSwatch.w{ background: rgba(10,120,80,0.85); }
+
+    .controlGrid{ display:grid; gap: 12px; margin-top: 10px; }
+    .toggleRow{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 14px;
+      padding: 10px 12px;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.55);
+    }
+    .toggleLabel{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      color: rgba(0,0,0,0.78);
+      line-height: 1.25;
+    }
+    .toggleHint{
+      display:block;
+      margin-top: 4px;
+      font-size: 12px;
+      color: rgba(0,0,0,0.55);
+    }
+    .switch{
+      position:relative;
+      width: 44px;
+      height: 26px;
+      flex: 0 0 auto;
+    }
+    .switch input{
+      appearance:none;
+      -webkit-appearance:none;
+      width: 44px;
+      height: 26px;
+      margin: 0;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.16);
+      border: 1px solid rgba(0,0,0,0.14);
+      cursor:pointer;
+      transition: background 160ms ease, border-color 160ms ease;
+      outline: none;
+    }
+    .switch input::after{
+      content:"";
+      position:absolute;
+      top: 3px;
+      left: 3px;
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.95);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+      transform: translateX(0);
+      transition: transform 160ms ease;
+    }
+    .switch input:checked{
+      background: rgba(0,0,0,0.78);
+      border-color: rgba(0,0,0,0.25);
+    }
+    .switch input:checked::after{ transform: translateX(18px); }
+
+    .sliderRow{
+      padding: 10px 12px;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.55);
+    }
+    .sliderTop{
+      display:flex;
+      align-items:baseline;
+      justify-content:space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .sliderLabel{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      color: rgba(0,0,0,0.78);
+    }
+    .sliderVal{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 13px;
+      color: rgba(0,0,0,0.62);
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+    }
+    input[type="range"]{
+      width: 100%;
+      accent-color: rgba(0,0,0,0.85);
+    }
+    .btnRow{ display:flex; gap: 10px; margin-top: 10px; }
+    button{
+      border: 1px solid rgba(0,0,0,0.16);
+      background: rgba(255,255,255,0.70);
+      padding: 10px 12px;
+      border-radius: 14px;
+      cursor:pointer;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 13px;
+      color: rgba(0,0,0,0.80);
+      flex: 1 1 auto;
+    }
+    button:active{ transform: translateY(1px); }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="side metricsSide">
+      <div class="stack">
+        <div class="card">
+          <div class="cardTitle">Order + sync</div>
+          <div class="metricsWrap" id="metricsWrap">
+            <canvas id="metricsCanvas"></canvas>
+          </div>
+          <div class="metricsLegend">
+            <div class="legendItem"><span class="legendSwatch r"></span>Order parameter \(R(t)\)</div>
+            <div class="legendItem"><span class="legendSwatch w"></span>Control magnitude \(|w(t)|\)</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="left">
+      <div class="wrap" id="wrap">
+        <canvas id="c"></canvas>
+
+        <div class="overlay">
+          <div class="title">
+            LMS Kuramoto on \(S^{d-1}\) reduced to \(B^2\): \((z,w,\zeta,Z)\) on the Poincaré disk
+          </div>
+          <div class="subtitle">
+            Drag \( \zeta_\infty \) (black dot) on the boundary to set the “synchrony direction”. Drag \(r\) on the ray to set the initial magnitude.
+            The swarm points are \(y_i(t)=\zeta(t)\,M_{w(t)}(p_i)\) (Möbius action).
+            Body center \(w\) follows LMS \(\dot w=-\tfrac12(1-|w|^2)\zeta^{-1}Z(z)\) (plus noise); lab center is constrained by \(z=-\zeta w\).
+          </div>
+          <div></div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="stack">
+        <div class="card">
+          <div class="cardTitle">Statistics</div>
+          <div class="statGrid" aria-live="polite">
+            <div class="statKey">Dimension \(d\)</div>
+            <div class="statVal" id="statD">—</div>
+
+            <div class="statKey">Coupling \(K\)</div>
+            <div class="statVal" id="statK">—</div>
+
+            <div class="statKey">Rotation rate \(\omega\)</div>
+            <div class="statVal" id="statOmega">—</div>
+
+            <div class="statKey">\(|w|\)</div>
+            <div class="statVal" id="statW">—</div>
+
+            <div class="statKey">\(|z|\)</div>
+            <div class="statVal" id="statZ">—</div>
+
+            <div class="statKey">Shrink \(f_d(|z|)\)</div>
+            <div class="statVal" id="statFd">—</div>
+
+            <div class="statKey">\(|Z|/K\)</div>
+            <div class="statVal" id="statZnorm">—</div>
+
+            <div class="statKey">Time-warp \(p\)</div>
+            <div class="statVal" id="statWarp">—</div>
+
+            <div class="statKey">SNR</div>
+            <div class="statVal" id="statSNR">—</div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="noteTitle">Model (2D visualization, \(d\)-dependent bias)</div>
+          <p class="noteText">
+            We simulate in the Poincaré disk with \(\zeta(t)\in SO(2)\) (angle \(\phi\)).
+            Order parameter uses the thermodynamic-limit LMS formula \(Z(z)=K\,f_d(|z|)\,z\) where \(f_d\) is a Gauss hypergeometric ratio.
+            For \(d=2\), \(f_d\equiv 1\) (OA/WS “miracle”).
+          </p>
+          <p class="noteText">
+            \(\zeta\) evolves by “Thomas/Wigner precession”:
+            \(\dot\phi=\omega-\mathrm{cross}(\zeta w,\,Z)\).
+            Noise is injected in a tangent (Euclidean) approximation with \(\sigma\approx \|\text{drift}\|/\mathrm{SNR}\).
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="cardTitle">Controls</div>
+          <div class="controlGrid">
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Run
+                <span class="toggleHint">Pause/resume the LMS reduced dynamics</span>
+              </div>
+              <label class="switch" aria-label="Toggle run">
+                <input id="toggleRun" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Noise
+                <span class="toggleHint">Add SNR-controlled stochastic perturbations to \(\dot w\)</span>
+              </div>
+              <label class="switch" aria-label="Toggle noise">
+                <input id="toggleNoise" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Show ray + handles
+                <span class="toggleHint">Dashed ray to \(\zeta_\infty\), drag boundary and \(r\)</span>
+              </div>
+              <label class="switch" aria-label="Toggle ray">
+                <input id="toggleRay" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Show \(w\) and \(z\)
+                <span class="toggleHint">Body center \(w\) (filled) and lab center \(z\) (ring)</span>
+              </div>
+              <label class="switch" aria-label="Toggle centers">
+                <input id="toggleCenters" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Oscillator ticks
+                <span class="toggleHint">Dots outside the boundary with radial markers</span>
+              </div>
+              <label class="switch" aria-label="Toggle oscillator ticks">
+                <input id="toggleOscTicks" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Phase + density heatmap
+                <span class="toggleHint">Hue = phase, intensity = density; radial weighting uses \(f_d\)</span>
+              </div>
+              <label class="switch" aria-label="Toggle phase density heatmap">
+                <input id="toggleDensity" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="toggleRow">
+              <div class="toggleLabel">
+                Flow comb
+                <span class="toggleHint">Tangential strokes show angular drift direction</span>
+              </div>
+              <label class="switch" aria-label="Toggle flow comb">
+                <input id="toggleFlow" type="checkbox" checked>
+              </label>
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Oscillators \(N\)</div>
+                <div class="sliderVal" id="valN">—</div>
+              </div>
+              <input id="sliderN" type="range" min="8" max="200" step="1" value="60">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Start radius \(r_0\)</div>
+                <div class="sliderVal" id="valRho">—</div>
+              </div>
+              <input id="sliderRho" type="range" min="0.02" max="0.95" step="0.01" value="0.12">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Dimension \(d\)</div>
+                <div class="sliderVal" id="valD">—</div>
+              </div>
+              <input id="sliderD" type="range" min="2" max="12" step="1" value="2">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Coupling \(K\)</div>
+                <div class="sliderVal" id="valK">—</div>
+              </div>
+              <input id="sliderK" type="range" min="0" max="6" step="0.05" value="2.0">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Rotation rate \(\omega\)</div>
+                <div class="sliderVal" id="valOmega">—</div>
+              </div>
+              <input id="sliderOmega" type="range" min="-6" max="6" step="0.05" value="0.40">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Time-warp exponent \(p\)</div>
+                <div class="sliderVal" id="valWarp">—</div>
+              </div>
+              <input id="sliderWarp" type="range" min="0" max="2.5" step="0.05" value="0.80">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">SNR</div>
+                <div class="sliderVal" id="valSNR">—</div>
+              </div>
+              <input id="sliderSNR" type="range" min="0.5" max="80" step="0.1" value="10">
+            </div>
+
+            <div class="btnRow">
+              <button id="btnReset">Reset</button>
+              <button id="btnKick">Random kick</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+<script>
+(() => {
+  const TAU = Math.PI * 2;
+  const EPS = 1e-12;
+
+  // ---------- vec helpers ----------
+  const add = (a,b)=>({x:a.x+b.x,y:a.y+b.y});
+  const sub = (a,b)=>({x:a.x-b.x,y:a.y-b.y});
+  const scale = (v,s)=>({x:v.x*s,y:v.y*s});
+  const dot = (a,b)=>a.x*b.x+a.y*b.y;
+  const cross = (a,b)=>a.x*b.y - a.y*b.x;
+  const norm2 = (v)=>v.x*v.x+v.y*v.y;
+  const norm = (v)=>Math.hypot(v.x,v.y);
+  const unit = (v)=>{ const r=norm(v); return r<EPS?{x:1,y:0}:scale(v,1/r); };
+  const perp = (v)=>({x:-v.y,y:v.x});
+
+  function clampToDisk(v, maxR=0.999999){
+    const r = norm(v);
+    return r<=maxR ? v : scale(v, maxR/r);
+  }
+  function rot(v, ang){
+    const c = Math.cos(ang), s = Math.sin(ang);
+    return {x: c*v.x - s*v.y, y: s*v.x + c*v.y};
+  }
+  function atanhSafe(x){
+    const y = Math.max(0, Math.min(0.999999999, x));
+    return Math.atanh(y);
+  }
+
+  function angleDelta(a, b){
+    let d = a - b;
+    if (d > Math.PI) d -= TAU;
+    if (d < -Math.PI) d += TAU;
+    return d;
+  }
+
+  function hslToRgb(h, s, l){
+    const hh = ((h % 360) + 360) % 360;
+    const c = (1 - Math.abs(2*l - 1)) * s;
+    const hp = hh / 60;
+    const x = c * (1 - Math.abs((hp % 2) - 1));
+    let r1 = 0, g1 = 0, b1 = 0;
+    if (hp >= 0 && hp < 1){ r1 = c; g1 = x; }
+    else if (hp < 2){ r1 = x; g1 = c; }
+    else if (hp < 3){ g1 = c; b1 = x; }
+    else if (hp < 4){ g1 = x; b1 = c; }
+    else if (hp < 5){ r1 = x; b1 = c; }
+    else { r1 = c; b1 = x; }
+    const m = l - c/2;
+    return {
+      r: Math.round(255 * (r1 + m)),
+      g: Math.round(255 * (g1 + m)),
+      b: Math.round(255 * (b1 + m))
+    };
+  }
+
+  function kdeCircularDensity(angles, samples, sigma){
+    const dens = new Array(samples).fill(0);
+    const inv2 = 1 / (2 * sigma * sigma);
+    let max = 0;
+    for (let i=0; i<samples; i++){
+      const ang = TAU * i / samples;
+      let sum = 0;
+      for (const a of angles){
+        const d = angleDelta(ang, a);
+        sum += Math.exp(-d*d*inv2);
+      }
+      dens[i] = sum;
+      if (sum > max) max = sum;
+    }
+    if (max > 0){
+      for (let i=0; i<dens.length; i++) dens[i] /= max;
+    }
+    return dens;
+  }
+
+  // ---------- RNG ----------
+  function randn(){
+    const u1 = Math.max(1e-12, Math.random());
+    const u2 = Math.random();
+    return Math.sqrt(-2*Math.log(u1))*Math.cos(TAU*u2);
+  }
+  function randn2(){ return {x: randn(), y: randn()}; }
+
+  // ---------- Gamma (Lanczos) ----------
+  // Good enough for real arguments used here.
+  function gamma(z){
+    const p = [
+      0.99999999999980993,
+      676.5203681218851,
+      -1259.1392167224028,
+      771.32342877765313,
+      -176.61502916214059,
+      12.507343278686905,
+      -0.13857109526572012,
+      9.9843695780195716e-6,
+      1.5056327351493116e-7
+    ];
+    const g = 7;
+    if (z < 0.5){
+      // reflection formula
+      return Math.PI / (Math.sin(Math.PI*z) * gamma(1 - z));
+    }
+    z -= 1;
+    let x = p[0];
+    for (let i=1; i<p.length; i++){
+      x += p[i] / (z + i);
+    }
+    const t = z + g + 0.5;
+    return Math.sqrt(2*Math.PI) * Math.pow(t, z + 0.5) * Math.exp(-t) * x;
+  }
+
+  // ---------- 2F1(1,b;c;u) for |u|<1 via series ----------
+  // Since (1)_n = n!, the coefficient simplifies:
+  // 2F1(1,b;c;u) = sum_{n>=0} (b)_n/(c)_n * u^n.
+  function hyp2f1_1b_c_u(b, c, u){
+    // stable for u in [0, 0.9999...] with moderate iterations
+    const maxN = 2500;
+    const tol = 1e-12;
+    let term = 1.0;
+    let sum = 1.0;
+    for (let n=0; n<maxN; n++){
+      const num = (b + n);
+      const den = (c + n);
+      term *= (num/den) * u;
+      sum += term;
+      if (Math.abs(term) < tol*Math.abs(sum)) break;
+    }
+    return sum;
+  }
+
+  // Closed form at u=1 when Re(c-a-b)>0:
+  // 2F1(a,b;c;1)= Γ(c)Γ(c-a-b)/(Γ(c-a)Γ(c-b)).
+  // Here a=1 -> c-a = c-1, c-a-b = c-1-b.
+  function hyp2f1_1b_c_1(b, c){
+    const num = gamma(c) * gamma(c - 1 - b);
+    const den = gamma(c - 1) * gamma(c - b);
+    return num / den;
+  }
+
+  // LMS continuum shrink: f_d(r) = F(1,1-d/2;1+d/2;r^2) / F(1,1-d/2;1+d/2;1)
+  function fShrink(d, r){
+    const u = Math.min(0.999999999, r*r);
+    const b = 1 - d/2;
+    const c = 1 + d/2;
+    if (Math.abs(b) < 1e-12) return 1.0; // d=2
+    const Fu = hyp2f1_1b_c_u(b, c, u);
+    const F1 = hyp2f1_1b_c_1(b, c);
+    return Fu / F1;
+  }
+
+  // ---------- Möbius action on disk boundary (complex formula, 2D) ----------
+  // M_w(x) = (w + x) / (1 + conj(w) x), for |x|=1.
+  function mobius(w, x){
+    const a = w.x, b = w.y;
+    const u = x.x, v = x.y;
+
+    // numerator: (a+u) + i(b+v)
+    const nr = a + u;
+    const ni = b + v;
+
+    // conj(w)*x = (a - ib)(u + iv) = (au + bv) + i(av - bu)
+    const cr = a*u + b*v;
+    const ci = a*v - b*u;
+
+    // denom: 1 + cr + i ci
+    const dr = 1 + cr;
+    const di = ci;
+
+    const denom2 = dr*dr + di*di;
+
+    // (nr + i ni) / (dr + i di) = ( (nr+ini)(dr-idi) )/|d|^2
+    const rr = (nr*dr + ni*di)/denom2;
+    const ri = (ni*dr - nr*di)/denom2;
+
+    // should lie on unit circle (numerical drift possible)
+    const s = 1/Math.max(EPS, Math.hypot(rr, ri));
+    return {x: rr*s, y: ri*s};
+  }
+
+  // ---------- LMS reduced dynamics (2D visualization) ----------
+  // Variables:
+  //  - w ∈ B^2 (body center)
+  //  - ζ ∈ SO(2) (angle φ)
+  //  - z := - ζ w (constraint)
+  //  - Z(z) := K f_d(|z|) z
+  //
+  // Equations (LMS 5a, 5b with A=ωJ):
+  //  wdot = -(1/2)(1-|w|^2) ζ^{-1} Z(z)
+  //  φdot = ω - cross(ζ w, Z(z))      (since α(y1,y2)=cross(y1,y2)J in 2D)
+  //
+  // Time warp: multiply wdot by (1-|w|)^{-p} to get faster boundary approach.
+  function warpFactor(r, p){
+    const u = Math.max(1e-3, 1 - r);
+    return Math.pow(u, -p);
+  }
+
+  // ---------- canvas ----------
+  const wrap = document.getElementById("wrap");
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const metricsWrap = document.getElementById("metricsWrap");
+  const metricsCanvas = document.getElementById("metricsCanvas");
+  const metricsCtx = metricsCanvas.getContext("2d");
+
+  function geom(){
+    const w = wrap.getBoundingClientRect().width;
+    const h = wrap.getBoundingClientRect().height;
+    const pad = 20;
+    const R = Math.min(w,h)/2 - pad;
+    return {w,h,R,cx:w/2,cy:h/2};
+  }
+  function diskToPx(v){
+    const {R,cx,cy}=geom();
+    return {x: cx + v.x*R, y: cy - v.y*R};
+  }
+  function pxToDisk(p){
+    const {R,cx,cy}=geom();
+    return {x: (p.x-cx)/R, y: (cy-p.y)/R};
+  }
+  function pointerPos(ev){
+    const r = wrap.getBoundingClientRect();
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top;
+    return {x,y};
+  }
+
+  function resize(){
+    const rect = wrap.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width  = Math.round(rect.width  * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  function resizeMetrics(){
+    const rect = metricsWrap.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    metricsCanvas.width = Math.round(rect.width * dpr);
+    metricsCanvas.height = Math.round(rect.height * dpr);
+    metricsCtx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("resize", resizeMetrics);
+  resize();
+  resizeMetrics();
+
+  function drawDiskBoundary(){
+    const {w,h,R,cx,cy} = geom();
+    ctx.save();
+    ctx.clearRect(0,0,w,h);
+    ctx.lineWidth = 2.2;
+    ctx.strokeStyle = "#000";
+    ctx.beginPath();
+    ctx.arc(cx,cy,R,0,TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawPoint(v, rPx, fillStyle, strokeStyle=null){
+    const p = diskToPx(v);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,rPx,0,TAU);
+    if (strokeStyle){
+      ctx.fillStyle = fillStyle;
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = 2.2;
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = fillStyle;
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  function drawRing(v, rPx){
+    const p = diskToPx(v);
+    ctx.save();
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,rPx,0,TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---------- UI ----------
+  const statD = document.getElementById("statD");
+  const statK = document.getElementById("statK");
+  const statOmega = document.getElementById("statOmega");
+  const statW = document.getElementById("statW");
+  const statZ = document.getElementById("statZ");
+  const statFd = document.getElementById("statFd");
+  const statZnorm = document.getElementById("statZnorm");
+  const statWarp = document.getElementById("statWarp");
+  const statSNR = document.getElementById("statSNR");
+
+  const toggleRun = document.getElementById("toggleRun");
+  const toggleNoise = document.getElementById("toggleNoise");
+  const toggleRay = document.getElementById("toggleRay");
+  const toggleCenters = document.getElementById("toggleCenters");
+  const toggleOscTicks = document.getElementById("toggleOscTicks");
+  const toggleDensity = document.getElementById("toggleDensity");
+  const toggleFlow = document.getElementById("toggleFlow");
+
+  const sliderN = document.getElementById("sliderN");
+  const sliderRho = document.getElementById("sliderRho");
+  const sliderD = document.getElementById("sliderD");
+  const sliderK = document.getElementById("sliderK");
+  const sliderOmega = document.getElementById("sliderOmega");
+  const sliderWarp = document.getElementById("sliderWarp");
+  const sliderSNR = document.getElementById("sliderSNR");
+
+  const valN = document.getElementById("valN");
+  const valRho = document.getElementById("valRho");
+  const valD = document.getElementById("valD");
+  const valK = document.getElementById("valK");
+  const valOmega = document.getElementById("valOmega");
+  const valWarp = document.getElementById("valWarp");
+  const valSNR = document.getElementById("valSNR");
+
+  const btnReset = document.getElementById("btnReset");
+  const btnKick = document.getElementById("btnKick");
+
+  function setText(el, text){ if (el) el.textContent = text; }
+
+  const viz = { run:true, noise:true, ray:true, centers:true, oscTicks:true, heat:true, flow:true };
+  function syncToggles(){
+    viz.run = !!toggleRun.checked;
+    viz.noise = !!toggleNoise.checked;
+    viz.ray = !!toggleRay.checked;
+    viz.centers = !!toggleCenters.checked;
+    viz.oscTicks = !!toggleOscTicks.checked;
+    viz.heat = !!toggleDensity.checked;
+    viz.flow = !!toggleFlow.checked;
+  }
+  [toggleRun,toggleNoise,toggleRay,toggleCenters,toggleOscTicks,toggleDensity,toggleFlow].forEach(el=>{
+    el.addEventListener("change", syncToggles);
+  });
+  syncToggles();
+
+  const ctrl = {
+    n: parseInt(sliderN.value,10),
+    d: parseInt(sliderD.value,10),
+    K: parseFloat(sliderK.value),
+    omega: parseFloat(sliderOmega.value),
+    warpP: parseFloat(sliderWarp.value),
+    snr: parseFloat(sliderSNR.value),
+  };
+  function syncSliders(){
+    const nextN = parseInt(sliderN.value,10);
+    if (nextN !== ctrl.n){
+      ctrl.n = nextN;
+      setOscillatorCount(ctrl.n);
+    }
+    ctrl.d = parseInt(sliderD.value,10);
+    ctrl.K = parseFloat(sliderK.value);
+    ctrl.omega = parseFloat(sliderOmega.value);
+    ctrl.warpP = parseFloat(sliderWarp.value);
+    ctrl.snr = parseFloat(sliderSNR.value);
+
+    setText(valN, `${ctrl.n}`);
+    setText(valD, `${ctrl.d}`);
+    setText(valK, ctrl.K.toFixed(2));
+    setText(valOmega, ctrl.omega.toFixed(2));
+    setText(valWarp, ctrl.warpP.toFixed(2));
+    setText(valSNR, ctrl.snr.toFixed(1));
+  }
+  [sliderN,sliderD,sliderK,sliderOmega,sliderWarp,sliderSNR].forEach(el=>{
+    el.addEventListener("input", syncSliders);
+  });
+  syncSliders();
+
+  // ---------- State: boundary "direction at infinity" and initial radius ----------
+  let theta = 0.45;  // boundary direction
+  let rho = parseFloat(sliderRho.value);    // initial radius along ray
+
+  function syncRhoSlider(){
+    rho = parseFloat(sliderRho.value);
+    setText(valRho, rho.toFixed(2));
+    if (!dragging){
+      w = initWFromControls();
+    }
+  }
+  function updateRhoSlider(){
+    const rVal = Math.max(0.02, Math.min(0.98, rho));
+    sliderRho.value = rVal.toFixed(2);
+    setText(valRho, rVal.toFixed(2));
+  }
+  sliderRho.addEventListener("input", syncRhoSlider);
+  updateRhoSlider();
+
+  function zetaInf(){ return {x: Math.cos(theta), y: Math.sin(theta)}; }
+  function initWFromControls(){
+    // put w on the ray toward zetaInf (body frame)
+    return clampToDisk(scale(unit(zetaInf()), rho), 0.98);
+  }
+
+  // reduced variables
+  let w = initWFromControls();
+  let phi = 0.0; // ζ ∈ SO(2)
+
+  // base points p_i on the boundary (body-frame labels)
+  let N = ctrl.n;
+  let base = [];
+  let prevAngles = [];
+  function setOscillatorCount(n){
+    N = Math.max(4, n);
+    base = Array.from({length:N}, (_,i)=>{
+      const a = TAU*i/N;
+      return {x: Math.cos(a), y: Math.sin(a)};
+    });
+    prevAngles = new Array(N).fill(null);
+  }
+  setOscillatorCount(N);
+  const oscStyle = {
+    tickGap: 2.0,
+    tickLength: 9.0,
+    dotOffset: 12.0,
+    dotRadius: 3.1,
+    heatSamples: 360,
+    heatSigma: 0.36,
+    heatRes: 140,
+    heatAlpha: 0.9,
+    heatSat: 0.70,
+    heatLight: 0.52,
+    heatGamma: 0.75,
+    heatFloor: 0.22,
+    flowInset: 7.0,
+    flowMin: 2.5,
+    flowMax: 10.0,
+    flowScale: 0.12
+  };
+  const heat = {
+    res: oscStyle.heatRes,
+    canvas: document.createElement("canvas"),
+    ctx: null,
+    image: null,
+    radial: new Array(oscStyle.heatRes).fill(1),
+    lastD: null
+  };
+  heat.canvas.width = heat.res;
+  heat.canvas.height = heat.res;
+  heat.ctx = heat.canvas.getContext("2d");
+  heat.image = heat.ctx.createImageData(heat.res, heat.res);
+
+  const metricsStyle = {
+    pad: 12,
+    gap: 16,
+    grid: "rgba(0,0,0,0.08)",
+    text: "rgba(0,0,0,0.62)",
+    rColor: "rgba(20,60,90,0.9)",
+    wColor: "rgba(10,120,80,0.85)"
+  };
+  const history = {
+    len: 420,
+    idx: 0,
+    filled: false,
+    R: new Array(420).fill(0),
+    W: new Array(420).fill(0)
+  };
+  function resetHistory(){
+    history.idx = 0;
+    history.filled = false;
+    history.R.fill(0);
+    history.W.fill(0);
+  }
+  function pushHistory(rVal, wVal){
+    history.R[history.idx] = rVal;
+    history.W[history.idx] = wVal;
+    history.idx = (history.idx + 1) % history.len;
+    if (history.idx === 0) history.filled = true;
+  }
+  function historyCount(){
+    return history.filled ? history.len : history.idx;
+  }
+  function historyValue(arr, i){
+    if (!history.filled) return arr[i];
+    const idx = (history.idx + i) % history.len;
+    return arr[idx];
+  }
+  function drawMetrics(currentR, currentW){
+    const rect = metricsWrap.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    metricsCtx.clearRect(0,0,w,h);
+
+    const pad = metricsStyle.pad;
+    const gap = metricsStyle.gap;
+    const chartW = Math.max(1, w - pad * 2);
+    const chartH = Math.max(1, (h - pad * 2 - gap) / 2);
+    const count = historyCount();
+
+    function drawChart(y0, label, data, color, current){
+      metricsCtx.save();
+      metricsCtx.strokeStyle = metricsStyle.grid;
+      metricsCtx.lineWidth = 1;
+      metricsCtx.beginPath();
+      metricsCtx.moveTo(pad, y0 + chartH);
+      metricsCtx.lineTo(pad + chartW, y0 + chartH);
+      metricsCtx.stroke();
+
+      metricsCtx.fillStyle = metricsStyle.text;
+      metricsCtx.font = "12px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+      metricsCtx.textBaseline = "top";
+      metricsCtx.fillText(label, pad, y0 + 2);
+
+      if (count > 1){
+        metricsCtx.strokeStyle = color;
+        metricsCtx.lineWidth = 1.6;
+        metricsCtx.beginPath();
+        for (let i=0; i<count; i++){
+          const v = Math.max(0, Math.min(1, historyValue(data, i)));
+          const x = pad + (chartW * i / (count - 1));
+          const y = y0 + chartH * (1 - v);
+          if (i === 0) metricsCtx.moveTo(x, y);
+          else metricsCtx.lineTo(x, y);
+        }
+        metricsCtx.stroke();
+      }
+
+      const cur = Math.max(0, Math.min(1, current));
+      const cx = pad + chartW;
+      const cy = y0 + chartH * (1 - cur);
+      metricsCtx.fillStyle = color;
+      metricsCtx.beginPath();
+      metricsCtx.arc(cx, cy, 3.2, 0, TAU);
+      metricsCtx.fill();
+      metricsCtx.restore();
+    }
+
+    drawChart(pad, "R(t)", history.R, metricsStyle.rColor, currentR);
+    drawChart(pad + chartH + gap, "|w(t)|", history.W, metricsStyle.wColor, currentW);
+  }
+
+  function updateHeatRadial(d){
+    heat.lastD = d;
+    let max = 0;
+    for (let i=0; i<heat.radial.length; i++){
+      const r = i / (heat.radial.length - 1);
+      const v = fShrink(d, r);
+      heat.radial[i] = v;
+      if (v > max) max = v;
+    }
+    if (max > 0){
+      for (let i=0; i<heat.radial.length; i++){
+        heat.radial[i] /= max;
+      }
+    }
+  }
+
+  function renderHeatmap(angles, d){
+    if (heat.lastD !== d) updateHeatRadial(d);
+    const dens = kdeCircularDensity(angles, oscStyle.heatSamples, oscStyle.heatSigma);
+    const data = heat.image.data;
+    const res = heat.res;
+    for (let j=0; j<res; j++){
+      const y = 1 - 2 * j / (res - 1);
+      for (let i=0; i<res; i++){
+        const x = 2 * i / (res - 1) - 1;
+        const r = Math.hypot(x, y);
+        const idx = (j * res + i) * 4;
+        if (r > 1){
+          data[idx + 3] = 0;
+          continue;
+        }
+        const ang = Math.atan2(y, x);
+        let sIdx = Math.floor(((ang + Math.PI) / TAU) * oscStyle.heatSamples);
+        if (sIdx >= oscStyle.heatSamples) sIdx = 0;
+        const densVal = dens[sIdx];
+        const rIdx = Math.min(heat.radial.length - 1, Math.floor(r * (heat.radial.length - 1)));
+        const radial = heat.radial[rIdx];
+        const intensity = Math.pow(densVal, oscStyle.heatGamma) * (oscStyle.heatFloor + (1 - oscStyle.heatFloor) * radial);
+        if (intensity <= 0.001){
+          data[idx + 3] = 0;
+          continue;
+        }
+        const hue = (ang + Math.PI) / TAU * 360;
+        const rgb = hslToRgb(hue, oscStyle.heatSat, oscStyle.heatLight);
+        data[idx] = rgb.r;
+        data[idx + 1] = rgb.g;
+        data[idx + 2] = rgb.b;
+        data[idx + 3] = Math.round(255 * Math.min(1, intensity * oscStyle.heatAlpha));
+      }
+    }
+    heat.ctx.putImageData(heat.image, 0, 0);
+  }
+
+  // ---------- Interaction: drag boundary ζ∞ or drag r point ----------
+  let dragging = null; // "zeta" | "rho" | null
+  function hitTest(ptPx){
+    const dir = unit(zetaInf());
+    const zH = scale(dir, 0.999);
+    const rH = scale(dir, rho);
+    const zPx = diskToPx(zH);
+    const rPx = diskToPx(rH);
+    const dz = Math.hypot(ptPx.x-zPx.x, ptPx.y-zPx.y);
+    const dr = Math.hypot(ptPx.x-rPx.x, ptPx.y-rPx.y);
+    const hitR = 18;
+    if (dz < hitR) return "zeta";
+    if (dr < hitR) return "rho";
+    return null;
+  }
+  function setZetaFromPointer(ptPx){
+    const v = pxToDisk(ptPx);
+    theta = Math.atan2(v.y, v.x);
+  }
+  function setRhoFromPointer(ptPx){
+    const v = pxToDisk(ptPx);
+    const d = unit(zetaInf());
+    rho = Math.max(0.02, Math.min(0.98, dot(v, d)));
+    updateRhoSlider();
+  }
+
+  wrap.addEventListener("mousedown", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "zeta") setZetaFromPointer(p);
+    if (dragging === "rho") setRhoFromPointer(p);
+    e.preventDefault();
+  });
+  window.addEventListener("mouseup", ()=> dragging=null);
+
+  wrap.addEventListener("touchstart", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchmove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "zeta") setZetaFromPointer(p);
+    if (dragging === "rho") setRhoFromPointer(p);
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchend", ()=> dragging=null);
+
+  // ---------- Buttons ----------
+  btnReset.addEventListener("click", ()=>{
+    w = initWFromControls();
+    phi = 0.0;
+    resetHistory();
+  });
+  btnKick.addEventListener("click", ()=>{
+    const kick = scale(randn2(), 0.10);
+    w = clampToDisk(add(w, kick), 0.98);
+    phi += 0.8*randn();
+  });
+
+  // ---------- Simulation ----------
+  const DT = 0.012;
+
+  function step(){
+    syncSliders();
+    syncToggles();
+
+    // enforce w direction from controls if user is actively dragging (optional feel)
+    if (dragging){
+      w = initWFromControls();
+    }
+
+    // constraint: z = -ζ w
+    const z = scale(rot(w, phi), -1);
+
+    // order parameter: Z(z)=K f_d(|z|) z
+    const rZ = norm(z);
+    const fd = fShrink(ctrl.d, rZ);
+    const Z = scale(z, ctrl.K * fd);
+
+    // wdot = -(1/2)(1-|w|^2) ζ^{-1} Z
+    const oneMinus = Math.max(1e-9, 1 - norm2(w));
+    const Zbody = rot(Z, -phi);
+    let wdot = scale(Zbody, -0.5*oneMinus);
+
+    // time warp (pure visualization / finite-time-ish boundary approach)
+    wdot = scale(wdot, warpFactor(norm(w), ctrl.warpP));
+
+    // noise in tangent approximation (Euclidean)
+    if (viz.noise){
+      const driftMag = Math.max(1e-6, norm(wdot));
+      const sigma = driftMag / Math.max(0.5, ctrl.snr) + 0.0015;
+      const dW = scale(randn2(), sigma * Math.sqrt(DT));
+      w = add(w, add(scale(wdot, DT), dW));
+    } else {
+      w = add(w, scale(wdot, DT));
+    }
+    w = clampToDisk(w, 0.999995);
+
+    // φdot = ω - cross(ζ w, Z)
+    // (ζ w = rot(w,phi))
+    const zetaW = rot(w, phi);
+    const precess = cross(zetaW, Z);
+    phi += (ctrl.omega - precess) * DT;
+
+    // wrap phi for numerical hygiene
+    if (phi > Math.PI) phi -= TAU;
+    if (phi < -Math.PI) phi += TAU;
+
+    // update stats
+    setText(statD, `${ctrl.d}`);
+    setText(statK, ctrl.K.toFixed(2));
+    setText(statOmega, ctrl.omega.toFixed(2));
+    setText(statW, norm(w).toFixed(4));
+    setText(statZ, norm(z).toFixed(4));
+    setText(statFd, fd.toFixed(4));
+    setText(statZnorm, (norm(Z)/Math.max(1e-9, ctrl.K)).toFixed(4));
+    setText(statWarp, ctrl.warpP.toFixed(2));
+    setText(statSNR, ctrl.snr.toFixed(1));
+
+    // draw
+    draw(z, Z, fd);
+  }
+
+  function draw(z, Z, fd){
+    const {w:W,h:H,R,cx,cy} = geom();
+    drawDiskBoundary();
+
+    const oscDirs = [];
+    const oscAngles = [];
+    let sumX = 0;
+    let sumY = 0;
+    for (const p of base){
+      const mw = mobius(w, p);
+      const y = rot(mw, phi);
+      const u = unit(y);
+      oscDirs.push(u);
+      oscAngles.push(Math.atan2(u.y, u.x));
+      sumX += u.x;
+      sumY += u.y;
+    }
+    const orderR = oscDirs.length ? Math.hypot(sumX, sumY) / oscDirs.length : 0;
+
+    // clip inside disk for inner cues
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx,cy,R-0.5,0,TAU);
+    ctx.clip();
+
+    if (viz.heat){
+      renderHeatmap(oscAngles, ctrl.d);
+      ctx.save();
+      ctx.globalAlpha = 0.95;
+      ctx.drawImage(heat.canvas, cx - R, cy - R, 2 * R, 2 * R);
+      ctx.restore();
+    }
+
+    if (viz.flow){
+      ctx.save();
+      ctx.lineWidth = 1.2;
+      ctx.lineCap = "round";
+      const flowR = R - oscStyle.flowInset;
+      for (let i=0; i<oscDirs.length; i++){
+        const prev = prevAngles[i];
+        if (prev === null) continue;
+        const delta = angleDelta(oscAngles[i], prev);
+        const speed = Math.min(1, Math.abs(delta) / oscStyle.flowScale);
+        if (speed < 0.05) continue;
+        const sign = delta >= 0 ? 1 : -1;
+        const dir = oscDirs[i];
+        const tan = scale(perp(dir), sign);
+        const len = oscStyle.flowMin + oscStyle.flowMax * speed;
+        const mid = {x: cx + dir.x * flowR, y: cy - dir.y * flowR};
+        const dx = tan.x * len * 0.5;
+        const dy = -tan.y * len * 0.5;
+        ctx.strokeStyle = `rgba(0,0,0,${0.15 + 0.55 * speed})`;
+        ctx.beginPath();
+        ctx.moveTo(mid.x - dx, mid.y - dy);
+        ctx.lineTo(mid.x + dx, mid.y + dy);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // dashed ray + handles
+    const dir = unit(zetaInf());
+    if (viz.ray){
+      ctx.save();
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 2.0;
+      ctx.setLineDash([6,6]);
+      const p0 = diskToPx({x:0,y:0});
+      const p1 = diskToPx(scale(dir, 0.999));
+      ctx.beginPath();
+      ctx.moveTo(p0.x,p0.y);
+      ctx.lineTo(p1.x,p1.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // show an order-parameter arrow direction (scaled, purely visual)
+    const Zdir = unit(Z);
+    const Ztip = add({x:0,y:0}, scale(Zdir, Math.min(0.55, 0.12 + 0.45*norm(Z)/(Math.max(1e-9, norm(z))*Math.max(1e-9, fd)*Math.max(1e-9, ctrl.K) + 1e-9))));
+    ctx.save();
+    ctx.strokeStyle = "#000";
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 2.0;
+    ctx.beginPath();
+    const a0 = diskToPx({x:0,y:0});
+    const a1 = diskToPx(Ztip);
+    ctx.moveTo(a0.x,a0.y);
+    ctx.lineTo(a1.x,a1.y);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.restore(); // end clip
+
+    if (viz.oscTicks){
+      ctx.save();
+      ctx.lineWidth = 1.2;
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(0,0,0,0.40)";
+      ctx.fillStyle = "#000";
+      ctx.globalAlpha = 0.75;
+      const startR = R + oscStyle.tickGap;
+      const endR = R + oscStyle.tickGap + oscStyle.tickLength;
+      const dotR = R + oscStyle.dotOffset;
+      for (const u of oscDirs){
+        const p0 = {x: cx + u.x * startR, y: cy - u.y * startR};
+        const p1 = {x: cx + u.x * endR, y: cy - u.y * endR};
+        ctx.beginPath();
+        ctx.moveTo(p0.x,p0.y);
+        ctx.lineTo(p1.x,p1.y);
+        ctx.stroke();
+
+        const dp = {x: cx + u.x * dotR, y: cy - u.y * dotR};
+        ctx.beginPath();
+        ctx.arc(dp.x, dp.y, oscStyle.dotRadius, 0, TAU);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    for (let i=0; i<oscAngles.length; i++) prevAngles[i] = oscAngles[i];
+
+    if (viz.run){
+      pushHistory(orderR, norm(w));
+    }
+    drawMetrics(orderR, norm(w));
+
+    // boundary and rho handles
+    if (viz.ray){
+      drawPoint(scale(dir, 0.999), 9, "#000");    // ζ∞ handle
+      drawPoint(scale(dir, rho), 7.8, "#000");    // r handle
+    }
+
+    // centers: w and z
+    if (viz.centers){
+      drawPoint(w, 7.5, "#000");         // w (filled)
+      drawPoint(z, 7.0, "#fff", "#000"); // z (ringed)
+    }
+
+    // labels
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.textBaseline = "middle";
+
+    if (viz.ray){
+      const zPx = diskToPx(scale(dir, 0.999));
+      const rPx = diskToPx(scale(dir, rho));
+      ctx.font = "italic 22px Georgia, Times, serif";
+      ctx.fillText("ζ∞", zPx.x + 14, zPx.y - 14);
+      ctx.fillText("r",  rPx.x + 14, rPx.y + 14);
+    }
+
+    if (viz.centers){
+      const wPx = diskToPx(w);
+      const zcPx = diskToPx(z);
+      ctx.font = "italic 18px Georgia, Times, serif";
+      ctx.fillText("w", wPx.x + 12, wPx.y + 14);
+      ctx.fillText("z", zcPx.x + 12, zcPx.y + 14);
+    }
+
+    ctx.restore();
+  }
+
+  // ---------- animation loop ----------
+  function tick(){
+    if (viz.run) step();
+    else {
+      // draw frozen frame
+      const z = scale(rot(w, phi), -1);
+      const fd = fShrink(ctrl.d, norm(z));
+      const Z = scale(z, ctrl.K * fd);
+      draw(z, Z, fd);
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+})();
+</script>
+
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script>
+  window.addEventListener("DOMContentLoaded", () => {
+    if (!window.renderMathInElement) return;
+    window.renderMathInElement(document.body, {
+      delimiters: [
+        {left: "\\(", right: "\\)", display: false},
+        {left: "\\[", right: "\\]", display: true},
+        {left: "$", right: "$", display: false},
+        {left: "$$", right: "$$", display: true},
+      ],
+    });
+  });
+</script>
+</body>
+</html>

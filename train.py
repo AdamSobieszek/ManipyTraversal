@@ -62,7 +62,7 @@ def main():
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
     parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
-    parser.add_argument('--only-potential', action='store_true', help="only train potential")
+    parser.add_argument('--only-potential', type=bool, default=True, help="only train potential")
     parser.add_argument('--kanpde', action='store_true', help="use KanPDE")
 
     # === Reconstructor (R) ========================================================================================== #
@@ -77,7 +77,7 @@ def main():
     parser.add_argument('--accumulate-grad-steps', type=int, default=1, help="set number of steps to accumulate gradients")
     parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
     parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
-    parser.add_argument('--lambda-reg', type=float, default=1.0, help="regression loss weight")
+    parser.add_argument('--lambda-reg', type=float, default=.0, help="regression loss weight")
     parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
@@ -89,14 +89,6 @@ def main():
     parser.add_argument('--reset_schedulers', action='store_true', help="reset schedulers")
     parser.add_argument('--reset_start_iter', action='store_true', help="reset start iteration")
 
-    # === Device ===================================================================================================== #
-    parser.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA during training")
-    parser.add_argument('--no-cuda', dest='cuda', action='store_false', help="do NOT use CUDA during training")
-    parser.add_argument('--mps', dest='mps', action='store_true', help="use Apple Metal (MPS) backend")
-    parser.add_argument('--no-mps', dest='mps', action='store_false', help="do NOT use MPS backend")
-    parser.set_defaults(cuda=True, mps=False)
-    # ================================================================================================================ #
-
     # Parse given arguments
     args = parser.parse_args()
 
@@ -107,17 +99,8 @@ def main():
     cuda_available = torch.cuda.is_available()
     mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
 
-    if args.cuda and not cuda_available:
-        print("*** WARNING ***: CUDA was requested but is not available. Falling back to CPU/MPS.\n"
-              "                 On Apple Silicon, try --mps if supported by your PyTorch build.")
-    if args.mps and not mps_available:
-        print("*** WARNING ***: MPS was requested but is not available. Falling back to CPU/CUDA.")
-    if cuda_available and not args.cuda:
-        print("*** WARNING ***: It looks like you have a CUDA device, but aren't using CUDA.\n"
-              "                 Run with --cuda for optimal training speed.")
-
-    use_cuda = args.cuda and cuda_available
-    use_mps = args.mps and mps_available
+    use_cuda = cuda_available
+    use_mps = mps_available
     device = torch.device('cuda' if use_cuda else ('mps' if use_mps else 'cpu'))
 
     # Set default tensor type for CUDA only (no MPS default tensor type exists)
@@ -206,9 +189,9 @@ def main():
     print("#. Experiment: {}".format(exp_dir))
     print("  \\__Only train potential: {}".format(args.only_potential))
     if args.only_potential:
-        trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu)
+        trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
     else:
-        trn = Trainer(params=args, exp_dir=exp_dir, device=device, use_cuda=use_cuda, use_mps=use_mps, multi_gpu=multi_gpu)
+        trn = Trainer(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
     trn.train(generator=G, support_sets=S, reconstructor=R)

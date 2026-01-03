@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Two-tonal Diffusion Cone: Euclidean vs Hyperbolic (Poincaré)</title>
+  <style>
+    :root { --size: 920px; }
+    body{
+      margin:0; min-height:100vh; display:grid; place-items:center; background:#fff;
+      font-family: Georgia, "Times New Roman", Times, serif;
+    }
+    .wrap{
+      position:relative; width:min(var(--size),94vw); aspect-ratio: 16/9;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto 1fr auto;
+      padding: 14px 18px;
+    }
+    .top{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap: 18px;
+    }
+    .title{
+      font-size: clamp(16px, 2.0vw, 26px);
+      line-height: 1.15;
+    }
+    .subtitle{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      opacity: 0.8;
+      margin-top: 6px;
+    }
+    .info{
+      pointer-events:none;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      line-height: 1.28;
+      color: rgba(0,0,0,0.84);
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      min-width: 280px;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      align-self: flex-start;
+    }
+    .row{ display:flex; justify-content:space-between; gap: 14px; white-space:nowrap; }
+    .k{ color: rgba(0,0,0,0.62); }
+    .v{ font-variant-numeric: tabular-nums; }
+    .bottomHint{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      opacity: 0.85;
+      justify-self:center;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap" id="wrap">
+    <canvas id="c"></canvas>
+
+    <div class="overlay">
+      <div class="top">
+        <div>
+          <div class="title">
+            Euclidean (left) vs Hyperbolic/Poincaré (right): same drifting “cone diffusion”
+          </div>
+          <div class="subtitle">
+            Drag the black seed point. Drag the two small “sensor knobs” on the <b>left</b> circles to set two snapshot times.
+          </div>
+        </div>
+        <div class="info" id="info"></div>
+      </div>
+      <div></div>
+      <div class="bottomHint">
+        Hyperbolic visible radius collapses near the boundary because the metric scale factor is (1‒r²)/2.
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // --------------------------------------------
+  // Math + geometry helpers
+  // --------------------------------------------
+  const EPS = 1e-10;
+  const TAU = Math.PI * 2;
+  const MAX_ATANH = 0.999999999;
+
+  const add = (a,b)=>({x:a.x+b.x, y:a.y+b.y});
+  const sub = (a,b)=>({x:a.x-b.x, y:a.y-b.y});
+  const scale = (v,s)=>({x:v.x*s, y:v.y*s});
+  const dot = (a,b)=>a.x*b.x + a.y*b.y;
+  const norm2 = (v)=>v.x*v.x + v.y*v.y;
+  const norm = (v)=>Math.hypot(v.x,v.y);
+  const unit = (v)=>{ const r=norm(v); return r<EPS?{x:1,y:0}:scale(v,1/r); };
+
+  function clampToDisk(v, maxR=0.999){
+    const r = norm(v);
+    return (r <= maxR) ? v : scale(v, maxR/r);
+  }
+
+  function atanh(x){ return 0.5*Math.log((1+x)/(1-x)); }
+
+  // Hyperbolic radius from 0: ρ=2 atanh(r)
+  function hypRadiusFromEuclid(r){
+    const rr = Math.min(MAX_ATANH, Math.max(0, r));
+    return 2 * atanh(rr);
+  }
+  function euclidRadiusFromHyp(rho){
+    return Math.tanh(rho/2);
+  }
+
+  // --------------------------------------------
+  // Model: "drifting mean to boundary" + widening covariance
+  // --------------------------------------------
+  // Seed point X0 (in disk coordinates). This sets the ray direction ζ = X0/||X0||.
+  let X0 = clampToDisk({x: 0.46, y: 0.18});
+
+  // Two snapshot times (hyperbolic-time-like parameter).
+  // These control (i) mean moving outward, (ii) hyperbolic sigma(t) and thus visible radius.
+  let t1 = 0.55;
+  let t2 = 1.25;
+
+  // Drift speed along the ray in hyperbolic arclength per unit time.
+  const driftSpeed = 1.20;
+
+  // "Cone diffusion" law: sigma_H(t) ~ t (so covariance ~ t^2).
+  // (If you want Brownian instead, change to Math.sqrt(t).)
+  function sigmaH(t){ return t; }
+
+  // Scale factor mapping sigma_H to a drawn radius in hyperbolic distance units.
+  // Bigger -> thicker circles.
+  const radiusScale = 0.35;
+
+  // Mean trajectory:
+  // Start at X0, move along the same ray to the boundary by increasing hyperbolic radius.
+  function meanAtTime(t){
+    const r0 = norm(X0);
+    const zeta = unit(X0);
+    const rho0 = hypRadiusFromEuclid(r0);
+    const rho = rho0 + driftSpeed * t;
+    const r = euclidRadiusFromHyp(rho);
+    return scale(zeta, Math.min(0.999, r));
+  }
+
+  // Visible Euclidean radius for a hyperbolic isotropic circle of radius ~ (radiusScale*sigmaH(t))
+  // around a point at Euclidean radius r = ||center||:
+  //   sigma_E ≈ sigma_H / λ(x) = sigma_H * (1-r^2)/2
+  function visibleHyperRadius(center, t){
+    const r2 = norm2(center);
+    const shrink = (1 - r2) / 2;                 // (1 - ||x||^2)/2
+    return radiusScale * sigmaH(t) * shrink;
+  }
+
+  // Euclidean panel radius (flat): same sigma law but no hyperbolic shrink.
+  function euclidRadiusFlat(t){
+    return radiusScale * sigmaH(t);
+  }
+
+  // --------------------------------------------
+  // Canvas + layout
+  // --------------------------------------------
+  const wrap = document.getElementById("wrap");
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  function resize(){
+    const rect = wrap.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    draw();
+  }
+  window.addEventListener("resize", resize);
+
+  function layout(){
+    const w = wrap.getBoundingClientRect().width;
+    const h = wrap.getBoundingClientRect().height;
+
+    const pad = 18;
+    const gap = 18;
+
+    // panels are side-by-side
+    const pw = (w - 2*pad - gap) / 2;
+    const ph = h - 2*pad;
+
+    const left = {x: pad, y: pad, w: pw, h: ph};
+    const right = {x: pad + pw + gap, y: pad, w: pw, h: ph};
+
+    // each panel has a "disk coordinate view" with scale
+    const leftR = Math.min(left.w, left.h) * 0.43;
+    const rightR = Math.min(right.w, right.h) * 0.43;
+
+    const leftC  = {x: left.x + left.w/2,  y: left.y + left.h/2};
+    const rightC = {x: right.x + right.w/2, y: right.y + right.h/2};
+
+    return {w,h,left,right,leftC,rightC,leftR,rightR};
+  }
+
+  function diskToPx(panelCenter, panelR, v){
+    return { x: panelCenter.x + v.x * panelR, y: panelCenter.y - v.y * panelR };
+  }
+  function pxToDisk(panelCenter, panelR, p){
+    return { x: (p.x - panelCenter.x) / panelR, y: (panelCenter.y - p.y) / panelR };
+  }
+
+  function pointerPos(ev){
+    const r = wrap.getBoundingClientRect();
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top;
+    return {x,y};
+  }
+
+  // --------------------------------------------
+  // Drawing
+  // --------------------------------------------
+  function drawPanelFrame(rect, title){
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.font = "600 13px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+    ctx.fillText(title, rect.x + 10, rect.y + 18);
+    ctx.restore();
+  }
+
+  function drawRay(panelCenter, panelR, zeta){
+    const a0 = diskToPx(panelCenter, panelR, {x:0,y:0});
+    const a1 = diskToPx(panelCenter, panelR, scale(zeta, 0.999));
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([6,6]);
+    ctx.beginPath();
+    ctx.moveTo(a0.x,a0.y);
+    ctx.lineTo(a1.x,a1.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawCircle(panelCenter, panelR, center, radius, strokeStyle, lineWidth, dash){
+    const cpx = diskToPx(panelCenter, panelR, center);
+    ctx.save();
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth;
+    ctx.setLineDash(dash ?? []);
+    ctx.beginPath();
+    ctx.arc(cpx.x, cpx.y, radius * panelR, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function fillCircle(panelCenter, panelR, center, radius, fillStyle, alpha){
+    const cpx = diskToPx(panelCenter, panelR, center);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fillStyle;
+    ctx.beginPath();
+    ctx.arc(cpx.x, cpx.y, radius * panelR, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPoint(panelCenter, panelR, v, rPx=8){
+    const p = diskToPx(panelCenter, panelR, v);
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, rPx, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawKnob(panelCenter, panelR, center, radius, angleRad, label){
+    const u = {x: Math.cos(angleRad), y: Math.sin(angleRad)};
+    const knobDisk = add(center, scale(u, radius));
+    const p = diskToPx(panelCenter, panelR, knobDisk);
+
+    ctx.save();
+    // little white center + black ring (looks like a sensor)
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7, 0, TAU);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(0,0,0,0.8)";
+    ctx.font = "12px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+    ctx.fillText(label, p.x + 10, p.y - 10);
+    ctx.restore();
+
+    return {x:p.x, y:p.y};
+  }
+
+  function draw(){
+    const L = layout();
+    ctx.clearRect(0,0,L.w,L.h);
+
+    // frames
+    drawPanelFrame(L.left,  "Euclidean (flat) view");
+    drawPanelFrame(L.right, "Hyperbolic (Poincaré disk) view");
+
+    // Poincaré boundary circle on the right
+    ctx.save();
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.arc(L.rightC.x, L.rightC.y, L.rightR, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+
+    // "unit circle" hint on left (so both show same coordinates)
+    ctx.save();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([4,6]);
+    ctx.beginPath();
+    ctx.arc(L.leftC.x, L.leftC.y, L.leftR, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+
+    // direction to infinity
+    const zeta = unit(X0);
+    drawRay(L.leftC,  L.leftR,  zeta);
+    drawRay(L.rightC, L.rightR, zeta);
+
+    // means and radii at the two times
+    const m1 = meanAtTime(t1);
+    const m2 = meanAtTime(t2);
+
+    const rE1 = euclidRadiusFlat(t1);
+    const rE2 = euclidRadiusFlat(t2);
+
+    const rH1 = visibleHyperRadius(m1, t1);
+    const rH2 = visibleHyperRadius(m2, t2);
+
+    // shaded "Gaussian region" (use the earlier time as filled 1-sigma)
+    fillCircle(L.leftC,  L.leftR,  m1, rE1, "#000", 0.08);
+    fillCircle(L.rightC, L.rightR, m1, rH1, "#000", 0.08);
+
+    // snapshot circles (two times) left: solid + dashed
+    drawCircle(L.leftC, L.leftR, m1, rE1, "#000", 2.8, []);
+    drawCircle(L.leftC, L.leftR, m2, rE2, "rgba(0,0,0,0.85)", 2.2, [7,7]);
+
+    // snapshot circles right (hyperbolic-embedded appearance)
+    // clip to disk
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(L.rightC.x, L.rightC.y, L.rightR-0.5, 0, TAU);
+    ctx.clip();
+    drawCircle(L.rightC, L.rightR, m1, rH1, "#000", 2.8, []);
+    drawCircle(L.rightC, L.rightR, m2, rH2, "rgba(0,0,0,0.85)", 2.2, [7,7]);
+    ctx.restore();
+
+    // seed point (at t=0, mean is X0)
+    drawPoint(L.leftC,  L.leftR,  X0, 8);
+    drawPoint(L.rightC, L.rightR, X0, 8);
+
+    // boundary point "ζ" on the right (direction at infinity)
+    drawPoint(L.rightC, L.rightR, scale(zeta, 0.999), 7);
+    ctx.save();
+    const zp = diskToPx(L.rightC, L.rightR, scale(zeta, 0.999));
+    ctx.fillStyle = "#000";
+    ctx.font = "italic 18px Georgia, Times, serif";
+    ctx.fillText("ζ", zp.x + 10, zp.y - 10);
+    ctx.restore();
+
+    // sensor knobs on LEFT only (they control t1,t2 for both views)
+    const knobAngle = 0.85; // radians
+    const knob1 = drawKnob(L.leftC, L.leftR, m1, rE1, knobAngle, "t₁");
+    const knob2 = drawKnob(L.leftC, L.leftR, m2, rE2, knobAngle, "t₂");
+
+    // store knob positions for hit-testing
+    lastKnobPx = { knob1, knob2 };
+
+    // info card
+    const info = document.getElementById("info");
+    if (info){
+      const r0 = norm(X0);
+      const rho0 = hypRadiusFromEuclid(r0);
+      info.innerHTML =
+        `<div class="row"><span class="k">seed ‖X₀‖</span><span class="v">${r0.toFixed(3)}</span></div>` +
+        `<div class="row"><span class="k">seed ρ₀=2atanh(‖X₀‖)</span><span class="v">${rho0.toFixed(3)}</span></div>` +
+        `<div class="row"><span class="k">t₁, t₂</span><span class="v">${t1.toFixed(2)} , ${t2.toFixed(2)}</span></div>` +
+        `<div class="row"><span class="k">flat radii rE(t₁), rE(t₂)</span><span class="v">${rE1.toFixed(3)} , ${rE2.toFixed(3)}</span></div>` +
+        `<div class="row"><span class="k">hyper radii rH(t₁), rH(t₂)</span><span class="v">${rH1.toFixed(3)} , ${rH2.toFixed(3)}</span></div>` +
+        `<div class="row"><span class="k">shrink at m₂: (1-‖m₂‖²)/2</span><span class="v">${(((1-norm2(m2))/2)).toFixed(3)}</span></div>` +
+        `<div class="row"><span class="k">law</span><span class="v">σH(t)=t (cone)</span></div>`;
+    }
+  }
+
+  // --------------------------------------------
+  // Interaction
+  // --------------------------------------------
+  let dragging = null; // "seed" | "t1" | "t2"
+  let lastKnobPx = { knob1:{x:-1,y:-1}, knob2:{x:-1,y:-1} };
+
+  function hitTest(p){
+    const L = layout();
+
+    // seed point in either panel
+    const seedL = diskToPx(L.leftC, L.leftR, X0);
+    const seedR = diskToPx(L.rightC, L.rightR, X0);
+    const dSeedL = Math.hypot(p.x-seedL.x, p.y-seedL.y);
+    const dSeedR = Math.hypot(p.x-seedR.x, p.y-seedR.y);
+    if (Math.min(dSeedL, dSeedR) < 14) return "seed";
+
+    // knobs (left)
+    const d1 = Math.hypot(p.x-lastKnobPx.knob1.x, p.y-lastKnobPx.knob1.y);
+    const d2 = Math.hypot(p.x-lastKnobPx.knob2.x, p.y-lastKnobPx.knob2.y);
+    if (d1 < 14) return "t1";
+    if (d2 < 14) return "t2";
+
+    return null;
+  }
+
+  function updateSeedFromPointer(p){
+    const L = layout();
+
+    // Determine which panel pointer is in; map accordingly
+    const inLeft  = p.x >= L.left.x && p.x <= L.left.x+L.left.w && p.y >= L.left.y && p.y <= L.left.y+L.left.h;
+    const inRight = p.x >= L.right.x && p.x <= L.right.x+L.right.w && p.y >= L.right.y && p.y <= L.right.y+L.right.h;
+
+    let v;
+    if (inRight){
+      v = pxToDisk(L.rightC, L.rightR, p);
+    } else {
+      v = pxToDisk(L.leftC, L.leftR, p);
+    }
+    X0 = clampToDisk(v, 0.999);
+  }
+
+  // Dragging the knob changes time by changing the FLAT radius on the Euclidean side:
+  // rE = radiusScale*sigmaH(t), with sigmaH(t)=t => t = rE/radiusScale.
+  function updateTimeFromKnob(which, p){
+    const L = layout();
+    const zeta = unit(X0);
+
+    // current mean for that time (so knob drag feels stable)
+    const t = (which==="t1") ? t1 : t2;
+    const m = meanAtTime(t);
+
+    // compute radius in disk units from pointer to mean in LEFT panel
+    const cpx = diskToPx(L.leftC, L.leftR, m);
+    const rPx = Math.hypot(p.x - cpx.x, p.y - cpx.y);
+    const rDisk = rPx / L.leftR;
+
+    // invert rE(t)=radiusScale*t
+    let newT = rDisk / Math.max(1e-6, radiusScale);
+    newT = Math.max(0.02, Math.min(3.2, newT));
+
+    // keep ordering (swap if needed)
+    if (which==="t1"){
+      t1 = newT;
+      if (t1 > t2) { const tmp=t1; t1=t2; t2=tmp; }
+    } else {
+      t2 = newT;
+      if (t1 > t2) { const tmp=t1; t1=t2; t2=tmp; }
+    }
+  }
+
+  // Mouse
+  wrap.addEventListener("mousedown", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "seed") updateSeedFromPointer(p);
+    if (dragging === "t1") updateTimeFromKnob("t1", p);
+    if (dragging === "t2") updateTimeFromKnob("t2", p);
+    draw();
+  });
+  window.addEventListener("mouseup", ()=> dragging=null);
+
+  // Touch
+  wrap.addEventListener("touchstart", (e)=>{
+    const p = pointerPos(e);
+    const h = hitTest(p);
+    if (!h) return;
+    dragging = h;
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchmove", (e)=>{
+    if (!dragging) return;
+    const p = pointerPos(e);
+    if (dragging === "seed") updateSeedFromPointer(p);
+    if (dragging === "t1") updateTimeFromKnob("t1", p);
+    if (dragging === "t2") updateTimeFromKnob("t2", p);
+    draw();
+    e.preventDefault();
+  }, {passive:false});
+  window.addEventListener("touchend", ()=> dragging=null);
+
+  resize();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Optico-Mechanical Rays — Interactive Widget</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(','\\)'], ['$', '$']], displayMath: [['\\[','\\]']] },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" defer></script>
+  <style>
+    :root { --size: 760px; }
+    body{
+      margin:0; min-height:100vh; display:flex; justify-content:center; background:#fff;
+      font-family: Georgia, "Times New Roman", Times, serif;
+    }
+    .layout{
+      width:min(1600px, 98vw);
+      display:grid;
+      grid-template-columns: minmax(320px, 440px) minmax(560px, 1fr);
+      gap: 18px;
+      align-items:start;
+      padding: 20px 16px 32px;
+      box-sizing:border-box;
+    }
+    .col-left, .col-center, .col-right{
+      display:flex;
+      flex-direction:column;
+      gap: 10px;
+    }
+    .col-center{ align-items:center; }
+    @media (max-width: 1100px){
+      .layout{
+        grid-template-columns: 1fr;
+      }
+    }
+    .wrap{
+      position:relative; width:min(var(--size)*1.70, 98vw); max-width: 1280px; aspect-ratio: 2 / 1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      margin: 12px auto 6px;
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .canvasRow{
+      position:absolute; inset:0;
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 8px 10px 12px;
+      box-sizing:border-box;
+      align-items:stretch;
+    }
+    .canvasRow canvas{
+      width:100%;
+      height:100%;
+      aspect-ratio: 1 / 1;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
+    }
+
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto 1fr; justify-items:center;
+      padding-top:4%;
+    }
+    .title{
+      text-align:center; font-size:clamp(18px,2.7vw,32px);
+      line-height:1.12; margin:0 10%;
+      transform: translateY(-6px);
+    }
+
+    .panel{
+      position:sticky;
+      top: 12px;
+      width: 100%;
+      pointer-events:auto;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.95);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 16px;
+      padding: 12px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .panel h3{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+    }
+    .row{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin: 8px 0;
+    }
+    .row label{
+      font-size: 12px;
+      color: rgba(0,0,0,0.72);
+      white-space:nowrap;
+    }
+    .row input[type="range"]{ width: 170px; }
+    .row .val{
+      width: 64px;
+      text-align:right;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: rgba(0,0,0,0.78);
+    }
+    .btns{
+      display:flex; gap:8px; flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    button{
+      appearance:none; border:1px solid rgba(0,0,0,0.18);
+      border-radius: 999px;
+      padding: 8px 10px;
+      background: #fff;
+      font-size: 12px;
+      cursor:pointer;
+    }
+    button:hover{ background: rgba(0,0,0,0.04); }
+
+    .subtitleCard{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      color: rgba(0,0,0,0.78);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .subtitleCard h4{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: .2px;
+      color: rgba(0,0,0,0.85);
+    }
+    .mathBlock{
+      margin: 6px 0;
+    }
+
+    .info{
+      position:static;
+      pointer-events:none;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 12px;
+      line-height: 1.25;
+      color: rgba(0,0,0,0.84);
+      background: rgba(255,255,255,0.94);
+      border: 1px solid rgba(0,0,0,0.14);
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.10);
+      min-width: 240px;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      width: 100%;
+      box-sizing:border-box;
+    }
+    .infoRow{
+      display:flex;
+      justify-content:flex-start;
+      margin-top: 12px;
+      width: 100%;
+    }
+    .belowCols{
+      width:100%;
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .info .row2{
+      display:flex;
+      justify-content:space-between;
+      gap: 12px;
+      white-space:nowrap;
+    }
+    .info .k{ color: rgba(0,0,0,0.62); }
+    .info .v{ font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="col-left">
+      <div class="panel" id="panel">
+        <h3>Controls</h3>
+
+        <div class="row">
+          <label>Render quality</label>
+          <input id="res" type="range" min="1" max="3" step="0.1" value="1.6" />
+          <div class="val" id="resVal">1.6</div>
+        </div>
+
+        <div class="row">
+          <label>Number of rays</label>
+          <input id="rays" type="range" min="5" max="40" step="1" value="17" />
+          <div class="val" id="raysVal">17</div>
+        </div>
+
+        <div class="row">
+          <label>κ (Busemann strength)</label>
+          <input id="kappa" type="range" min="0.30" max="3.00" step="0.05" value="1.10" />
+          <div class="val" id="kappaVal">1.10</div>
+        </div>
+
+        <div class="row">
+          <label>A (rotation amplitude)</label>
+          <input id="rot" type="range" min="0.00" max="3.00" step="0.05" value="1.40" />
+          <div class="val" id="rotVal">1.40</div>
+        </div>
+
+        <div class="row">
+          <label>Time horizon</label>
+          <input id="tmax" type="range" min="0.8" max="6.0" step="0.05" value="2.60" />
+          <div class="val" id="tmaxVal">2.60</div>
+        </div>
+
+        <div class="row">
+          <label>Wavefront count</label>
+          <input id="waves" type="range" min="4" max="60" step="1" value="30" />
+          <div class="val" id="wavesVal">30</div>
+        </div>
+
+        <div class="btns">
+          <button id="rand">Randomize palette</button>
+          <button id="reset">Reset</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-center">
+      <div class="wrap" id="wrap">
+        <div class="canvasRow">
+          <canvas id="cEucl" aria-label="Ambient lift view"></canvas>
+          <canvas id="cPoinc" aria-label="Poincaré disk view"></canvas>
+        </div>
+
+        <div class="overlay">
+          <div class="title">
+            Optico-Mechanical Rays<br/>
+            <span style="font-style:italic;">action wavefronts + Killing flow + Busemann target</span>
+          </div>
+          <div></div>
+        </div>
+      </div>
+      <div class="infoRow">
+        <div class="info" id="info"></div>
+      </div>
+
+      <div class="belowCols">
+        <div class="subtitleCard">
+          <h4>What you are seeing — ambient lift</h4>
+          <div>
+            Rays are characteristics of the hyperbolic flow \(\dot z = K_t(z) - \nabla_{\mathrm{hyp}}\Phi_t(z)\),
+            evolved directly on the Poincaré disk and then lifted to the ambient plane by
+            \(\;x=\frac{2\,\operatorname{artanh}(|z|)}{|z|}z\).
+            Dashed curves are equal-action wavefronts \(S=\mathrm{const}\) with
+            \(S(t)=\int_0^t(\tfrac12|\dot z-K_t|_g^2-\Phi_t)\,dt\).
+          </div>
+        </div>
+        <div class="subtitleCard">
+          <h4>What you are seeing — Poincaré disk</h4>
+          <div>
+            The same dynamics drawn in the disk itself. Early times are dominated by the Gaussian potential
+            \(\Phi_0\), mid-time by the solenoidal Killing field \(K_t\), and late times by the Busemann pull
+            \(\Phi_\infty\). Dotted circles are horocycles (Busemann level sets) tangent at the ideal point \(\xi\).
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-right">
+      <div class="subtitleCard">
+        <h4>Model equations</h4>
+        <div class="mathBlock">
+          \[
+            \dot z = K_t(z) - \nabla_{\mathrm{hyp}}\Phi_t(z),
+            \qquad
+            \nabla_{\mathrm{hyp}}\Phi=\frac{(1-|z|^2)^2}{4}\nabla_E\Phi
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            S(t)=\int_0^t\left(\tfrac12|\dot z-K_t|_g^2-\Phi_t(z)\right)\,dt
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            \Phi_t=(1-\eta)\Phi_0+\eta\Phi_\infty,\qquad
+            \eta(t)=\tfrac12(1+\tanh(\alpha t))
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            \Phi_0=\tfrac{\beta}{2}d_g(z,0)^2,
+            \quad d_g(z,0)=2\,\operatorname{artanh}(|z|),
+            \quad
+            \Phi_\infty=-\kappa\,b_\xi(z)
+          \]
+        </div>
+        <div class="mathBlock">
+          \[
+            K_{A,Z}(z)=Az-\langle Z,z\rangle z+\tfrac12(1+|z|^2)Z,\quad A^\top=-A
+          \]
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const TAU = Math.PI * 2;
+    const EPS = 1e-6;
+    const START_R = 0.18;
+    const BETA = 0.85;
+    const ALPHA = 2.1;
+    const BOOST_SCALE = 0.65;
+    const XI = [1, 0];
+
+    // --- helpers ---
+    function clamp(x, a, b){ return Math.min(b, Math.max(a, x)); }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function hsvToRgb(h,s,v){
+      h = ((h%1)+1)%1;
+      const i = Math.floor(h*6);
+      const f = h*6 - i;
+      const p = v*(1-s);
+      const q = v*(1-f*s);
+      const t = v*(1-(1-f)*s);
+      let r,g,b;
+      switch(i%6){
+        case 0: r=v; g=t; b=p; break;
+        case 1: r=q; g=v; b=p; break;
+        case 2: r=p; g=v; b=t; break;
+        case 3: r=p; g=q; b=v; break;
+        case 4: r=t; g=p; b=v; break;
+        case 5: r=v; g=p; b=q; break;
+      }
+      return {r:Math.round(r*255), g:Math.round(g*255), b:Math.round(b*255)};
+    }
+    function format(num, digits=2){ return num.toFixed(digits); }
+
+    // --- elements ---
+    const wrap = document.getElementById("wrap");
+    const canvasE = document.getElementById("cEucl");
+    const canvasP = document.getElementById("cPoinc");
+    const ctxE = canvasE.getContext("2d", { alpha: true });
+    const ctxP = canvasP.getContext("2d", { alpha: true });
+    const info = document.getElementById("info");
+
+    const controls = {
+      res: document.getElementById("res"),
+      rays: document.getElementById("rays"),
+      kappa: document.getElementById("kappa"),
+      rot: document.getElementById("rot"),
+      tmax: document.getElementById("tmax"),
+      waves: document.getElementById("waves"),
+      rand: document.getElementById("rand"),
+      reset: document.getElementById("reset"),
+    };
+    const vals = {
+      resVal: document.getElementById("resVal"),
+      raysVal: document.getElementById("raysVal"),
+      kappaVal: document.getElementById("kappaVal"),
+      rotVal: document.getElementById("rotVal"),
+      tmaxVal: document.getElementById("tmaxVal"),
+      wavesVal: document.getElementById("wavesVal"),
+    };
+
+    let paletteSeed = Math.random();
+
+    function state(){
+      return {
+        quality: Number(controls.res.value),
+        nRays: Math.round(Number(controls.rays.value)),
+        kappa: Number(controls.kappa.value),
+        rot: Number(controls.rot.value),
+        tMax: Number(controls.tmax.value),
+        nWave: Math.round(Number(controls.waves.value)),
+        xi: XI,
+      };
+    }
+
+    function reset(){
+      controls.res.value = 1.6;
+      controls.rays.value = 17;
+      controls.kappa.value = 1.1;
+      controls.rot.value = 1.4;
+      controls.tmax.value = 2.6;
+      controls.waves.value = 30;
+      paletteSeed = Math.random();
+      syncLabels();
+      render();
+    }
+
+    function syncLabels(){
+      vals.resVal.textContent = format(Number(controls.res.value),1);
+      vals.raysVal.textContent = String(Math.round(Number(controls.rays.value)));
+      vals.kappaVal.textContent = format(Number(controls.kappa.value),2);
+      vals.rotVal.textContent = format(Number(controls.rot.value),2);
+      vals.tmaxVal.textContent = format(Number(controls.tmax.value),2);
+      vals.wavesVal.textContent = String(Math.round(Number(controls.waves.value)));
+    }
+
+    Object.values(controls).forEach(el => {
+      if (el.type === "range") el.addEventListener("input", () => { syncLabels(); render(); });
+    });
+    controls.rand.onclick = () => { paletteSeed = Math.random(); render(); };
+    controls.reset.onclick = reset;
+
+    function geomCanvas(el){
+      const rect = el.getBoundingClientRect();
+      const pad = 10;
+      const R = Math.max(12, Math.min(rect.width, rect.height)/2 - pad);
+      return {w: rect.width, h: rect.height, R, cx: rect.width/2, cy: rect.height/2};
+    }
+
+    function resize(){
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      [canvasE, canvasP].forEach((el, idx) => {
+        const rect = el.getBoundingClientRect();
+        el.width  = Math.round(rect.width  * dpr);
+        el.height = Math.round(rect.height * dpr);
+        const ctx = idx === 0 ? ctxE : ctxP;
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+      });
+      render();
+    }
+    window.addEventListener("resize", resize);
+
+    // --- dynamics: hyperbolic flow + action ---
+    function clampToDisk(zx, zy){
+      const r2 = zx*zx + zy*zy;
+      const maxR = 1 - 1e-4;
+      if (r2 > maxR*maxR){
+        const f = maxR / Math.sqrt(r2);
+        return [zx*f, zy*f];
+      }
+      return [zx, zy];
+    }
+
+    function diskToAmbient(zx, zy){
+      const r = Math.hypot(zx, zy);
+      if (r < 1e-9) return {x:0,y:0};
+      const rho = 2 * Math.atanh(Math.min(0.999999, r));
+      const f = rho / r;
+      return {x: zx*f, y: zy*f};
+    }
+
+    function eta(t, tMax){
+      const scale = Math.max(0.5 * tMax, EPS);
+      return 0.5 * (1 + Math.tanh(ALPHA * (t / scale)));
+    }
+
+    function bump(t, tMax){
+      const e = eta(t, tMax);
+      return 4 * e * (1 - e);
+    }
+
+    function phi0Val(r, r2){
+      const u = Math.atanh(Math.min(0.999999, r));
+      const dg = 2 * u;
+      return 0.5 * BETA * dg * dg;
+    }
+
+    function gradPhi0(zx, zy, r, r2){
+      if (r < 1e-8) return [0,0];
+      const u = Math.atanh(Math.min(0.999999, r));
+      const denom = Math.max(1 - r2, EPS);
+      const dPhi_dr = 4 * BETA * u / denom;
+      return [dPhi_dr * zx / r, dPhi_dr * zy / r];
+    }
+
+    function busemann(zx, zy, r2, xi){
+      const dx = zx - xi[0];
+      const dy = zy - xi[1];
+      const dist2 = Math.max(dx*dx + dy*dy, EPS);
+      const num = Math.max(1 - r2, EPS);
+      return Math.log(num / dist2);
+    }
+
+    function gradBusemann(zx, zy, r2, xi){
+      const dx = zx - xi[0];
+      const dy = zy - xi[1];
+      const dist2 = Math.max(dx*dx + dy*dy, EPS);
+      const denom = Math.max(1 - r2, EPS);
+      return [
+        -2 * zx / denom - 2 * dx / dist2,
+        -2 * zy / denom - 2 * dy / dist2,
+      ];
+    }
+
+    function phiInfVal(zx, zy, r2, params){
+      return -params.kappa * busemann(zx, zy, r2, params.xi);
+    }
+
+    function gradPhiInf(zx, zy, r2, params){
+      const gradB = gradBusemann(zx, zy, r2, params.xi);
+      return [-params.kappa * gradB[0], -params.kappa * gradB[1]];
+    }
+
+    function gradHypPhi(t, z, params){
+      const zx = z[0], zy = z[1];
+      const r2 = Math.min(zx*zx + zy*zy, 0.999999);
+      const r = Math.sqrt(r2);
+      const etaVal = eta(t, params.tMax);
+      const phi0 = phi0Val(r, r2);
+      const phiInf = phiInfVal(zx, zy, r2, params);
+      const phi = (1 - etaVal) * phi0 + etaVal * phiInf;
+
+      const grad0 = gradPhi0(zx, zy, r, r2);
+      const gradInf = gradPhiInf(zx, zy, r2, params);
+      const gradEx = (1 - etaVal) * grad0[0] + etaVal * gradInf[0];
+      const gradEy = (1 - etaVal) * grad0[1] + etaVal * gradInf[1];
+
+      const hyp = ((1 - r2) * (1 - r2)) / 4;
+      return {gradHyp: [gradEx * hyp, gradEy * hyp], phi};
+    }
+
+    function killingField(t, z, params){
+      const zx = z[0], zy = z[1];
+      const r2 = zx*zx + zy*zy;
+      const m = bump(t, params.tMax);
+      const a = params.rot;
+      const boost = params.rot * BOOST_SCALE;
+      const Zx = boost * params.xi[0];
+      const Zy = boost * params.xi[1];
+      const dot = Zx*zx + Zy*zy;
+      const Ax = -a * zy;
+      const Ay = a * zx;
+      const kx = Ax - dot*zx + 0.5 * (1 + r2) * Zx;
+      const ky = Ay - dot*zy + 0.5 * (1 + r2) * Zy;
+      return [m * kx, m * ky];
+    }
+
+    function flow(t, z, params){
+      const K = killingField(t, z, params);
+      const {gradHyp, phi} = gradHypPhi(t, z, params);
+      return {v: [K[0] - gradHyp[0], K[1] - gradHyp[1]], K, gradHyp, phi};
+    }
+
+    function lagrangian(z, v, K, phi){
+      const r2 = Math.min(z[0]*z[0] + z[1]*z[1], 0.999999);
+      const denom = Math.max((1 - r2) * (1 - r2), EPS);
+      const gFactor = 4 / denom;
+      const wx = v[0] - K[0];
+      const wy = v[1] - K[1];
+      return 0.5 * gFactor * (wx*wx + wy*wy) - phi;
+    }
+
+    function stepRK4(z, t, dt, params){
+      const k1 = flow(t, z, params).v;
+      const z2 = [ z[0]+0.5*dt*k1[0], z[1]+0.5*dt*k1[1] ];
+      const k2 = flow(t + 0.5*dt, z2, params).v;
+      const z3 = [ z[0]+0.5*dt*k2[0], z[1]+0.5*dt*k2[1] ];
+      const k3 = flow(t + 0.5*dt, z3, params).v;
+      const z4 = [ z[0]+dt*k3[0], z[1]+dt*k3[1] ];
+      const k4 = flow(t + dt, z4, params).v;
+      const zx = z[0] + (dt/6)*(k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
+      const zy = z[1] + (dt/6)*(k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
+      return clampToDisk(zx, zy);
+    }
+
+    function integrate(params){
+      const {nRays, tMax, quality} = params;
+      const steps = Math.max(300, Math.round(650 * quality * (tMax/2.6)));
+      const dt = tMax / steps;
+      const t0 = -tMax / 2;
+      const phis = [];
+      for (let i=0;i<nRays;i++){
+        phis.push(lerp(-Math.PI, Math.PI, i/(Math.max(nRays-1,1))));
+      }
+
+      const rays = [];
+      let maxR = 1;
+      let minS = Infinity;
+      let maxS = -Infinity;
+      const startAmbientRadius = 2 * Math.atanh(START_R);
+
+      for (const phi0 of phis){
+        let z = [START_R * Math.cos(phi0), START_R * Math.sin(phi0)];
+        const zx = new Float32Array(steps+1);
+        const zy = new Float32Array(steps+1);
+        const ax = new Float32Array(steps+1);
+        const ay = new Float32Array(steps+1);
+        const S = new Float32Array(steps+1);
+
+        zx[0] = z[0];
+        zy[0] = z[1];
+        S[0] = 0;
+        const a0 = diskToAmbient(z[0], z[1]);
+        ax[0] = a0.x;
+        ay[0] = a0.y;
+        maxR = Math.max(maxR, Math.hypot(a0.x, a0.y));
+        minS = Math.min(minS, S[0]);
+        maxS = Math.max(maxS, S[0]);
+
+        for (let i=1;i<=steps;i++){
+          const t = t0 + (i-1)*dt;
+          const parts = flow(t, z, params);
+          const L = lagrangian(z, parts.v, parts.K, parts.phi);
+          S[i] = S[i-1] + L * dt;
+
+          z = stepRK4(z, t, dt, params);
+          zx[i] = z[0];
+          zy[i] = z[1];
+          const a = diskToAmbient(z[0], z[1]);
+          ax[i] = a.x;
+          ay[i] = a.y;
+          maxR = Math.max(maxR, Math.hypot(a.x, a.y));
+          minS = Math.min(minS, S[i]);
+          maxS = Math.max(maxS, S[i]);
+        }
+        rays.push({zx, zy, ax, ay, S});
+      }
+
+      // wavefronts: equal action levels across rays
+      const waveCount = Math.max(2, params.nWave);
+      const wavefronts = [];
+      const sRange = maxS - minS;
+      if (sRange > EPS){
+        const sStart = minS + 0.05 * sRange;
+        const sEnd = maxS - 0.05 * sRange;
+        for (let w=1; w<=waveCount; w++){
+          const sLevel = lerp(sStart, sEnd, w/(waveCount+1));
+          const xs = [];
+          const ys = [];
+          for (const ray of rays){
+            const Sarr = ray.S;
+            let hit = -1;
+            for (let i=0;i<steps;i++){
+              const a = Sarr[i] - sLevel;
+              const b = Sarr[i+1] - sLevel;
+              if (a === 0 || a*b <= 0){
+                hit = i;
+                break;
+              }
+            }
+            if (hit >= 0){
+              const s0 = Sarr[hit];
+              const s1 = Sarr[hit+1];
+              const tLoc = Math.abs(s1 - s0) < 1e-9 ? 0 : (sLevel - s0) / (s1 - s0);
+              xs.push(lerp(ray.zx[hit], ray.zx[hit+1], tLoc));
+              ys.push(lerp(ray.zy[hit], ray.zy[hit+1], tLoc));
+            }
+          }
+          if (xs.length > 1) wavefronts.push({xs, ys});
+        }
+      }
+
+      return {rays, wavefronts, maxR, steps, dt, t0, startAmbientRadius};
+    }
+
+    function palette(k, total){
+      const h = ((k/Math.max(total,1)) + paletteSeed) % 1;
+      const s = 0.60 + 0.18*Math.sin(2*Math.PI*h);
+      const v = 0.86;
+      return hsvToRgb(h, s, v);
+    }
+
+    function renderBackground(ctx, w, h){
+      const grad = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, Math.max(w,h)/1.1);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(1, "rgba(236,241,252,0.95)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0,0,w,h);
+    }
+
+    function renderEuclideanView(ctx, geom, data, params){
+      const {w,h,cx,cy} = geom;
+      renderBackground(ctx, w, h);
+
+      const pad = 0.12 * data.maxR;
+      const scale = 0.45 * Math.min(w,h) / (data.maxR + pad);
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(1,-1);
+
+      // wavefronts
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6,7]);
+      data.wavefronts.forEach((wf, idx) => {
+        const fade = Math.pow(idx / data.wavefronts.length, 0.7);
+        ctx.strokeStyle = `rgba(60,70,120,${0.18 + 0.25*fade})`;
+        ctx.beginPath();
+        const p0 = diskToAmbient(wf.xs[0], wf.ys[0]);
+        ctx.moveTo(p0.x*scale, p0.y*scale);
+        for (let i=1;i<wf.xs.length;i++){
+          const p = diskToAmbient(wf.xs[i], wf.ys[i]);
+          ctx.lineTo(p.x*scale, p.y*scale);
+        }
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+
+      // rays
+      ctx.lineWidth = 1.6 * params.quality;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      data.rays.forEach((ray, i) => {
+        const col = palette(i, data.rays.length);
+        ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.92)`;
+        ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},0.30)`;
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.moveTo(ray.ax[0]*scale, ray.ay[0]*scale);
+        for (let j=1;j<ray.ax.length;j++){
+          ctx.lineTo(ray.ax[j]*scale, ray.ay[j]*scale);
+        }
+        ctx.stroke();
+      });
+      ctx.shadowColor = "transparent";
+
+      // starting ring in ambient lift
+      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath();
+      ctx.arc(0,0, data.startAmbientRadius*scale, 0, TAU);
+      ctx.stroke();
+
+      // axes
+      ctx.strokeStyle = "rgba(0,0,0,0.08)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-w,0); ctx.lineTo(w,0);
+      ctx.moveTo(0,-h); ctx.lineTo(0,h);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function drawHorocycles(ctx, R, xi){
+      const levels = [1.5, 3, 6, 12];
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4,6]);
+      ctx.strokeStyle = "rgba(45,60,115,0.16)";
+      for (const k of levels){
+        const r = 1 / (1 + k);
+        const cx = xi[0] * (1 - r) * R;
+        const cy = xi[1] * (1 - r) * R;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * R, 0, TAU);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      ctx.fillStyle = "rgba(25,30,45,0.95)";
+      ctx.beginPath();
+      ctx.arc(xi[0] * (R - 0.5), xi[1] * (R - 0.5), 3.2, 0, TAU);
+      ctx.fill();
+    }
+
+    function renderPoincareView(ctx, geom, data, params){
+      const {w,h,R,cx,cy} = geom;
+      renderBackground(ctx, w, h);
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(1,-1);
+
+      // clip to disk
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(0,0,R-0.5,0,TAU);
+      ctx.clip();
+
+      // fill disk softly
+      const g = ctx.createRadialGradient(0,0,0,0,0,R);
+      g.addColorStop(0,"rgba(255,255,255,0.96)");
+      g.addColorStop(1,"rgba(240,244,252,0.95)");
+      ctx.fillStyle = g;
+      ctx.fillRect(-R,-R,2*R,2*R);
+
+      // horocycles and ideal point
+      drawHorocycles(ctx, R, params.xi);
+
+      // starting ring
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.12)";
+      ctx.beginPath();
+      ctx.arc(0,0, START_R * R, 0, TAU);
+      ctx.stroke();
+
+      // wavefronts
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6,7]);
+      data.wavefronts.forEach((wf, idx) => {
+        const fade = Math.pow(idx / data.wavefronts.length, 0.7);
+        ctx.strokeStyle = `rgba(60,70,120,${0.18 + 0.25*fade})`;
+        ctx.beginPath();
+        ctx.moveTo(wf.xs[0]*R, wf.ys[0]*R);
+        for (let i=1;i<wf.xs.length;i++){
+          ctx.lineTo(wf.xs[i]*R, wf.ys[i]*R);
+        }
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+
+      // rays
+      ctx.lineWidth = 1.6 * params.quality;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      data.rays.forEach((ray, i) => {
+        const col = palette(i, data.rays.length);
+        ctx.strokeStyle = `rgba(${col.r},${col.g},${col.b},0.92)`;
+        ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},0.30)`;
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.moveTo(ray.zx[0]*R, ray.zy[0]*R);
+        for (let j=1;j<ray.zx.length;j++){
+          ctx.lineTo(ray.zx[j]*R, ray.zy[j]*R);
+        }
+        ctx.stroke();
+      });
+      ctx.shadowColor = "transparent";
+
+      ctx.restore(); // end clip
+
+      // boundary
+      ctx.lineWidth = 2.0;
+      ctx.strokeStyle = "rgba(0,0,0,0.80)";
+      ctx.beginPath();
+      ctx.arc(0,0,R-0.5,0,TAU);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    let lastStats = {maxR:0, steps:0};
+    function render(){
+      const params = state();
+      const data = integrate(params);
+      lastStats.maxR = data.maxR;
+      lastStats.steps = data.steps;
+
+      const gE = geomCanvas(canvasE);
+      const gP = geomCanvas(canvasP);
+
+      renderEuclideanView(ctxE, gE, data, params);
+      renderPoincareView(ctxP, gP, data, params);
+      updateInfo(params, data.maxR, data.steps);
+    }
+
+    function updateInfo(params, maxR, steps){
+      const halfT = params.tMax / 2;
+      info.innerHTML =
+        `<div class="row2"><span class="k">κ</span><span class="v">${format(params.kappa,2)}</span></div>` +
+        `<div class="row2"><span class="k">A</span><span class="v">${format(params.rot,2)}</span></div>` +
+        `<div class="row2"><span class="k">Rays</span><span class="v">${params.nRays}</span></div>` +
+        `<div class="row2"><span class="k">Wavefronts</span><span class="v">${params.nWave}</span></div>` +
+        `<div class="row2"><span class="k">t span</span><span class="v">[-${format(halfT,2)}, ${format(halfT,2)}]</span></div>` +
+        `<div class="row2"><span class="k">Max |x|</span><span class="v">${format(maxR,2)}</span></div>` +
+        `<div class="row2"><span class="k">Steps</span><span class="v">${steps}</span></div>`;
+    }
+
+    // init
+    syncLabels();
+    resize();
+  </script>
+</body>
+</html>
