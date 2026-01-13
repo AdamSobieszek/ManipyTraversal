@@ -1,0 +1,856 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gaussian-Kernel Force Field Painter (Poincaré Disk Slice)</title>
+  <style>
+    :root{
+      --canvas-max: 107.5em;   /* ~1720px */
+      --content-max: 120em;    /* ~1920px */
+      --gap: 28px;
+      --bg: #f6f6f6;
+      --card: rgba(255,255,255,0.92);
+      --border: rgba(20,20,20,0.14);
+      --ink: #0b0b0b;
+      --muted: rgba(0,0,0,0.70);
+    }
+    body{
+      margin:0;
+      min-height:100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", Times, serif;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding: clamp(14px, 2.4vw, 32px);
+    }
+    .app{
+      width: min(var(--content-max), 96vw);
+      display:grid;
+      grid-template-columns: 3fr 1fr;
+      gap: var(--gap);
+      align-items:start;
+    }
+    @media (max-width: 980px){
+      .app{ grid-template-columns: 1fr; }
+    }
+    .left{ display:flex; justify-content:center; }
+    .wrap{
+      position:relative;
+      width: min(var(--canvas-max), 100%);
+      aspect-ratio:1/1;
+      user-select:none; -webkit-user-select:none; touch-action:none;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      overflow:hidden;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.10);
+    }
+    canvas{ width:100%; height:100%; display:block; }
+    .overlay{
+      position:absolute; inset:0; pointer-events:none;
+      display:grid; grid-template-rows:auto auto 1fr; justify-items:center;
+      padding-top:6%;
+    }
+    .title{
+      text-align:center;
+      font-size:clamp(18px, 3.0vw, 34px);
+      line-height:1.15;
+      margin:0 10%;
+    }
+    .subtitle{
+      margin-top:10px;
+      font-size:clamp(14px, 2.0vw, 20px);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      opacity:0.86;
+    }
+    .side{ position:relative; }
+    .stack{ display:flex; flex-direction:column; gap: 16px; }
+    .card{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px 18px 16px;
+      box-shadow:
+        0 1px 0 rgba(0,0,0,0.06),
+        0 18px 60px rgba(0,0,0,0.08);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .cardTitle{
+      font-size: 18px;
+      letter-spacing: 0.2px;
+      margin: 0 0 12px;
+    }
+    .noteText{
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: rgba(0,0,0,0.80);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    }
+    .noteText:last-child{ margin-bottom: 0; }
+
+    .controlGrid{
+      display:grid;
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .row{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 14px;
+      padding: 10px 12px;
+      border: 1px solid rgba(0,0,0,0.10);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.55);
+    }
+    .label{
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      color: rgba(0,0,0,0.78);
+      line-height: 1.25;
+    }
+    .hint{
+      display:block;
+      margin-top: 4px;
+      font-size: 12px;
+      color: rgba(0,0,0,0.55);
+    }
+    .slider{
+      width: 180px;
+      accent-color: #111;
+    }
+    .val{
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+      color: rgba(0,0,0,0.86);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 13px;
+      padding: 2px 8px;
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 10px;
+      background: rgba(255,255,255,0.70);
+      min-width: 52px;
+      text-align:right;
+    }
+    button{
+      appearance:none;
+      border: 1px solid rgba(0,0,0,0.18);
+      background: rgba(255,255,255,0.82);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-size: 14px;
+      cursor:pointer;
+    }
+    button:hover{ background: rgba(255,255,255,0.95); }
+    .cornerReset{
+      position:absolute;
+      left: 12px;
+      bottom: 12px;
+      pointer-events:auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="left">
+      <div class="wrap" id="wrap">
+        <canvas id="c"></canvas>
+        <button id="reset" class="cornerReset" type="button">Reset field</button>
+        <div class="overlay">
+          <div class="title">Gaussian-kernel force field painter (2D slice)</div>
+          <div class="subtitle">Draw inside the disk to locally add vectors; strokes accumulate (with optional fluid wiggle).</div>
+          <div></div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="stack">
+        <div class="card">
+          <div class="cardTitle">Controls</div>
+          <div class="controlGrid">
+            <div class="row">
+              <div class="label">Influence radius
+                <span class="hint">Gaussian kernel σ (disk units)</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="sigma" class="slider" type="range" min="0.02" max="0.35" step="0.01" value="0.12">
+                <span id="sigmaVal" class="val">0.12</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Stroke gain
+                <span class="hint">How much each segment adds</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="gain" class="slider" type="range" min="0.2" max="6.0" step="0.1" value="2.2">
+                <span id="gainVal" class="val">2.2</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Stroke decay
+                <span class="hint">On paint: damp the component colinear with the new segment</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="strokeDecay" class="slider" type="range" min="0.00" max="0.25" step="0.01" value="0.08">
+                <span id="strokeDecayVal" class="val">0.08</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Continuous decay / boost
+                <span class="hint">Positive decays; negative boosts toward a target total magnitude density</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <label style="display:flex; align-items:center; gap:8px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:13px; color:rgba(0,0,0,0.78);">
+                  <input id="decayOn" type="checkbox" style="accent-color:#111;">
+                  on
+                </label>
+                <input id="decay" class="slider" type="range" min="-2.00" max="2.00" step="0.05" value="0.35">
+                <span id="decayVal" class="val">0.35</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Clock speed
+                <span class="hint">Scales simulation time step</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="speed" class="slider" type="range" min="0.1" max="4.0" step="0.1" value="1.0">
+                <span id="speedVal" class="val">1.0</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Transport along flow
+                <span class="hint">Self-advection: field values move along their own velocity (group velocity = induced velocity)</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <label style="display:flex; align-items:center; gap:8px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:13px; color:rgba(0,0,0,0.78);">
+                  <input id="transportOn" type="checkbox" style="accent-color:#111;">
+                  on
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Volume preserve (project)
+                <span class="hint">Optional incompressibility projection \( \nabla\cdot v = 0 \) after transport</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <label style="display:flex; align-items:center; gap:8px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:13px; color:rgba(0,0,0,0.78);">
+                  <input id="projectOn" type="checkbox" style="accent-color:#111;">
+                  on
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Disk wall (collision)
+                <span class="hint">No-penetration at boundary (clips radial component)</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <label style="display:flex; align-items:center; gap:8px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:13px; color:rgba(0,0,0,0.78);">
+                  <input id="wallOn" type="checkbox" checked style="accent-color:#111;">
+                  on
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Wall vorticity
+                <span class="hint">Extra curl injected on collision (projection keeps volume)</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="wallVort" class="slider" type="range" min="0.0" max="2.5" step="0.05" value="0.45">
+                <span id="wallVortVal" class="val">0.45</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">Max magnitude
+                <span class="hint">Clamp to prevent blow-up</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <input id="vmax" class="slider" type="range" min="0.2" max="6.0" step="0.1" value="2.2">
+                <span id="vmaxVal" class="val">2.2</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardTitle">How it works</div>
+          <p class="noteText">
+            The vector field is stored on a grid of sample points inside the disk.
+            Each drawn stroke is split into segments; each segment contributes a vector in its direction,
+            weighted by a Gaussian kernel \( \exp(-\|x-x_0\|^2/(2\sigma^2)) \) centered at the segment midpoint.
+          </p>
+          <p class="noteText">
+            Arrows are colored by strength, and their length scales like \( \sqrt{\|v\|} \).
+          </p>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+  (() => {
+    const TAU = Math.PI * 2;
+    const EPS = 1e-10;
+
+    // ---------- DOM ----------
+    const wrap = document.getElementById("wrap");
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+
+    const sigmaEl = document.getElementById("sigma");
+    const gainEl = document.getElementById("gain");
+    const strokeDecayEl = document.getElementById("strokeDecay");
+    const decayOnEl = document.getElementById("decayOn");
+    const decayEl = document.getElementById("decay");
+    const speedEl = document.getElementById("speed");
+    const transportOnEl = document.getElementById("transportOn");
+    const projectOnEl = document.getElementById("projectOn");
+    const wallOnEl = document.getElementById("wallOn");
+    const wallVortEl = document.getElementById("wallVort");
+    const vmaxEl = document.getElementById("vmax");
+    const resetEl = document.getElementById("reset");
+
+    const sigmaVal = document.getElementById("sigmaVal");
+    const gainVal = document.getElementById("gainVal");
+    const strokeDecayVal = document.getElementById("strokeDecayVal");
+    const decayVal = document.getElementById("decayVal");
+    const speedVal = document.getElementById("speedVal");
+    const wallVortVal = document.getElementById("wallVortVal");
+    const vmaxVal = document.getElementById("vmaxVal");
+
+    // ---------- vector helpers ----------
+    const add = (a,b)=>({x:a.x+b.x,y:a.y+b.y});
+    const sub = (a,b)=>({x:a.x-b.x,y:a.y-b.y});
+    const scale = (v,s)=>({x:v.x*s,y:v.y*s});
+    const dot = (a,b)=>a.x*b.x+a.y*b.y;
+    const norm2 = (v)=>v.x*v.x+v.y*v.y;
+    const norm = (v)=>Math.hypot(v.x,v.y);
+    const unit = (v)=>{ const r=norm(v); return r<EPS?{x:1,y:0}:scale(v,1/r); };
+
+    // ---------- geometry ----------
+    function geom(){
+      const w = wrap.getBoundingClientRect().width;
+      const h = wrap.getBoundingClientRect().height;
+      const pad = 20;
+      const R = Math.min(w,h)/2 - pad;
+      return {w,h,R,cx:w/2,cy:h/2};
+    }
+    function diskToPx(v){
+      const {R,cx,cy}=geom();
+      return {x: cx + v.x*R, y: cy - v.y*R};
+    }
+    function pxToDisk(p){
+      const {R,cx,cy}=geom();
+      return {x: (p.x-cx)/R, y: (cy-p.y)/R};
+    }
+    function pointerPos(ev){
+      const r = wrap.getBoundingClientRect();
+      const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - r.left;
+      const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - r.top;
+      return {x,y};
+    }
+    function insideDisk(v){
+      return norm2(v) <= 0.999*0.999;
+    }
+    function clampToDisk(v, maxR=0.999){
+      const r = norm(v);
+      return r<=maxR ? v : scale(v, maxR/r);
+    }
+
+    // ---------- field grid (structured, for fluid-style operations) ----------
+    const N = 33;
+    const SIZE = N*N;
+    const H = 2/(N-1); // grid spacing in disk coords
+
+    const px = new Float32Array(SIZE);
+    const py = new Float32Array(SIZE);
+    const inside = new Uint8Array(SIZE);
+
+    const vx = new Float32Array(SIZE);
+    const vy = new Float32Array(SIZE);
+    const vx2 = new Float32Array(SIZE);
+    const vy2 = new Float32Array(SIZE);
+    const curl = new Float32Array(SIZE);
+    const tmp = new Float32Array(SIZE);
+    const div = new Float32Array(SIZE);
+    const p = new Float32Array(SIZE);
+    const p2 = new Float32Array(SIZE);
+
+    const gridIdx = []; // indices inside disk, for fast loops
+
+    function idx(ix,iy){ return iy*N + ix; }
+    function neigh(ix, iy, dx, dy){
+      const nx = ix + dx;
+      const ny = iy + dy;
+      if (nx < 0 || nx >= N || ny < 0 || ny >= N) return -1;
+      const j = idx(nx, ny);
+      return inside[j] ? j : -1;
+    }
+    function initGrid(){
+      gridIdx.length = 0;
+      for (let iy=0; iy<N; iy++){
+        for (let ix=0; ix<N; ix++){
+          const i = idx(ix,iy);
+          const x = -1 + (2*ix)/(N-1);
+          const y = -1 + (2*iy)/(N-1);
+          px[i] = x; py[i] = y;
+          const ok = (x*x + y*y) <= 0.98*0.98;
+          inside[i] = ok ? 1 : 0;
+          if (ok) gridIdx.push(i);
+          vx[i] = 0; vy[i] = 0;
+        }
+      }
+    }
+    initGrid();
+
+    function resetField(){
+      for (const i of gridIdx){
+        vx[i] = 0;
+        vy[i] = 0;
+      }
+    }
+    resetEl.addEventListener("click", () => resetField());
+
+    function readParams(){
+      const sigma = parseFloat(sigmaEl.value);
+      const gain = parseFloat(gainEl.value);
+      const strokeDecay = parseFloat(strokeDecayEl.value);
+      const decayOn = !!decayOnEl.checked;
+      const decay = parseFloat(decayEl.value);
+      const speed = parseFloat(speedEl.value);
+      const transportOn = !!transportOnEl.checked;
+      const projectOn = !!projectOnEl.checked;
+      const wallOn = !!wallOnEl.checked;
+      const wallVort = parseFloat(wallVortEl.value);
+      const vmax = parseFloat(vmaxEl.value);
+      sigmaVal.textContent = sigma.toFixed(2);
+      gainVal.textContent = gain.toFixed(1);
+      strokeDecayVal.textContent = strokeDecay.toFixed(2);
+      decayVal.textContent = decay.toFixed(2);
+      speedVal.textContent = speed.toFixed(1);
+      wallVortVal.textContent = wallVort.toFixed(2);
+      vmaxVal.textContent = vmax.toFixed(1);
+      // UX: disable decay slider when global decay is off
+      decayEl.disabled = !decayOn;
+      // UX: wall vorticity only relevant when wall is on
+      wallVortEl.disabled = !wallOn;
+      return {sigma, gain, strokeDecay, decayOn, decay, speed, transportOn, projectOn, wallOn, wallVort, vmax};
+    }
+    let params = readParams();
+    [sigmaEl,gainEl,strokeDecayEl,decayEl,speedEl,wallVortEl,vmaxEl].forEach(el => el.addEventListener("input", () => {
+      params = readParams();
+    }));
+    ;[decayOnEl, transportOnEl, projectOnEl, wallOnEl].forEach(el => el.addEventListener("change", () => {
+      params = readParams();
+    }));
+
+    // ---------- applying a stroke segment ----------
+    function applySegment(p0, p1){
+      const {sigma, gain, strokeDecay, vmax} = params;
+      const d = sub(p1, p0);
+      const len = norm(d);
+      if (len < 1e-4) return;
+
+      const dir = scale(d, 1/len);
+      const mid = scale(add(p0,p1), 0.5);
+
+      const inv2s2 = 1/(2*sigma*sigma);
+      const strength = gain * len; // segment length drives total impulse
+
+      for (const i of gridIdx){
+        const x = px[i], y = py[i];
+        const dx = x - mid.x;
+        const dy = y - mid.y;
+        const w = Math.exp(-(dx*dx + dy*dy) * inv2s2);
+        if (w < 1e-4) continue;
+        // Stroke-local decay: reduce ONLY the component of the existing field colinear with the stroke direction.
+        // Apply locally (scaled by Gaussian weight) to avoid global damping.
+        const eff = strokeDecay * w;
+        if (eff > 0){
+          const vp = vx[i]*dir.x + vy[i]*dir.y; // projection
+          vx[i] -= eff * vp * dir.x;
+          vy[i] -= eff * vp * dir.y;
+        }
+
+        // Add impulse
+        vx[i] += strength * w * dir.x;
+        vy[i] += strength * w * dir.y;
+
+        // clamp
+        const m = Math.hypot(vx[i], vy[i]);
+        if (m > vmax){
+          const s = vmax / m;
+          vx[i] *= s; vy[i] *= s;
+        }
+      }
+    }
+
+    // ---------- transport along flow lines (self-advection) + optional projection ----------
+    function sampleBilinear(x, y, srcX, srcY){
+      // x,y in [-1,1]
+      const gx = (x + 1) * 0.5 * (N - 1);
+      const gy = (y + 1) * 0.5 * (N - 1);
+      const x0 = Math.max(0, Math.min(N-2, Math.floor(gx)));
+      const y0 = Math.max(0, Math.min(N-2, Math.floor(gy)));
+      const tx = gx - x0;
+      const ty = gy - y0;
+
+      const i00 = idx(x0, y0);
+      const i10 = idx(x0+1, y0);
+      const i01 = idx(x0, y0+1);
+      const i11 = idx(x0+1, y0+1);
+
+      const a00x = srcX[i00], a00y = srcY[i00];
+      const a10x = srcX[i10], a10y = srcY[i10];
+      const a01x = srcX[i01], a01y = srcY[i01];
+      const a11x = srcX[i11], a11y = srcY[i11];
+
+      const ax0 = a00x*(1-tx) + a10x*tx;
+      const ay0 = a00y*(1-tx) + a10y*tx;
+      const ax1 = a01x*(1-tx) + a11x*tx;
+      const ay1 = a01y*(1-tx) + a11y*tx;
+
+      return {
+        x: ax0*(1-ty) + ax1*ty,
+        y: ay0*(1-ty) + ay1*ty,
+      };
+    }
+
+    function wallProjectAndSwirl(i, wallVort){
+      const x = px[i], y = py[i];
+      const r = Math.hypot(x,y);
+      if (r < 1e-6) return;
+      if (r < 0.975) return;
+      const rx = x / r, ry = y / r;
+      const radial = vx2[i]*rx + vy2[i]*ry;
+      // no-penetration: remove radial component
+      vx2[i] -= radial * rx;
+      vy2[i] -= radial * ry;
+      // add a small tangential swirl proportional to “slam” into wall
+      const slam = Math.max(0, radial);
+      if (slam <= 0 || wallVort <= 0) return;
+      const tx = -ry, ty = rx;
+      const sign = Math.sign(x*vy2[i] - y*vx2[i]) || 1;
+      vx2[i] += sign * wallVort * slam * tx;
+      vy2[i] += sign * wallVort * slam * ty;
+    }
+
+    function projectIncompressible(){
+      // Enforce ∇·v = 0 (volume-preserving) on the disk mask via a Jacobi pressure solve,
+      // then subtract ∇p. Boundary is treated as a solid wall (no normal flux).
+      const iters = 22;
+
+      // divergence (centered differences with solid boundary handling)
+      for (const i of gridIdx){
+        const ix = i % N;
+        const iy = (i / N) | 0;
+        const il = neigh(ix, iy, -1, 0);
+        const ir = neigh(ix, iy,  1, 0);
+        const id = neigh(ix, iy, 0, -1);
+        const iu = neigh(ix, iy, 0,  1);
+
+        const vlx = (il >= 0) ? vx2[il] : 0;
+        const vrx = (ir >= 0) ? vx2[ir] : 0;
+        const vdy = (id >= 0) ? vy2[id] : 0;
+        const vuy = (iu >= 0) ? vy2[iu] : 0;
+
+        div[i] = (vrx - vlx + vuy - vdy) / (2*H);
+        p[i] = 0;
+      }
+
+      // Jacobi: ∇²p = div
+      for (let k=0; k<iters; k++){
+        for (const i of gridIdx){
+          const ix = i % N;
+          const iy = (i / N) | 0;
+          const il = neigh(ix, iy, -1, 0);
+          const ir = neigh(ix, iy,  1, 0);
+          const id = neigh(ix, iy, 0, -1);
+          const iu = neigh(ix, iy, 0,  1);
+
+          const pl = (il >= 0) ? p[il] : p[i];
+          const pr = (ir >= 0) ? p[ir] : p[i];
+          const pd = (id >= 0) ? p[id] : p[i];
+          const pu = (iu >= 0) ? p[iu] : p[i];
+          p2[i] = (pl + pr + pd + pu - div[i] * (H*H)) * 0.25;
+        }
+        // swap p <-> p2
+        for (const i of gridIdx){
+          p[i] = p2[i];
+        }
+      }
+
+      // subtract pressure gradient
+      for (const i of gridIdx){
+        const ix = i % N;
+        const iy = (i / N) | 0;
+        const il = neigh(ix, iy, -1, 0);
+        const ir = neigh(ix, iy,  1, 0);
+        const id = neigh(ix, iy, 0, -1);
+        const iu = neigh(ix, iy, 0,  1);
+
+        const pl = (il >= 0) ? p[il] : p[i];
+        const pr = (ir >= 0) ? p[ir] : p[i];
+        const pd = (id >= 0) ? p[id] : p[i];
+        const pu = (iu >= 0) ? p[iu] : p[i];
+
+        vx2[i] -= (pr - pl) / (2*H);
+        vy2[i] -= (pu - pd) / (2*H);
+      }
+    }
+
+    function transportStep(dt){
+      const {wallVort, vmax, wallOn, projectOn} = params;
+      // advect
+      vx2.fill(0); vy2.fill(0);
+      for (const i of gridIdx){
+        const x = px[i], y = py[i];
+        const bx = x - dt * vx[i];
+        const by = y - dt * vy[i];
+        const b = clampToDisk({x:bx, y:by}, 0.999);
+        const vv = sampleBilinear(b.x, b.y, vx, vy);
+        vx2[i] = vv.x;
+        vy2[i] = vv.y;
+      }
+      // Optional solid wall: no-penetration + optional collision swirl
+      if (wallOn){
+        for (const i of gridIdx){
+          wallProjectAndSwirl(i, wallVort);
+          const m = Math.hypot(vx2[i], vy2[i]);
+          if (m > vmax){
+            const s = vmax / m;
+            vx2[i] *= s; vy2[i] *= s;
+          }
+        }
+      }
+
+      // Optional volume preservation (projection)
+      if (projectOn){
+        projectIncompressible();
+        if (wallOn){
+          for (const i of gridIdx){
+            wallProjectAndSwirl(i, 0); // just no-penetration after projection
+            const m = Math.hypot(vx2[i], vy2[i]);
+            if (m > vmax){
+              const s = vmax / m;
+              vx2[i] *= s; vy2[i] *= s;
+            }
+          }
+        }
+      }
+
+      // commit
+      for (const i of gridIdx){
+        vx[i] = vx2[i];
+        vy[i] = vy2[i];
+      }
+    }
+
+    // ---------- drawing ----------
+    function drawDisk(){
+      const {w,h,R,cx,cy} = geom();
+      ctx.clearRect(0,0,w,h);
+      ctx.save();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = "#000";
+      ctx.beginPath();
+      ctx.arc(cx,cy,R,0,TAU);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function colorFromMag(m, vmax){
+      const t = Math.max(0, Math.min(1, m / Math.max(1e-6, vmax)));
+      // blue -> red
+      const hue = 220 - 220*t;
+      const sat = 92;
+      const light = 46;
+      return `hsl(${hue} ${sat}% ${light}%)`;
+    }
+
+    function drawArrow(p, v){
+      const {vmax} = params;
+      const m = Math.hypot(v.x,v.y);
+      if (m < 1e-3) return;
+
+      const u = unit(v);
+      const t = Math.max(0, Math.min(1, m / Math.max(1e-6, vmax)));
+
+      // length in disk units: proportional to sqrt(m)
+      const L = 0.04 + 0.20 * Math.sqrt(t);
+      const shaft = scale(u, L);
+
+      const p0 = diskToPx(p);
+      const p1 = diskToPx(add(p, shaft));
+
+      ctx.save();
+      ctx.strokeStyle = colorFromMag(m, vmax);
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.globalAlpha = 0.95;
+      ctx.lineWidth = 0.8 + 2.2 * t;
+      ctx.lineCap = "round";
+
+      // shaft
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+
+      // head
+      const headLen = 6 + 6*t;
+      const headAng = 0.55;
+      const ang = Math.atan2(u.y, u.x);
+      const a1 = ang + Math.PI - headAng;
+      const a2 = ang + Math.PI + headAng;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p1.x + headLen*Math.cos(a1), p1.y - headLen*Math.sin(a1));
+      ctx.lineTo(p1.x + headLen*Math.cos(a2), p1.y - headLen*Math.sin(a2));
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // ---------- paint interaction ----------
+    let isDrawing = false;
+    let lastDisk = null;
+
+    function beginDraw(ev){
+      const p = pointerPos(ev);
+      const d = pxToDisk(p);
+      if (!insideDisk(d)) return;
+      isDrawing = true;
+      lastDisk = d;
+      ev.preventDefault();
+    }
+    function moveDraw(ev){
+      if (!isDrawing) return;
+      const p = pointerPos(ev);
+      let d = pxToDisk(p);
+      d = clampToDisk(d, 0.999);
+      if (!lastDisk) { lastDisk = d; return; }
+      applySegment(lastDisk, d);
+      lastDisk = d;
+      ev.preventDefault();
+    }
+    function endDraw(){
+      isDrawing = false;
+      lastDisk = null;
+    }
+
+    wrap.addEventListener("mousedown", beginDraw);
+    window.addEventListener("mousemove", moveDraw);
+    window.addEventListener("mouseup", endDraw);
+
+    wrap.addEventListener("touchstart", beginDraw, {passive:false});
+    window.addEventListener("touchmove", moveDraw, {passive:false});
+    window.addEventListener("touchend", endDraw);
+
+    // ---------- resize + animation ----------
+    function resize(){
+      const rect = wrap.getBoundingClientRect();
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width  = Math.round(rect.width  * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    window.addEventListener("resize", () => resize());
+
+    let lastT = performance.now();
+    function tick(t){
+      const dt = Math.min(0.05, (t - lastT)/1000);
+      lastT = t;
+      const dtSim = dt * Math.max(0.0, params.speed);
+
+      // Optional continuous decay toward zero: v <- v * exp(-decay*dt)
+      if (params.decayOn && Math.abs(params.decay) > 0){
+        if (params.decay > 0){
+          const k = Math.exp(-params.decay * dtSim);
+          for (const i of gridIdx){
+            vx[i] *= k;
+            vy[i] *= k;
+          }
+        } else {
+          // Negative decay => global boost toward a target total magnitude density.
+          // Target total magnitude ≈ (1/2) * vmax * area(disk) with area π in disk coordinates.
+          const target = 0.5 * params.vmax * Math.PI;
+          const cellArea = H*H;
+          let total = 0;
+          for (const i of gridIdx){
+            total += Math.hypot(vx[i], vy[i]) * cellArea;
+          }
+          if (total > 1e-8){
+            const rate = -params.decay;
+            const mul = Math.exp(rate * dtSim);
+            const maxMul = target / total;
+            const m = Math.min(mul, maxMul);
+            if (m > 1){
+              for (const i of gridIdx){
+                vx[i] *= m;
+                vy[i] *= m;
+                // keep per-cell clamp
+                const mag = Math.hypot(vx[i], vy[i]);
+                if (mag > params.vmax){
+                  const s = params.vmax / mag;
+                  vx[i] *= s;
+                  vy[i] *= s;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Optional transport along the field's own flow lines (group velocity = induced velocity)
+      if (params.transportOn){
+        // run a couple of small steps for stability (semi-Lagrangian is forgiving)
+        const subSteps = 2;
+        const hdt = dtSim / subSteps;
+        for (let s=0; s<subSteps; s++){
+          transportStep(hdt);
+        }
+      }
+
+      drawDisk();
+
+      // clip vector field to disk
+      const {R,cx,cy} = geom();
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx,cy,R-0.5,0,TAU);
+      ctx.clip();
+
+      for (const i of gridIdx){
+        drawArrow({x:px[i], y:py[i]}, {x:vx[i], y:vy[i]});
+      }
+      ctx.restore();
+
+      requestAnimationFrame(tick);
+    }
+
+    resize();
+    requestAnimationFrame(tick);
+  })();
+  </script>
+</body>
+</html>
+
+

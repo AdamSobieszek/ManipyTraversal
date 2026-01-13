@@ -50,6 +50,7 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Potential flow training script for pre-trained GANs")
 
+    parser.add_argument('--experiment-name', type=str, required=True, help='set experiment name')
     # === Pre-trained GAN Generator (G) ============================================================================== #
     parser.add_argument('--gan-type', type=str, choices=GAN_WEIGHTS.keys(), help='set GAN generator model type')
     parser.add_argument('--z-truncation', type=float, help="set latent code sampling truncation parameter")
@@ -61,33 +62,18 @@ def main():
     # === Support Sets (S) ======================================================================== #
     parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
     parser.add_argument('--only-potential', type=bool, default=True, help="only train potential")
-    parser.add_argument('--kanpde', action='store_true', help="use KanPDE")
 
     # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-lr', type=float, default=2e-4,
-                        help="set learning rate for reconstructor R optimization")
     parser.add_argument('--reconstructor-type', type=str, default='ResNet',
                         help='set reconstructor network type')
 
-    # === Training =================================================================================================== #
-    parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
+    # === Inference =================================================================================================== #
+    parser.add_argument('--max-iter', type=int, default=20, help="set maximum number of saved batches iterations")
     parser.add_argument('--batch-size', type=int, default=32, help="set batch size")
     parser.add_argument('--accumulate-grad-steps', type=int, default=1, help="set number of steps to accumulate gradients")
-    parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
-    parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
-    parser.add_argument('--lambda-reg', type=float, default=.0, help="regression loss weight")
-    parser.add_argument('--lambda-pde', type=float, default=1.00, help="pde loss weight")
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
-    parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
-    # === Restart ===================================================================================================== #
-    parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
-    parser.add_argument('--reset_lr', action='store_true', help="reset learning rate")
-    parser.add_argument('--reset_weight_decay', action='store_true', help="reset weight decay")
-    parser.add_argument('--reset_schedulers', action='store_true', help="reset schedulers")
-    parser.add_argument('--reset_start_iter', action='store_true', help="reset start iteration")
 
     # Parse given arguments
     args = parser.parse_args()
@@ -160,11 +146,9 @@ def main():
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
                     lambdas={'BB':.5, 'g2orth': 1.0},
-                    ) if not args.kanpde else KanPDE(num_support_sets=args.num_support_sets,
-                    num_support_timesteps=args.num_support_timesteps,
-                    support_vectors_dim=G.dim_z,
-                    lambdas={'fconvex': 1.0,'BB':.33, 'g2orth': 1.0},
-                    )
+                    ) 
+    S.load_state_dict(torch.load(f'experiments/{args.experiment_name}/support_sets.pth'))
+    S.eval()
     # For stylegan remove the last activation layer otherwise the changes are too small
     # if args.gan_type != 'StyleGAN2':
     #     for i in range(S.num_support_sets):
@@ -182,20 +166,8 @@ def main():
                       channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
                       pool_size=4 if args.gan_type == 'StyleGAN2' and args.stylegan2_resolution == 1024 else 1)
 
+    R.load_state_dict(torch.load(f'experiments/{args.experiment_name}/reconstructor.pth'))
+    R.eval()
+
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in R.parameters() if p.requires_grad)))
-
-    # Set up trainer
-    print("#. Experiment: {}".format(exp_dir))
-    print("  \\__Only train potential: {}".format(args.only_potential))
-    if args.only_potential:
-        trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
-    else:
-        trn = Trainer(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
-
-    # Train
-    trn.train(generator=G, support_sets=S, reconstructor=R)
-
-
-if __name__ == '__main__':
-    main()

@@ -1,14 +1,15 @@
 import argparse
 import os
 import os.path as osp
+import math
 import torch
 from torch import nn
 from PIL import Image, ImageDraw
 import json
 from torchvision.transforms import ToPILImage
 from lib import *
+from models.gan_load import build_biggan, build_proggan, build_stylegan2, build_sngan
 import numpy as np
-from vae import ConvVAE
 
 def text_save(filename, data):
     file = open(filename,'a')
@@ -49,6 +50,35 @@ def tensor2image(tensor, img_size=None, adaptive=False):
             return ToPILImage()((255 * tensor.cpu().detach()).to(torch.uint8))
 
 
+def build_gan(gan_type, target_classes, stylegan2_resolution, shift_in_w_space, use_cuda, multi_gpu):
+    # -- BigGAN
+    if gan_type == 'BigGAN':
+        G = build_biggan(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]],
+                         target_classes=target_classes)
+    # -- ProgGAN
+    elif gan_type == 'ProgGAN':
+        G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]])
+    # -- StyleGAN2
+    elif gan_type == 'StyleGAN2':
+        G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][stylegan2_resolution],
+                            resolution=stylegan2_resolution,
+                            shift_in_w_space=shift_in_w_space)
+    # -- Spectrally Normalised GAN (SNGAN)
+    else:
+        G = build_sngan(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]],
+                        gan_type=gan_type)
+
+    # Upload GAN generator model to GPU
+    if use_cuda:
+        G = G.cuda()
+
+    # Parallelize GAN generator model into multiple GPUs if possible
+    if multi_gpu:
+        G = DataParallelPassthrough(G)
+
+    return G
+
+
 def one_hot(dims, value, idx):
     vec = torch.zeros(dims)
     vec[idx] = value
@@ -63,17 +93,48 @@ def get_concat_h(img_file_orig,
                  shift_steps,
                  path_id,
                  draw_header=False,
-                 draw_progress_bar=True):
-    img_orig = Image.open(img_file_orig).resize((size, size))
-    img_orig_w = img_orig.width
-    img_orig_h = img_orig.height
+                 draw_progress_bar=True,
+                 progress_bar_width=12,
+                 progress_bar_side='right',
+                 include_original=True):
+    """
+    Returns a single-row panel image for a GIF frame.
 
-    img_shifted = Image.open(shifted_img_file).resize((size, size))
-    img_shifted_w = img_shifted.width
+    Layout options:
+      - include_original=True:  [orig | shifted] plus optional progress bar strip
+      - include_original=False: [shifted] plus optional progress bar strip
+      - progress_bar_side in {'left','right'} places the strip on that side (never obstructs images).
+    """
+    include_original = bool(include_original)
+    progress_bar_width = int(max(0, progress_bar_width))
+    progress_bar_side = (progress_bar_side or 'right').lower()
+    if progress_bar_side not in ('left', 'right'):
+        raise ValueError("progress_bar_side must be 'left' or 'right'")
 
-    dst = Image.new('RGB', (img_orig_w + img_shifted_w, img_orig_h))
-    dst.paste(img_orig, (0, 0))
-    dst.paste(img_shifted, (img_orig_w, 0))
+    img_h = int(size)
+    img_w = int(size)
+
+    img_shifted = Image.open(shifted_img_file).resize((img_w, img_h))
+    if include_original:
+        img_orig = Image.open(img_file_orig).resize((img_w, img_h))
+        content_w = img_w + img_w
+    else:
+        img_orig = None
+        content_w = img_w
+
+    dst_w = content_w + progress_bar_width
+    dst_h = img_h
+    dst = Image.new('RGB', (dst_w, dst_h))
+
+    bar_x0 = 0 if progress_bar_side == 'left' else content_w
+    content_x0 = progress_bar_width if progress_bar_side == 'left' else 0
+
+    # Paste images
+    if include_original:
+        dst.paste(img_orig, (content_x0, 0))
+        dst.paste(img_shifted, (content_x0 + img_w, 0))
+    else:
+        dst.paste(img_shifted, (content_x0, 0))
 
     # Add header with img_id and path_id
     if draw_header:
@@ -88,16 +149,73 @@ def get_concat_h(img_file_orig,
     # Draw progress bar
     if draw_progress_bar:
         draw = ImageDraw.Draw(dst)
-        bar_h = 7
-        bar_color = (252, 186, 3)
-        draw.rectangle(xy=[(size, size - bar_h), ((1 + s / shift_steps) * size, size)], fill=bar_color)
+        if progress_bar_width > 0:
+            bar_color = (252, 186, 3)
+            bar_bg = (35, 35, 35)
+            x0 = bar_x0
+            x1 = x0 + progress_bar_width
+            # background strip
+            draw.rectangle(xy=[(x0, 0), (x1, dst_h)], fill=bar_bg)
+            # vertical fill: start as an infinitesimally thin line at 0.5 and expand
+            # symmetrically around the center as we move away from the middle frame.
+            steps = max(1, int(shift_steps))
+            center = 0.5 * (steps - 1)  # middle frame index (can be .5 when even)
+            denom = max(1e-9, center)   # normalize distance to [0,1]
+            dist = abs(float(s) - center) / float(denom)
+            dist = max(0.0, min(1.0, dist))
+            y_mid = (dst_h - 1) / 2.0
+            half_fill = 0.5 * dist * dst_h
+            y0 = int(round(y_mid - half_fill))
+            y1 = int(round(y_mid + half_fill))
+            y0 = max(0, min(dst_h - 1, y0))
+            y1 = max(0, min(dst_h - 1, y1))
+            if y1 < y0:
+                y0, y1 = y1, y0
+            if y0 == y1:
+                # ensure at least 1px "infinitesimal" line
+                y1 = min(dst_h - 1, y0 + 1)
+            draw.rectangle(xy=[(x0, y0), (x1, y1)], fill=bar_color)
+            # outline
+            draw.rectangle(xy=[(x0, 0), (x1 - 1, dst_h - 1)], outline=(80, 80, 80))
 
     return dst
 
 
 def main():
-    
-    parser = argparse.ArgumentParser(description="Laten flow evolution script")
+    """WarpedGANSpace -- Latent space traversal script.
+
+    A script for traversing the latent space of a pre-trained GAN generator through paths defined by the warpings of
+    a set of pre-trained support vectors. Latent codes are drawn from a pre-defined collection via the `--pool`
+    argument. The generated images are stored under `results/` directory.
+
+    Options:
+        ================================================================================================================
+        -v, --verbose : set verbose mode on
+        ================================================================================================================
+        --exp         : set experiment's model dir, as created by `train.py`, i.e., it should contain a sub-directory
+                        `models/` with two files, namely `reconstructor.pt` and `support_sets.pt`, which
+                        contain the weights for the reconstructor and the support sets, respectively, and an `args.json`
+                        file that contains the arguments the model has been trained with.
+        --pool        : directory of pre-defined pool of latent codes (created by `sample_gan.py`)
+        ================================================================================================================
+        --shift-steps : set number of shifts to be applied to each latent code at each direction (positive/negative).
+                        That is, the total number of shifts applied to each latent code will be equal to
+                        2 * args.shift_steps.
+        --eps         : set shift step magnitude for generating G(z'), where z' = z +/- eps * direction.
+        --shift-leap  : set path shift leap (after how many steps to generate images)
+        --batch-size  : set generator batch size (if not set, use the total number of images per path)
+        --img-size    : set size of saved generated images (if not set, use the output size of the respective GAN
+                        generator)
+        --img-quality : JPEG image quality (max 95)
+        --gif         : generate collated GIF images for all paths and all latent codes
+        --gif-size    : set GIF image size
+        --gif-fps     : set number of frames per second for the generated GIF images
+        ================================================================================================================
+        --cuda        : use CUDA (default)
+        --no-cuda     : do not use CUDA
+        ================================================================================================================
+    """
+    parser = argparse.ArgumentParser(description="WarpedGANSpace latent space traversal script")
     parser.add_argument('-v', '--verbose', action='store_true', help="set verbose mode on")
     # ================================================================================================================ #
     parser.add_argument('--exp', type=str, required=True, help="set experiment's model dir (created by `train.py`)")
@@ -105,7 +223,7 @@ def main():
                                                                 "(created by `sample_gan.py`)")
     parser.add_argument('--shift-steps', type=int, default=16, help="set number of shifts per positive/negative path "
                                                                     "direction")
-    parser.add_argument('--eps', type=float, default=1, help="set shift step magnitude")
+    parser.add_argument('--eps', type=float, default=0.2, help="set shift step magnitude")
     parser.add_argument('--shift-leap', type=int, default=1,
                         help="set path shift leap (after how many steps to generate images)")
     parser.add_argument('--batch-size', type=int, help="set generator batch size (if not set, use the total number of "
@@ -116,7 +234,12 @@ def main():
     parser.add_argument('--gif', action='store_true', help="Create GIF traversals")
     parser.add_argument('--gif-size', type=int, default=256, help="set gif resolution")
     parser.add_argument('--gif-fps', type=int, default=30, help="set gif frame rate")
-    parser.add_argument("--vae_scratch", type=bool, default=False)
+    parser.add_argument('--gif-frame-multiplier', type=int, default=2,
+                        help="duplicate each GIF frame this many times (e.g. 2 => 2x frames / 2x slower)")
+    parser.add_argument('--gif-stack-dims', type=int, default=1,
+                        help="stack N path dimensions per GIF by horizontal concatenation")
+    parser.add_argument('--gif-progress-bar-width', type=int, default=12,
+                        help="width (px) of vertical progress bar strip drawn on the right")
     # ================================================================================================================ #
     parser.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA during training")
     parser.add_argument('--no-cuda', dest='cuda', action='store_false', help="do NOT use CUDA during training")
@@ -145,7 +268,7 @@ def main():
     # ---- Get all files of models directory
     models_dir_files = [f for f in os.listdir(models_dir) if osp.isfile(osp.join(models_dir, f))]
 
-    # ---- Check for PDE support sets file (final or checkpoint)
+    # ---- Check for support sets file (final or checkpoint)
     support_sets_model = osp.join(models_dir, 'checkpoint.pt')
     if not osp.isfile(support_sets_model):
         support_sets_checkpoint_files = []
@@ -156,9 +279,25 @@ def main():
         print(models_dir,support_sets_checkpoint_files)
         support_sets_model = osp.join(models_dir, support_sets_checkpoint_files[-1])
 
+    # ---- Check for reconstructor file (final or checkpoint)
+    # reconstructor_model = osp.join(models_dir, 'reconstructor.pt')
+    # if not osp.isfile(reconstructor_model):
+    #     reconstructor_checkpoint_files = []
+    #     for f in models_dir_files:
+    #         if 'reconstructor-' in f:
+    #             reconstructor_checkpoint_files.append(f)
+    #     reconstructor_checkpoint_files.sort()
+    #     reconstructor_model = osp.join(models_dir, reconstructor_checkpoint_files[-1])
+
     # Check given pool directory
     pool = osp.join('experiments', 'latent_codes')
-    pool = osp.join(pool, gan_type, args.pool)
+    if gan_type == 'BigGAN':
+        biggan_target_classes = ''
+        for c in args_json.__dict__["biggan_target_classes"]:
+            biggan_target_classes += '-{}'.format(c)
+        pool = osp.join(pool, gan_type + biggan_target_classes, args.pool)
+    else:
+        pool = osp.join(pool, gan_type, args.pool)
 
     if not osp.isdir(pool):
         raise NotADirectoryError("Invalid pool directory: {} -- Please run sample_gan.py to create it.".format(pool))
@@ -179,29 +318,33 @@ def main():
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
 
-    # Build VAE load with pre-trained weights
-    if args.shapes3d == True:
-        G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
-    else:
-        G = ConvVAE2(num_channel=3, latent_size=18 * 18, img_size=128)
-        
-
-    # Build PDE flows S
+    # Build GAN generator model and load with pre-trained weights
     if args.verbose:
-        print("#. Build PDE flows S...")
+        print("#. Build GAN generator model G and load with pre-trained weights...")
+        print("  \\__GAN type: {}".format(gan_type))
+        print("  \\__Pre-trained weights: {}".format(
+            GAN_WEIGHTS[gan_type]['weights'][args_json.__dict__["stylegan2_resolution"]]
+            if gan_type == 'StyleGAN2' else GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]]))
 
-    
+    G = build_gan(gan_type=gan_type,
+                  target_classes=args_json.__dict__["biggan_target_classes"],
+                  stylegan2_resolution=args_json.__dict__["stylegan2_resolution"],
+                  shift_in_w_space=args_json.__dict__["shift_in_w_space"],
+                  use_cuda=use_cuda,
+                  multi_gpu=multi_gpu).eval()
+
+    # Build support sets model S
+    if args.verbose:
+        print("#. Build support sets model S...")
+
     S = WavePDE(num_support_sets=args_json.__dict__["num_support_sets"],
-                num_support_timesteps=args_json.__dict__["num_support_timesteps"],
-                support_vectors_dim=G.latent_size)
-
+                    num_support_timesteps=args_json.__dict__["num_support_timesteps"],
+                    support_vectors_dim=G.dim_z,)
+    #For stylegan remove the last activation layer otherwise the changes are too small
+    # Load pre-trained weights and set to evaluation mode
     if args.verbose:
         print("  \\__Pre-trained weights: {}".format(support_sets_model))
     S.load_state_dict(torch.load(support_sets_model, map_location=lambda storage, loc: storage)['support_sets'])
-    if args.vae_scratch:
-        
-        G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
-        G.load_state_dict(torch.load(support_sets_model, map_location=lambda storage, loc: storage)['vae'])
     if args.verbose:
         print("  \\__Set to evaluation mode")
     S.eval()
@@ -257,6 +400,8 @@ def main():
 
     # Iterate over given latent codes
     for i in range(num_of_latent_codes):
+        #if i<=11:
+        #    continue
         # Un-squeeze current latent code in shape [1, dim] and create hash code for it
         z_ = zs[i, :].unsqueeze(0)
 
@@ -274,6 +419,112 @@ def main():
         # Create directory for storing path images
         transformed_images_root_dir = osp.join(latent_code_dir, 'paths_images')
         os.makedirs(transformed_images_root_dir, exist_ok=True)
+
+        # ============================================================================================================
+        # Vectorized traversal (WavePDE.inference runs all K paths in parallel).
+        # We keep the old per-dim implementation below but skip it via `continue`.
+        # ============================================================================================================
+        shift_in_w_space = args_json.__dict__.get("shift_in_w_space", True if gan_type == 'StyleGAN2' else False)
+
+        z0 = (G.get_w(z_, truncation_psi=0.5) if shift_in_w_space else z_).clone()
+        if z0.dim() != 2:
+            raise ValueError(f"Expected initial latent to be rank-2 [B,D], got shape={tuple(z0.shape)}")
+        z0_bk = z0.unsqueeze(1).expand(z0.size(0), num_gen_paths, z0.size(1)).contiguous()  # [1,K,D]
+
+        current_path_latent_codes = [z0_bk]
+        current_path_latent_shifts = [torch.zeros_like(z0_bk)]
+
+        half_steps = args.shift_steps // 2
+        dt_mag = 10 / max(1, half_steps - 1)
+
+        energy_waves = [[] for _ in range(num_gen_paths)]
+        shift_waves = [[] for _ in range(num_gen_paths)]
+
+        # == Negative direction ==
+        z = z0_bk
+        cnt = 0
+        for _step in range(0, half_steps):
+            cnt += 1
+            energy, z_infer, shift = S.inference(z, dt=-dt_mag, return_all=True)  # shift:[B,K,D]
+            for k in range(num_gen_paths):
+                energy_waves[k].append(float(energy[0, k].reshape(-1)[0].detach().cpu().item()))
+                shift_waves[k].extend(shift[0, k].detach().cpu().numpy().reshape(-1).tolist())
+            if cnt == args.shift_leap:
+                current_path_latent_shifts.append(-args.eps * shift)
+                current_path_latent_codes.append(z)
+                cnt = 0
+            z = z - args.eps * shift
+
+        current_path_latent_shifts.reverse()
+        current_path_latent_codes.reverse()
+
+        # == Positive direction ==
+        z = z0_bk
+        cnt = 0
+        for _step in range(0, half_steps):
+            cnt += 1
+            energy, z_infer, shift = S.inference(z, dt=dt_mag, return_all=True)  # shift:[B,K,D]
+            for k in range(num_gen_paths):
+                energy_waves[k].append(float(energy[0, k].reshape(-1)[0].detach().cpu().item()))
+                shift_waves[k].extend(shift[0, k].detach().cpu().numpy().reshape(-1).tolist())
+            if cnt == args.shift_leap:
+                current_path_latent_shifts.append(args.eps * shift)
+                current_path_latent_codes.append(z)
+                cnt = 0
+            z = z + args.eps * shift
+
+        for k in range(num_gen_paths):
+            text_save(osp.join(transformed_images_root_dir, 'shift_{:03d}.txt'.format(k)), np.array(shift_waves[k]))
+            text_save(osp.join(transformed_images_root_dir, 'wave_{:03d}.txt'.format(k)), np.array(energy_waves[k]))
+
+        current_path_latent_codes = torch.cat(current_path_latent_codes, dim=0)    # [T,K,D]
+        current_path_latent_shifts = torch.cat(current_path_latent_shifts, dim=0)  # [T,K,D]
+
+        # Save paths as [K, T, D]
+        torch.save(current_path_latent_codes.permute(1, 0, 2).contiguous(),
+                   osp.join(latent_code_dir, 'paths_latent_codes.pt'))
+
+        # Generate images: flatten [T,K,D] -> [T*K,D]
+        T_total = current_path_latent_codes.size(0)
+        codes_batches = torch.split(current_path_latent_codes, args.batch_size, dim=0)
+        shifts_batches = torch.split(current_path_latent_shifts, args.batch_size, dim=0)
+        if len(codes_batches) != len(shifts_batches):
+            raise AssertionError("Mismatched batches for latent codes vs shifts.")
+
+        transformed_img = []
+        for b in range(len(codes_batches)):
+            z_bkd = codes_batches[b]
+            s_bkd = shifts_batches[b]
+            z_bd = z_bkd.reshape(-1, z_bkd.size(-1))
+            s_bd = s_bkd.reshape(-1, s_bkd.size(-1))
+            with torch.no_grad():
+                transformed_img.append(G(z=z_bd, shift=s_bd))
+        transformed_img = torch.cat(transformed_img, dim=0)  # [T*K,C,H,W]
+        transformed_img = transformed_img.view(T_total, num_gen_paths, *transformed_img.shape[1:])  # [T,K,C,H,W]
+
+        for k in range(num_gen_paths):
+            if args.verbose:
+                print()
+                update_progress("      \\__path: {:03d}/{:03d} ".format(k + 1, num_gen_paths), num_gen_paths, k + 1)
+
+            transformed_images_dir = osp.join(transformed_images_root_dir, 'path_{:03d}'.format(k))
+            os.makedirs(transformed_images_dir, exist_ok=True)
+            for t in range(T_total):
+                pil_img = tensor2image(transformed_img[t, k].cpu(), img_size=args.img_size, adaptive=True)
+                pil_img.save(osp.join(transformed_images_dir, '{:06d}.jpg'.format(t)),
+                             "JPEG", quality=args.img_quality, optimize=True, progressive=True)
+                if (t == T_total // 2) and (k == 0):
+                    pil_img.save(osp.join(latent_code_dir, 'original_image.jpg'),
+                                 "JPEG", quality=95, optimize=True, progressive=True)
+            if args.verbose:
+                update_stdout(1)
+
+        if args.verbose:
+            update_stdout(1)
+            print()
+            print()
+
+        continue
 
         # Keep all latent paths the current latent code (sample)
         paths_latent_codes = []
@@ -293,78 +544,51 @@ def main():
             transformed_images = []
 
             # Current path's latent codes and shifts lists
-            current_path_latent_codes = [G.get_w(z_) if args_json.__dict__["shift_in_w_space"] else z_]
+            current_path_latent_codes = [G.get_w(z_, truncation_psi=0.5) if args_json.__dict__["shift_in_w_space"] else z_]
             current_path_latent_shifts = [torch.zeros_like(z_).cuda() if use_cuda else torch.zeros_like(z_)]
 
             ## ====================================================================================================== ##
             ##                                                                                                        ##
             ##                    [ Traverse through current path (positive/negative directions) ]                    ##
             ##                                                                                                        ##
-            ## ====================================================================================================== ##
             # == Positive direction ==
             if args_json.__dict__["shift_in_w_space"]:
                 z = z_.clone().requires_grad_()
-                w = G.get_w(z)
+                w = G.get_w(z, truncation_psi=0.5)
             else:
                 z = z_.clone().requires_grad_()
             cnt = 0
-            print("K index:",dim)
             half_steps = args.shift_steps // 2
-            # == Negative direction ==
             for step in range(0,half_steps):
                 cnt += 1
-                energy, shift, _ = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
-                                               step * torch.ones(1, 1, requires_grad=True),G.decoder)
-                if shift.dim()==1:
-                    shift = shift.unsqueeze(0)
-                #shift = shift.unsqueeze(0)
-                # Store latent codes and shifts
-                if cnt == args.shift_leap:
-                    current_path_latent_shifts.append(-args.eps*shift)
-                    current_path_latent_codes.append(w if args_json.__dict__["shift_in_w_space"] else z)
-                    cnt = 0
-                # Update z/w
-                if args_json.__dict__["shift_in_w_space"]:
-                    w = w - args.eps * shift
-                else:
-                    z = z - args.eps * shift
-            current_path_latent_shifts.reverse()
-            current_path_latent_codes.reverse()
-            # == Positive direction ==
-            if args_json.__dict__["shift_in_w_space"]:
-                z = z_.clone().requires_grad_()
-                w = G.get_w(z)
-            else:
-                z = z_.clone().requires_grad_()
-            cnt = 0
-            for step in range(0,half_steps):
-                cnt += 1
-                energy, shift, _ = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
-                                       step * torch.ones(1, 1, requires_grad=True),G.decoder)
-                if shift.dim()==1:
-                    shift = shift.unsqueeze(0)
-                #shift = shift.unsqueeze(0)
-                if step == 0:
+                energy, shift = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
+                                            step * torch.ones(1, 1, requires_grad=True), G)
+                print(energy)
+                if step==0:
                     energy_wave = np.array(energy.view(-1).cpu().detach().numpy())
-                    shift_wave = np.array(z.view(-1).cpu().detach().numpy())
-                    shift_wave = np.append(shift_wave, np.array(shift.view(-1).cpu().detach().numpy()))
+                    shift_wave = np.array(shift.view(-1).cpu().detach().numpy())
                 else:
                     energy_wave = np.append(energy_wave, np.array(energy.view(-1).cpu().detach().numpy()))
-                    shift_wave = np.append(shift_wave, np.array(shift.view(-1).cpu().detach().numpy()))
-              
-                # Store latent codes and shifts
+                    shift_wave = np.append(shift_wave,np.array(shift.view(-1).cpu().detach().numpy()))
                 if cnt == args.shift_leap:
                     current_path_latent_shifts.append(args.eps*shift)
                     current_path_latent_codes.append(w if args_json.__dict__["shift_in_w_space"] else z)
                     cnt = 0
-
                 # Update z/w
                 if args_json.__dict__["shift_in_w_space"]:
-                    w = w + args.eps * shift
+                    w = w + args.eps*shift
                 else:
-                    z = z + args.eps * shift
+                    z = z + args.eps*shift
+                # Store latent codes and shifts
             text_save(osp.join(transformed_images_root_dir, 'shift_{:03d}.txt'.format(dim)), shift_wave)
             text_save(osp.join(transformed_images_root_dir, 'wave_{:03d}.txt'.format(dim)), energy_wave)
+            # Generate transformed images
+            # Split latent codes and shifts in batches
+            current_path_latent_codes = torch.cat(current_path_latent_codes)
+            current_path_latent_codes_batches = torch.split(current_path_latent_codes, args.batch_size)
+            current_path_latent_shifts = torch.cat(current_path_latent_shifts)
+            current_path_latent_shifts_batches = torch.split(current_path_latent_shifts, args.batch_size)
+
             if len(current_path_latent_codes_batches) != len(current_path_latent_shifts_batches):
                 raise AssertionError()
             else:
@@ -373,11 +597,13 @@ def main():
             transformed_img = []
             for t in range(num_batches):
                 with torch.no_grad():
-                    print(current_path_latent_shifts_batches[t]+current_path_latent_shifts_batches[t])
-                    img = G.inference(current_path_latent_codes_batches[t]+current_path_latent_shifts_batches[t])
-                    transformed_img.append(img)
+                    if args_json.__dict__["shift_in_w_space"]:
+                        transformed_img.append(G(z=current_path_latent_codes_batches[t],
+                                                 shift=current_path_latent_shifts_batches[t]))
+                    else:
+                        transformed_img.append(G(z=current_path_latent_codes_batches[t],
+                                                 shift=current_path_latent_shifts_batches[t]))
             transformed_img = torch.cat(transformed_img)
-
 
             # Convert tensors (transformed images) into PIL images
             for t in range(transformed_img.size()[0]):
@@ -425,8 +651,8 @@ def main():
                                    if os.path.isdir(os.path.join(path_images_dir, dI))]
             path_images_subdirs.sort()
             for item in path_images_subdirs:
-                structure[img_id].update({item: [dI for dI in os.listdir(osp.join(path_images_dir, item))
-                                                 if osp.isfile(os.path.join(path_images_dir, item, dI))]})
+                structure[img_id].update({item: sorted([dI for dI in os.listdir(osp.join(path_images_dir, item))
+                                                        if osp.isfile(os.path.join(path_images_dir, item, dI))])})
 
         # Create directory for storing traversal GIFs
         os.makedirs(osp.join(out_dir, 'paths_gifs'), exist_ok=True)
@@ -434,49 +660,128 @@ def main():
         # For each interpretable path (warping function), collect the generated image sequences for each original latent
         # code and collate them into a GIF file
         print("#. Collate GIFs...")
-        num_of_frames = list()
-        for dim in range(num_gen_paths):
+        gif_stack = max(1, int(args.gif_stack_dims))
+        frame_mult = max(1, int(args.gif_frame_multiplier))
+        bar_w = max(0, int(args.gif_progress_bar_width))
+        img_ids = list(structure.keys())
+
+        def _hconcat(imgs):
+            if len(imgs) == 1:
+                return imgs[0]
+            w = sum(im.width for im in imgs)
+            h = max(im.height for im in imgs)
+            out = Image.new('RGB', (w, h))
+            x = 0
+            for im in imgs:
+                out.paste(im, (x, 0))
+                x += im.width
+            return out
+
+        for dim0 in range(0, num_gen_paths, gif_stack):
+            dims = list(range(dim0, min(num_gen_paths, dim0 + gif_stack)))
             if args.verbose:
-                update_progress("  \\__path: {:03d}/{:03d} ".format(dim + 1, num_gen_paths), num_gen_paths, dim + 1)
+                update_progress("  \\__paths: {} ".format(",".join(["{:03d}".format(d) for d in dims])),
+                                num_gen_paths, dims[-1] + 1)
+
+            # Determine shared (safe) frame count across all img_ids and selected dims
+            frame_counts = []
+            for img_id in img_ids:
+                for d in dims:
+                    key = 'path_{:03d}'.format(d)
+                    if key not in structure[img_id]:
+                        raise KeyError("Missing {} for img_id={}".format(key, img_id))
+                    frame_counts.append(len(structure[img_id][key]))
+            min_frames = int(min(frame_counts)) if len(frame_counts) else 0
+            if min_frames <= 0:
+                print("#. Warning: No frames found for dims={} (skipping)".format(dims))
+                continue
+            if len(set(frame_counts)) > 1:
+                print("#. Warning: Inconsistent number of frames (using min={}): {}".format(min_frames, frame_counts))
 
             gif_frames = []
-            for img_id in structure.keys():
+            for img_id in img_ids:
                 original_img_file = osp.join(out_dir, '{}'.format(img_id), 'original_image.jpg')
-                shifted_images_dir = osp.join(out_dir, '{}'.format(img_id), 'paths_images', 'path_{:03d}'.format(dim))
+                path_images_dir = osp.join(out_dir, '{}'.format(img_id), 'paths_images')
 
                 row_frames = []
-                img_id_num_of_frames = 0
-                for t in range(len(structure[img_id]['path_{:03d}'.format(dim)])):
-                    img_id_num_of_frames += 1
-                for t in range(len(structure[img_id]['path_{:03d}'.format(dim)])):
-                    shifted_img_file = osp.join(shifted_images_dir, '{:06d}.jpg'.format(t))
+                for t in range(min_frames):
+                    panels = []
+                    even_cols_layout = (len(dims) % 2 == 0)
+                    for d in dims:
+                        key = 'path_{:03d}'.format(d)
+                        shifted_images_dir = osp.join(path_images_dir, key)
+                        shifted_img_file = osp.join(shifted_images_dir, structure[img_id][key][t])
+                        col_idx = dims.index(d)  # 0-based within this gif
+                        if even_cols_layout:
+                            # Even number of columns: alternate a compact layout.
+                            # - odd-numbered columns (1-based) show only changing image with slider on the LEFT
+                            # - even-numbered columns (1-based) show orig+shifted with slider on the RIGHT
+                            if (col_idx % 2) == 0:
+                                include_original = False
+                                bar_side = 'left'
+                            else:
+                                include_original = True
+                                bar_side = 'right'
+                        else:
+                            include_original = True
+                            bar_side = 'right'
 
-                    # Concatenate `original_img_file` and `shifted_img_file`
-                    row_frames.append(get_concat_h(img_file_orig=original_img_file,
-                                                   shifted_img_file=shifted_img_file,
-                                                   size=args.img_size,
-                                                   img_id=img_id,
-                                                   s=t,
-                                                   shift_steps=img_id_num_of_frames,
-                                                   path_id=dim))
-                num_of_frames.append(img_id_num_of_frames)
+                        panels.append(get_concat_h(img_file_orig=original_img_file,
+                                                  shifted_img_file=shifted_img_file,
+                                                  size=args.gif_size,
+                                                  img_id=img_id,
+                                                  s=t,
+                                                  shift_steps=min_frames,
+                                                  path_id=d,
+                                                  progress_bar_width=bar_w,
+                                                  progress_bar_side=bar_side,
+                                                  include_original=include_original))
+                    row_frames.append(_hconcat(panels))
                 gif_frames.append(row_frames)
 
-            if len(set(num_of_frames)) > 1:
-                print("#. Warning: Inconsistent number of frames for image sequences: {}".format(num_of_frames))
-
-            # Create full GIF frames
+            # Create full GIF frames (vertical stack across img_ids)
+            if len(dims) % 2 == 0:
+                # alternating widths: (bar+1img) for odd columns, (2img+bar) for even columns
+                w_odd = (args.gif_size + bar_w)
+                w_even = (2 * args.gif_size + bar_w)
+                frame_w = 0
+                for j in range(len(dims)):
+                    frame_w += (w_odd if (j % 2) == 0 else w_even)
+            else:
+                frame_w = len(dims) * (2 * args.gif_size + bar_w)
+            frame_h = len(img_ids) * args.gif_size
             full_gif_frames = []
-            for f in range(int(num_of_frames[0])):
-                gif_f = Image.new('RGB', (2 * args.gif_size, len(structure) * args.gif_size))
-                for i in range(len(structure)):
+            for f in range(min_frames):
+                gif_f = Image.new('RGB', (frame_w, frame_h))
+                for i in range(len(img_ids)):
                     gif_f.paste(gif_frames[i][f], (0, i * args.gif_size))
                 full_gif_frames.append(gif_f)
 
+            # Duplicate frames to get more frames / slower playback
+            # Time-warp: minimal multiplier is `frame_mult` at 1/4 and 3/4 of the GIF.
+            # Between, apply a squared cosine so that at 0/4, 2/4, 4/4 the multiplier is 3*frame_mult.
+            if frame_mult >= 1:
+                warped = []
+                n = len(full_gif_frames)
+                for f, fr in enumerate(full_gif_frames):
+                    if n <= 1:
+                        m = frame_mult
+                    else:
+                        phase = float(f) / float(n - 1)  # in [0,1]
+                        c = math.cos(2.0 * math.pi * phase)
+                        m = int(round(frame_mult * (1.0 + 1.0 * (c * c)/2)))
+                        m = max(1, m)
+                    warped.extend([fr] * m)
+                full_gif_frames = warped
+
             # Save gif
-            im = Image.new(mode='RGB', size=(2 * args.gif_size, len(structure) * args.gif_size))
+            if len(dims) == 1:
+                gif_name = 'path_{:03d}.gif'.format(dims[0])
+            else:
+                gif_name = 'paths_{:03d}-{:03d}.gif'.format(dims[0], dims[-1])
+            im = Image.new(mode='RGB', size=(frame_w, frame_h))
             im.save(
-                fp=osp.join(out_dir, 'paths_gifs', 'path_{:03d}.gif'.format(dim)),
+                fp=osp.join(out_dir, 'paths_gifs', gif_name),
                 append_images=full_gif_frames,
                 save_all=True,
                 optimize=True,

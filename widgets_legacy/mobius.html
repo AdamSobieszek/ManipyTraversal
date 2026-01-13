@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Möbius / Inversion on Sphere Grid (Interactive)</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #0b0c10; color: #e8e8e8; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #wrap { height: 100%; display: grid; grid-template-rows: auto 1fr; }
+    #ui {
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+      padding: 12px 14px; background: rgba(255,255,255,0.06); border-bottom: 1px solid rgba(255,255,255,0.10);
+    }
+    #ui label { display: inline-flex; align-items: center; gap: 10px; }
+    #ui input[type="range"] { width: min(440px, 60vw); }
+    #ui .pill {
+      padding: 6px 10px; border: 1px solid rgba(255,255,255,0.16);
+      border-radius: 999px; background: rgba(255,255,255,0.05);
+      font-size: 12px;
+    }
+    #canvas { width: 100%; height: 100%; display: block; }
+    a { color: #9bd2ff; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="ui">
+      <label>
+        Inversion radius R:
+        <input id="rin" type="range" min="0.2" max="8.0" step="0.01" value="2.40" />
+        <span class="pill" id="rinVal">2.40</span>
+      </label>
+
+      <label class="pill">
+        <input id="showOriginal" type="checkbox" checked />
+        Original grid (black/purple)
+      </label>
+
+      <label class="pill">
+        <input id="showTransformed" type="checkbox" checked />
+        Transformed grid (blue/red)
+      </label>
+
+      <span class="pill">Drag to orbit • Scroll to zoom</span>
+    </div>
+
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <!-- Three.js (CDN). If you need offline, download these files and serve locally. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    // ----------------------------
+    // Parameters (match your LaTeX defaults)
+    // ----------------------------
+    let r = 1.2;                // original sphere radius
+    let Rin = 2.0 * r;          // inversion radius (slider controls this)
+    const P = new THREE.Vector3(0, 0, r); // inversion center at north pole
+
+    // Ranges from the TeX file
+    const startLat = -88, endLat = 70, samplesLat = 15;
+    const startLon = 0.1, endLon = 360, samplesLon = 18;
+
+    const latStep = (endLat - startLat) / samplesLat;
+    const lonStep = (endLon - startLon) / samplesLon;
+
+    // Sampling along each curve (TeX used 120/160; keep it moderate but smooth)
+    const curveSamplesOriginal = 120;
+    const curveSamplesTransformed = 160;
+
+    // ----------------------------
+    // Three.js setup
+    // ----------------------------
+    const canvas = document.getElementById("canvas");
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 200);
+    // Roughly mimic tdplotsetmaincoords{65}{130}
+    // We'll place camera on a sphere around origin:
+    const camDist = 7.0;
+    const elevDeg = 65, azimDeg = 130;
+    const elev = THREE.MathUtils.degToRad(elevDeg);
+    const azim = THREE.MathUtils.degToRad(azimDeg);
+    // y-up convention:
+    camera.position.set(
+      camDist * Math.cos(elev) * Math.cos(azim),
+      camDist * Math.sin(elev),
+      camDist * Math.cos(elev) * Math.sin(azim)
+    );
+    camera.lookAt(0, 0, 0);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+
+    // Lighting isn't needed for lines, but a subtle ambient helps if you add meshes later.
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+
+    // Group containers so we can show/hide quickly
+    const gOriginal = new THREE.Group();
+    const gTransformed = new THREE.Group();
+    scene.add(gOriginal, gTransformed);
+
+    // Mark point P
+    const pGeom = new THREE.SphereGeometry(0.04, 16, 16);
+    const pMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const pMesh = new THREE.Mesh(pGeom, pMat);
+    pMesh.position.copy(P);
+    scene.add(pMesh);
+
+    // Optional: show the original sphere faintly for context
+    const sphereGeom = new THREE.SphereGeometry(r, 48, 48);
+    const sphereWire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(sphereGeom),
+      new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2, depthWrite: false })
+    );
+    gOriginal.add(sphereWire);
+
+    // ----------------------------
+    // Math helpers (degrees in, Vector3 out)
+    // ----------------------------
+    function origPoint(lonDeg, latDeg) {
+      const lon = THREE.MathUtils.degToRad(lonDeg);
+      const lat = THREE.MathUtils.degToRad(latDeg);
+      const x = r * Math.cos(lat) * Math.cos(lon);
+      const y = r * Math.cos(lat) * Math.sin(lon);
+      const z = r * Math.sin(lat);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    // Inversion in sphere centered at P with radius Rin:
+    // x ↦ P + (R^2 / ||x-P||^2) (x-P)
+    function invertPoint(x) {
+      const v = x.clone().sub(P);
+      const d2 = v.lengthSq();
+      // avoid division by 0 if ever hit P
+      const eps = 1e-9;
+      const s = (Rin * Rin) / Math.max(d2, eps);
+      return P.clone().add(v.multiplyScalar(s));
+    }
+
+    // Build a line from a param curve sampled uniformly
+    function makeLine(points, colorHex) {
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineBasicMaterial({ color: colorHex });
+      return new THREE.Line(geom, mat);
+    }
+
+    // Update an existing line's geometry positions (so slider updates are cheap)
+    function updateLineGeometry(line, points) {
+      const pos = line.geometry.attributes.position;
+      // If point count changes, rebuild geometry
+      if (!pos || pos.count !== points.length) {
+        line.geometry.dispose();
+        line.geometry = new THREE.BufferGeometry().setFromPoints(points);
+        return;
+      }
+      for (let i = 0; i < points.length; i++) {
+        pos.setXYZ(i, points[i].x, points[i].y, points[i].z);
+      }
+      pos.needsUpdate = true;
+      line.geometry.computeBoundingSphere();
+    }
+
+    // ----------------------------
+    // Build grids
+    // ----------------------------
+    const originalLatitudeLines = [];
+    const originalLongitudeLines = [];
+    const transformedLatitudeLines = [];
+    const transformedLongitudeLines = [];
+
+    function buildOriginalGrid() {
+      // Latitude circles (black)
+      for (let k = 0; k <= samplesLat; k++) {
+        const lat = startLat + k * latStep;
+        // mimic TeX "skip last" behavior
+        if (k === samplesLat) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesOriginal; i++) {
+          const t = i / curveSamplesOriginal;
+          const lon = startLon + t * (endLon - startLon);
+          pts.push(origPoint(lon, lat));
+        }
+        const line = makeLine(pts, 0x000000);
+        originalLatitudeLines.push(line);
+        gOriginal.add(line);
+      }
+
+      // Longitude circles (purple)
+      for (let k = 0; k <= samplesLon; k++) {
+        const lon = startLon + k * lonStep;
+        if (k === samplesLon) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesOriginal; i++) {
+          const t = i / curveSamplesOriginal;
+          const lat = startLat + t * (endLat - startLat);
+          pts.push(origPoint(lon, lat));
+        }
+        const line = makeLine(pts, 0x8a2be2); // purple-ish
+        originalLongitudeLines.push(line);
+        gOriginal.add(line);
+      }
+    }
+
+    function buildTransformedGrid() {
+      // Latitude curves (blue)
+      for (let k = 0; k <= samplesLat; k++) {
+        const lat = startLat + k * latStep;
+        if (k === samplesLat) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesTransformed; i++) {
+          const t = i / curveSamplesTransformed;
+          const lon = startLon + t * (endLon - startLon);
+          pts.push(invertPoint(origPoint(lon, lat)));
+        }
+        const line = makeLine(pts, 0x1e90ff); // blue-ish
+        transformedLatitudeLines.push(line);
+        gTransformed.add(line);
+      }
+
+      // Longitude curves (red)
+      for (let k = 0; k <= samplesLon; k++) {
+        const lon = startLon + k * lonStep;
+        if (k === samplesLon) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesTransformed; i++) {
+          const t = i / curveSamplesTransformed;
+          const lat = startLat + t * (endLat - startLat);
+          pts.push(invertPoint(origPoint(lon, lat)));
+        }
+        const line = makeLine(pts, 0xff3b30); // red-ish
+        transformedLongitudeLines.push(line);
+        gTransformed.add(line);
+      }
+    }
+
+    function updateTransformedGrid() {
+      // Recompute points for each transformed line
+      let idx = 0;
+      for (let k = 0; k <= samplesLat; k++) {
+        const lat = startLat + k * latStep;
+        if (k === samplesLat) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesTransformed; i++) {
+          const t = i / curveSamplesTransformed;
+          const lon = startLon + t * (endLon - startLon);
+          pts.push(invertPoint(origPoint(lon, lat)));
+        }
+        updateLineGeometry(transformedLatitudeLines[idx++], pts);
+      }
+
+      idx = 0;
+      for (let k = 0; k <= samplesLon; k++) {
+        const lon = startLon + k * lonStep;
+        if (k === samplesLon) continue;
+
+        const pts = [];
+        for (let i = 0; i <= curveSamplesTransformed; i++) {
+          const t = i / curveSamplesTransformed;
+          const lat = startLat + t * (endLat - startLat);
+          pts.push(invertPoint(origPoint(lon, lat)));
+        }
+        updateLineGeometry(transformedLongitudeLines[idx++], pts);
+      }
+    }
+
+    // ----------------------------
+    // UI wiring
+    // ----------------------------
+    const rinEl = document.getElementById("rin");
+    const rinValEl = document.getElementById("rinVal");
+    const showOriginalEl = document.getElementById("showOriginal");
+    const showTransformedEl = document.getElementById("showTransformed");
+
+    function setRin(value) {
+      Rin = value;
+      rinValEl.textContent = Rin.toFixed(2);
+      updateTransformedGrid();
+    }
+
+    rinEl.addEventListener("input", () => setRin(parseFloat(rinEl.value)));
+    showOriginalEl.addEventListener("change", () => { gOriginal.visible = showOriginalEl.checked; });
+    showTransformedEl.addEventListener("change", () => { gTransformed.visible = showTransformedEl.checked; });
+
+    // ----------------------------
+    // Resize + render loop
+    // ----------------------------
+    function resize() {
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    window.addEventListener("resize", resize);
+
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    // ----------------------------
+    // Init
+    // ----------------------------
+    buildOriginalGrid();
+    buildTransformedGrid();
+    resize();
+    setRin(parseFloat(rinEl.value));
+    animate();
+  </script>
+</body>
+</html>

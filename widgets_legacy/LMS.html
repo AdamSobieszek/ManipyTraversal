@@ -42,6 +42,9 @@
       position:relative;
       width: min(var(--canvas-max), 100%);
       aspect-ratio:1/1;
+      --uiScale: 1;
+      --titleX: 0px;
+      --titleY: 0px;
       user-select:none; -webkit-user-select:none; touch-action:none;
       background: rgba(255,255,255,0.72);
       border: 1px solid var(--border);
@@ -52,25 +55,56 @@
         0 18px 60px rgba(0,0,0,0.10);
     }
     canvas{ width:100%; height:100%; display:block; }
+    .resizeHandle{
+      position:absolute;
+      width: 14px;
+      height: 14px;
+      pointer-events:auto;
+      z-index: 6; /* above canvas, below overlay text (pointer-events none anyway) */
+      background: transparent;
+    }
+    .resizeHandle.nw{ left: 0; top: 0; cursor: nwse-resize; }
+    .resizeHandle.ne{ right: 0; top: 0; cursor: nesw-resize; }
+    .resizeHandle.sw{ left: 0; bottom: 0; cursor: nesw-resize; }
+    .resizeHandle.se{ right: 0; bottom: 0; cursor: nwse-resize; }
+
     .overlay{
       position:absolute; inset:0; pointer-events:none;
-      display:grid; grid-template-rows:auto auto 1fr; justify-items:center;
-      padding-top:6%;
     }
+    .titleDrag{
+      position:absolute;
+      left: 50%;
+      top: 6%;
+      transform: translate(-50%, 0) translate(var(--titleX), var(--titleY));
+      pointer-events: auto;
+      cursor: grab;
+      user-select:none;
+      -webkit-user-select:none;
+      touch-action:none;
+      z-index: 7;
+      width: min(92%, 980px);
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+    }
+    .titleDrag:active{ cursor: grabbing; }
     .title{
       text-align:center;
-      font-size:clamp(18px, 3.0vw, 34px);
+      font-size: calc(clamp(18px, 3.0vw, 34px) * var(--uiScale));
       line-height:1.15;
-      margin:0 10%;
+      margin:0;
+      padding: 0 10%;
     }
     .subtitle{
       margin-top:10px;
-      font-size:clamp(13px, 1.9vw, 19px);
+      font-size: calc(clamp(13px, 1.9vw, 19px) * var(--uiScale));
       font-family: "KaTeX_Main","Latin Modern Roman","CMU Serif",Georgia,"Times New Roman",Times,serif;
       opacity:0.90;
       text-align:center;
-      margin-left: 10%;
-      margin-right: 10%;
+      padding: 0 10%;
     }
     .side{ position:relative; }
     .stack{ display:flex; flex-direction:column; gap: 16px; }
@@ -130,7 +164,7 @@
 
     .metricsWrap{
       width: 100%;
-      height: clamp(220px, 32vh, 360px);
+      height: clamp(120px, 12vh, 360px);
       border-radius: 14px;
       background: rgba(255,255,255,0.62);
       border: 1px solid rgba(0,0,0,0.08);
@@ -259,6 +293,26 @@
       flex: 1 1 auto;
     }
     button:active{ transform: translateY(1px); }
+
+    /* Corner buttons (same convention as Gaussian_Field_Paint.html) */
+    button.cornerBtn{
+      position:absolute;
+      bottom: 12px;
+      z-index: 5;
+      pointer-events:auto;
+      flex: 0 0 auto;
+      appearance:none;
+      -webkit-appearance:none;
+      border: 1px solid rgba(0,0,0,0.18);
+      background: rgba(255,255,255,0.82);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 14px;
+      touch-action: manipulation;
+    }
+    button.cornerBtn:hover{ background: rgba(255,255,255,0.95); }
+    .cornerLeft{ left: 12px; }
+    .cornerRight{ right: 12px; }
   </style>
 </head>
 <body>
@@ -266,13 +320,13 @@
     <aside class="side metricsSide">
       <div class="stack">
         <div class="card">
-          <div class="cardTitle">Order + sync</div>
+          <div class="cardTitle">Order parameters (change \(d\) to separate)</div>
           <div class="metricsWrap" id="metricsWrap">
             <canvas id="metricsCanvas"></canvas>
           </div>
           <div class="metricsLegend">
-            <div class="legendItem"><span class="legendSwatch r"></span>Order parameter \(R(t)\)</div>
-            <div class="legendItem"><span class="legendSwatch w"></span>Control magnitude \(|w(t)|\)</div>
+            <div class="legendItem"><span class="legendSwatch r"></span>\(|Z(t)|/K\)</div>
+            <div class="legendItem"><span class="legendSwatch w"></span>\(|w(t)|\)</div>
           </div>
         </div>
       </div>
@@ -281,23 +335,99 @@
     <div class="left">
       <div class="wrap" id="wrap">
         <canvas id="c"></canvas>
+        <button id="btnReset" class="cornerBtn cornerLeft" type="button">Reset</button>
+        <button id="btnKick" class="cornerBtn cornerRight" type="button">Random kick</button>
+        <div class="resizeHandle nw" data-handle="nw" aria-hidden="true"></div>
+        <div class="resizeHandle ne" data-handle="ne" aria-hidden="true"></div>
+        <div class="resizeHandle sw" data-handle="sw" aria-hidden="true"></div>
+        <div class="resizeHandle se" data-handle="se" aria-hidden="true"></div>
 
         <div class="overlay">
-          <div class="title">
-            LMS Kuramoto on \(S^{d-1}\) reduced to \(B^2\): \((z,w,\zeta,Z)\) on the Poincaré disk
+          <div id="titleDrag" class="titleDrag" aria-label="Drag to reposition the title">
+            <div class="title">
+              LMS Kuramoto on \(S^{d-1}\) reduced to \(B^2\): \((z,w,\zeta,Z)\) on the Poincaré disk
+            </div>
+            <div class="subtitle">
+              Drag \( \zeta_\infty \) (black dot) on the boundary to set the “synchrony direction”. Drag \(r\) on the ray to set the initial magnitude.
+              The swarm points are \(y_i(t)=\zeta(t)\,M_{w(t)}(p_i)\) (Möbius action).
+              Body center \(w\) follows LMS \(\dot w=-\tfrac12(1-|w|^2)\zeta^{-1}Z(z)\) (plus noise); lab center is constrained by \(z=-\zeta w\).
+            </div>
           </div>
-          <div class="subtitle">
-            Drag \( \zeta_\infty \) (black dot) on the boundary to set the “synchrony direction”. Drag \(r\) on the ray to set the initial magnitude.
-            The swarm points are \(y_i(t)=\zeta(t)\,M_{w(t)}(p_i)\) (Möbius action).
-            Body center \(w\) follows LMS \(\dot w=-\tfrac12(1-|w|^2)\zeta^{-1}Z(z)\) (plus noise); lab center is constrained by \(z=-\zeta w\).
-          </div>
-          <div></div>
         </div>
       </div>
     </div>
 
     <aside class="side">
       <div class="stack">
+        <div class="card">
+          <div class="cardTitle">Parameters</div>
+          <div class="controlGrid">
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Oscillators \(N\)</div>
+                <div class="sliderVal" id="valN">—</div>
+              </div>
+              <input id="sliderN" type="range" min="8" max="200" step="1" value="60">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Start radius \(r_0\)</div>
+                <div class="sliderVal" id="valRho">—</div>
+              </div>
+              <input id="sliderRho" type="range" min="0.0001" max="0.95" step="0.01" value="0.02">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Dimension \(d\)</div>
+                <div class="sliderVal" id="valD">—</div>
+              </div>
+              <input id="sliderD" type="range" min="2" max="12" step="1" value="2">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Coupling \(K\)</div>
+                <div class="sliderVal" id="valK">—</div>
+              </div>
+              <input id="sliderK" type="range" min="0" max="6" step="0.05" value="1.0">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Rotation rate \(\omega\)</div>
+                <div class="sliderVal" id="valOmega">—</div>
+              </div>
+              <input id="sliderOmega" type="range" min="-6" max="6" step="0.05" value="1.0">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Time-warp exponent \(t\mapsto t^p\)</div>
+                <div class="sliderVal" id="valWarp">—</div>
+              </div>
+              <input id="sliderWarp" type="range" min="-2.0" max="2.0" step="0.05" value="1.0">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Time-warp multiplier \(t\mapsto \pm at\)</div>
+                <div class="sliderVal" id="valWarpMul">—</div>
+              </div>
+              <input id="sliderWarpMul" type="range" min="-1" max="1" step="0.01" value="1">
+            </div>
+
+            <div class="sliderRow">
+              <div class="sliderTop">
+                <div class="sliderLabel">Signal to noise ratio (SNR)</div>
+                <div class="sliderVal" id="valSNR">—</div>
+              </div>
+              <input id="sliderSNR" type="range" min="0." max="80" step="0.1" value="10">
+            </div>
+          </div>
+        </div>
+
         <div class="card">
           <div class="cardTitle">Statistics</div>
           <div class="statGrid" aria-live="polite">
@@ -335,8 +465,8 @@
           <p class="noteText">
             We simulate in the Poincaré disk with \(\zeta(t)\in SO(2)\) (angle \(\phi\)).
             Order parameter uses the thermodynamic-limit LMS formula \(Z(z)=K\,f_d(|z|)\,z\) where \(f_d\) is a Gauss hypergeometric ratio.
-            For \(d=2\), \(f_d\equiv 1\) (OA/WS “miracle”).
-          </p>
+            For \(d=2\), \(f_d\equiv 1\) (the \((d-1)\) constant turns into \(1\)).
+          </p>  
           <p class="noteText">
             \(\zeta\) evolves by “Thomas/Wigner precession”:
             \(\dot\phi=\omega-\mathrm{cross}(\zeta w,\,Z)\).
@@ -345,25 +475,15 @@
         </div>
 
         <div class="card">
-          <div class="cardTitle">Controls</div>
+          <div class="cardTitle">Switches</div>
           <div class="controlGrid">
-            <div class="toggleRow">
-              <div class="toggleLabel">
-                Run
-                <span class="toggleHint">Pause/resume the LMS reduced dynamics</span>
-              </div>
-              <label class="switch" aria-label="Toggle run">
-                <input id="toggleRun" type="checkbox" checked>
-              </label>
-            </div>
-
             <div class="toggleRow">
               <div class="toggleLabel">
                 Noise
                 <span class="toggleHint">Add SNR-controlled stochastic perturbations to \(\dot w\)</span>
               </div>
               <label class="switch" aria-label="Toggle noise">
-                <input id="toggleNoise" type="checkbox" checked>
+                <input id="toggleNoise" type="checkbox">
               </label>
             </div>
 
@@ -390,7 +510,7 @@
             <div class="toggleRow">
               <div class="toggleLabel">
                 Oscillator ticks
-                <span class="toggleHint">Dots outside the boundary with radial markers</span>
+                <span class="toggleHint">Toggle radial rays (dots are always shown)</span>
               </div>
               <label class="switch" aria-label="Toggle oscillator ticks">
                 <input id="toggleOscTicks" type="checkbox" checked>
@@ -415,67 +535,6 @@
               <label class="switch" aria-label="Toggle flow comb">
                 <input id="toggleFlow" type="checkbox" checked>
               </label>
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Oscillators \(N\)</div>
-                <div class="sliderVal" id="valN">—</div>
-              </div>
-              <input id="sliderN" type="range" min="8" max="200" step="1" value="60">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Start radius \(r_0\)</div>
-                <div class="sliderVal" id="valRho">—</div>
-              </div>
-              <input id="sliderRho" type="range" min="0.02" max="0.95" step="0.01" value="0.12">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Dimension \(d\)</div>
-                <div class="sliderVal" id="valD">—</div>
-              </div>
-              <input id="sliderD" type="range" min="2" max="12" step="1" value="2">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Coupling \(K\)</div>
-                <div class="sliderVal" id="valK">—</div>
-              </div>
-              <input id="sliderK" type="range" min="0" max="6" step="0.05" value="2.0">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Rotation rate \(\omega\)</div>
-                <div class="sliderVal" id="valOmega">—</div>
-              </div>
-              <input id="sliderOmega" type="range" min="-6" max="6" step="0.05" value="0.40">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">Time-warp exponent \(p\)</div>
-                <div class="sliderVal" id="valWarp">—</div>
-              </div>
-              <input id="sliderWarp" type="range" min="0" max="2.5" step="0.05" value="0.80">
-            </div>
-
-            <div class="sliderRow">
-              <div class="sliderTop">
-                <div class="sliderLabel">SNR</div>
-                <div class="sliderVal" id="valSNR">—</div>
-              </div>
-              <input id="sliderSNR" type="range" min="0.5" max="80" step="0.1" value="10">
-            </div>
-
-            <div class="btnRow">
-              <button id="btnReset">Reset</button>
-              <button id="btnKick">Random kick</button>
             </div>
           </div>
         </div>
@@ -677,16 +736,29 @@
   // Time warp: multiply wdot by (1-|w|)^{-p} to get faster boundary approach.
   function warpFactor(r, p){
     const u = Math.max(1e-3, 1 - r);
-    return Math.pow(u, -p);
+    // IMPORTANT: when p>0 and r→1, u^{-p} can blow up and make the system spin "infinitely fast"
+    // once we apply the same time warp to φ as well. Cap it for numerical/visual sanity.
+    const f = Math.pow(u, -p);
+    return Math.min(6.0, f);
   }
 
   // ---------- canvas ----------
   const wrap = document.getElementById("wrap");
   const canvas = document.getElementById("c");
   const ctx = canvas.getContext("2d");
+  const titleDrag = document.getElementById("titleDrag");
   const metricsWrap = document.getElementById("metricsWrap");
   const metricsCanvas = document.getElementById("metricsCanvas");
   const metricsCtx = metricsCanvas.getContext("2d");
+
+  // ---------- UI scaling + draggable title ----------
+  let uiBaseW = null;
+  let titleDragState = null; // {startX,startY,baseX,baseY,pid} | null
+
+  function setTitleOffset(xPx, yPx){
+    wrap.style.setProperty("--titleX", `${xPx.toFixed(1)}px`);
+    wrap.style.setProperty("--titleY", `${yPx.toFixed(1)}px`);
+  }
 
   function geom(){
     const w = wrap.getBoundingClientRect().width;
@@ -716,6 +788,11 @@
     canvas.width  = Math.round(rect.width  * dpr);
     canvas.height = Math.round(rect.height * dpr);
     ctx.setTransform(dpr,0,0,dpr,0,0);
+
+    // Preserve current typography at load, then scale proportionally with the canvas size.
+    if (uiBaseW === null) uiBaseW = Math.max(1, rect.width);
+    const ui = Math.max(0.72, Math.min(1.65, rect.width / uiBaseW));
+    wrap.style.setProperty("--uiScale", ui.toFixed(3));
   }
   function resizeMetrics(){
     const rect = metricsWrap.getBoundingClientRect();
@@ -728,6 +805,38 @@
   window.addEventListener("resize", resizeMetrics);
   resize();
   resizeMetrics();
+
+  // Ensure canvas tracks wrap size changes (corner resizing, responsive layout, etc.)
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => resize());
+    ro.observe(wrap);
+  }
+
+  // Title dragging (pointer events) - can move the label anywhere.
+  if (titleDrag) {
+    titleDrag.addEventListener("pointerdown", (ev) => {
+      const cs = getComputedStyle(wrap);
+      const baseX = parseFloat(cs.getPropertyValue("--titleX")) || 0;
+      const baseY = parseFloat(cs.getPropertyValue("--titleY")) || 0;
+      titleDragState = { startX: ev.clientX, startY: ev.clientY, baseX, baseY, pid: ev.pointerId };
+      try { titleDrag.setPointerCapture(ev.pointerId); } catch {}
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+    window.addEventListener("pointermove", (ev) => {
+      if (!titleDragState) return;
+      const dx = ev.clientX - titleDragState.startX;
+      const dy = ev.clientY - titleDragState.startY;
+      setTitleOffset(titleDragState.baseX + dx, titleDragState.baseY + dy);
+      ev.preventDefault();
+    });
+    window.addEventListener("pointerup", (ev) => {
+      if (!titleDragState) return;
+      try { titleDrag.releasePointerCapture(titleDragState.pid); } catch {}
+      titleDragState = null;
+    });
+    window.addEventListener("pointercancel", () => { titleDragState = null; });
+  }
 
   function drawDiskBoundary(){
     const {w,h,R,cx,cy} = geom();
@@ -779,7 +888,6 @@
   const statWarp = document.getElementById("statWarp");
   const statSNR = document.getElementById("statSNR");
 
-  const toggleRun = document.getElementById("toggleRun");
   const toggleNoise = document.getElementById("toggleNoise");
   const toggleRay = document.getElementById("toggleRay");
   const toggleCenters = document.getElementById("toggleCenters");
@@ -793,6 +901,7 @@
   const sliderK = document.getElementById("sliderK");
   const sliderOmega = document.getElementById("sliderOmega");
   const sliderWarp = document.getElementById("sliderWarp");
+  const sliderWarpMul = document.getElementById("sliderWarpMul");
   const sliderSNR = document.getElementById("sliderSNR");
 
   const valN = document.getElementById("valN");
@@ -801,6 +910,7 @@
   const valK = document.getElementById("valK");
   const valOmega = document.getElementById("valOmega");
   const valWarp = document.getElementById("valWarp");
+  const valWarpMul = document.getElementById("valWarpMul");
   const valSNR = document.getElementById("valSNR");
 
   const btnReset = document.getElementById("btnReset");
@@ -808,9 +918,8 @@
 
   function setText(el, text){ if (el) el.textContent = text; }
 
-  const viz = { run:true, noise:true, ray:true, centers:true, oscTicks:true, heat:true, flow:true };
+  const viz = { noise:false, ray:true, centers:true, oscTicks:true, heat:true, flow:true };
   function syncToggles(){
-    viz.run = !!toggleRun.checked;
     viz.noise = !!toggleNoise.checked;
     viz.ray = !!toggleRay.checked;
     viz.centers = !!toggleCenters.checked;
@@ -818,7 +927,7 @@
     viz.heat = !!toggleDensity.checked;
     viz.flow = !!toggleFlow.checked;
   }
-  [toggleRun,toggleNoise,toggleRay,toggleCenters,toggleOscTicks,toggleDensity,toggleFlow].forEach(el=>{
+  [toggleNoise,toggleRay,toggleCenters,toggleOscTicks,toggleDensity,toggleFlow].forEach(el=>{
     el.addEventListener("change", syncToggles);
   });
   syncToggles();
@@ -829,6 +938,7 @@
     K: parseFloat(sliderK.value),
     omega: parseFloat(sliderOmega.value),
     warpP: parseFloat(sliderWarp.value),
+    warpMul: parseFloat(sliderWarpMul.value),
     snr: parseFloat(sliderSNR.value),
   };
   function syncSliders(){
@@ -841,6 +951,7 @@
     ctrl.K = parseFloat(sliderK.value);
     ctrl.omega = parseFloat(sliderOmega.value);
     ctrl.warpP = parseFloat(sliderWarp.value);
+    ctrl.warpMul = parseFloat(sliderWarpMul.value);
     ctrl.snr = parseFloat(sliderSNR.value);
 
     setText(valN, `${ctrl.n}`);
@@ -848,9 +959,10 @@
     setText(valK, ctrl.K.toFixed(2));
     setText(valOmega, ctrl.omega.toFixed(2));
     setText(valWarp, ctrl.warpP.toFixed(2));
+    setText(valWarpMul, ctrl.warpMul.toFixed(2));
     setText(valSNR, ctrl.snr.toFixed(1));
   }
-  [sliderN,sliderD,sliderK,sliderOmega,sliderWarp,sliderSNR].forEach(el=>{
+  [sliderN,sliderD,sliderK,sliderOmega,sliderWarp,sliderWarpMul,sliderSNR].forEach(el=>{
     el.addEventListener("input", syncSliders);
   });
   syncSliders();
@@ -901,14 +1013,14 @@
     tickGap: 2.0,
     tickLength: 9.0,
     dotOffset: 12.0,
-    dotRadius: 3.1,
+    dotRadius: 4.65,
     heatSamples: 360,
     heatSigma: 0.36,
-    heatRes: 140,
+    heatRes: 260,
     heatAlpha: 0.9,
     heatSat: 0.70,
     heatLight: 0.52,
-    heatGamma: 0.75,
+    heatGamma: 0.90,
     heatFloor: 0.22,
     flowInset: 7.0,
     flowMin: 2.5,
@@ -933,24 +1045,24 @@
     gap: 16,
     grid: "rgba(0,0,0,0.08)",
     text: "rgba(0,0,0,0.62)",
-    rColor: "rgba(20,60,90,0.9)",
+    rColor: "rgba(20,60,90,0.9)",  // |Z|/K series color (kept for CSS legend compatibility)
     wColor: "rgba(10,120,80,0.85)"
   };
   const history = {
     len: 420,
     idx: 0,
     filled: false,
-    R: new Array(420).fill(0),
+    ZN: new Array(420).fill(0),
     W: new Array(420).fill(0)
   };
   function resetHistory(){
     history.idx = 0;
     history.filled = false;
-    history.R.fill(0);
+    history.ZN.fill(0);
     history.W.fill(0);
   }
-  function pushHistory(rVal, wVal){
-    history.R[history.idx] = rVal;
+  function pushHistory(znVal, wVal){
+    history.ZN[history.idx] = znVal;
     history.W[history.idx] = wVal;
     history.idx = (history.idx + 1) % history.len;
     if (history.idx === 0) history.filled = true;
@@ -963,32 +1075,19 @@
     const idx = (history.idx + i) % history.len;
     return arr[idx];
   }
-  function drawMetrics(currentR, currentW){
+  function drawMetrics(currentZN, currentW){
     const rect = metricsWrap.getBoundingClientRect();
     const w = rect.width;
     const h = rect.height;
     metricsCtx.clearRect(0,0,w,h);
 
     const pad = metricsStyle.pad;
-    const gap = metricsStyle.gap;
     const chartW = Math.max(1, w - pad * 2);
-    const chartH = Math.max(1, (h - pad * 2 - gap) / 2);
+    const chartH = Math.max(1, h - pad * 2);
     const count = historyCount();
 
-    function drawChart(y0, label, data, color, current){
+    function drawSeries(data, color){
       metricsCtx.save();
-      metricsCtx.strokeStyle = metricsStyle.grid;
-      metricsCtx.lineWidth = 1;
-      metricsCtx.beginPath();
-      metricsCtx.moveTo(pad, y0 + chartH);
-      metricsCtx.lineTo(pad + chartW, y0 + chartH);
-      metricsCtx.stroke();
-
-      metricsCtx.fillStyle = metricsStyle.text;
-      metricsCtx.font = "12px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-      metricsCtx.textBaseline = "top";
-      metricsCtx.fillText(label, pad, y0 + 2);
-
       if (count > 1){
         metricsCtx.strokeStyle = color;
         metricsCtx.lineWidth = 1.6;
@@ -996,25 +1095,43 @@
         for (let i=0; i<count; i++){
           const v = Math.max(0, Math.min(1, historyValue(data, i)));
           const x = pad + (chartW * i / (count - 1));
-          const y = y0 + chartH * (1 - v);
+          const y = pad + chartH * (1 - v);
           if (i === 0) metricsCtx.moveTo(x, y);
           else metricsCtx.lineTo(x, y);
         }
         metricsCtx.stroke();
       }
-
-      const cur = Math.max(0, Math.min(1, current));
-      const cx = pad + chartW;
-      const cy = y0 + chartH * (1 - cur);
-      metricsCtx.fillStyle = color;
-      metricsCtx.beginPath();
-      metricsCtx.arc(cx, cy, 3.2, 0, TAU);
-      metricsCtx.fill();
       metricsCtx.restore();
     }
 
-    drawChart(pad, "R(t)", history.R, metricsStyle.rColor, currentR);
-    drawChart(pad + chartH + gap, "|w(t)|", history.W, metricsStyle.wColor, currentW);
+    // baseline grid
+    metricsCtx.save();
+    metricsCtx.strokeStyle = metricsStyle.grid;
+    metricsCtx.lineWidth = 1;
+    metricsCtx.beginPath();
+    metricsCtx.moveTo(pad, pad + chartH);
+    metricsCtx.lineTo(pad + chartW, pad + chartH);
+    metricsCtx.stroke();
+    metricsCtx.restore();
+
+    // overlay both series on the same plot
+    drawSeries(history.ZN, metricsStyle.rColor);
+    drawSeries(history.W, metricsStyle.wColor);
+
+    // current markers (right edge)
+    const curZN = Math.max(0, Math.min(1, currentZN));
+    const curW = Math.max(0, Math.min(1, currentW));
+    const mx = pad + chartW;
+    metricsCtx.save();
+    metricsCtx.fillStyle = metricsStyle.rColor;
+    metricsCtx.beginPath();
+    metricsCtx.arc(mx, pad + chartH * (1 - curZN), 3.2, 0, TAU);
+    metricsCtx.fill();
+    metricsCtx.fillStyle = metricsStyle.wColor;
+    metricsCtx.beginPath();
+    metricsCtx.arc(mx, pad + chartH * (1 - curW), 3.2, 0, TAU);
+    metricsCtx.fill();
+    metricsCtx.restore();
   }
 
   function updateHeatRadial(d){
@@ -1044,18 +1161,20 @@
         const x = 2 * i / (res - 1) - 1;
         const r = Math.hypot(x, y);
         const idx = (j * res + i) * 4;
-        if (r > 1){
-          data[idx + 3] = 0;
-          continue;
-        }
+        // Extend the field beyond the unit disk; it will be occluded by the precise circle clip.
+        // This avoids blocky/transparent sampling artifacts near the boundary after scaling.
         const ang = Math.atan2(y, x);
         let sIdx = Math.floor(((ang + Math.PI) / TAU) * oscStyle.heatSamples);
         if (sIdx >= oscStyle.heatSamples) sIdx = 0;
         const densVal = dens[sIdx];
-        const rIdx = Math.min(heat.radial.length - 1, Math.floor(r * (heat.radial.length - 1)));
+        const rClamped = Math.min(1, r);
+        const rIdx = Math.min(heat.radial.length - 1, Math.floor(rClamped * (heat.radial.length - 1)));
         const radial = heat.radial[rIdx];
         const intensity = Math.pow(densVal, oscStyle.heatGamma) * (oscStyle.heatFloor + (1 - oscStyle.heatFloor) * radial);
         if (intensity <= 0.001){
+          data[idx] = 0;
+          data[idx + 1] = 0;
+          data[idx + 2] = 0;
           data[idx + 3] = 0;
           continue;
         }
@@ -1128,6 +1247,51 @@
   }, {passive:false});
   window.addEventListener("touchend", ()=> dragging=null);
 
+  // ---------- Corner resize handles ----------
+  let resizing = null; // {handle,startX,startY,startW,pid}
+  function startResize(ev, handle){
+    const rect = wrap.getBoundingClientRect();
+    resizing = { handle, startX: ev.clientX, startY: ev.clientY, startW: rect.width, pid: ev.pointerId };
+    try { wrap.setPointerCapture(ev.pointerId); } catch {}
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  function onResizeMove(ev){
+    if (!resizing) return;
+    const dx = ev.clientX - resizing.startX;
+    const dy = ev.clientY - resizing.startY;
+    let delta = 0;
+    if (resizing.handle === "se") delta = Math.max(dx, dy);
+    if (resizing.handle === "nw") delta = -Math.max(dx, dy);
+    if (resizing.handle === "ne") delta = Math.max(dx, -dy);
+    if (resizing.handle === "sw") delta = Math.max(-dx, dy);
+
+    const minSize = 320;
+    const maxSize = Math.min(window.innerWidth * 0.98, window.innerHeight * 0.98, 2400);
+    const next = Math.max(minSize, Math.min(maxSize, resizing.startW + delta));
+
+    wrap.style.width = `${next}px`;
+    wrap.style.height = `${next}px`;
+    resize();
+
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  function endResize(ev){
+    if (!resizing) return;
+    resizing = null;
+    try { wrap.releasePointerCapture(ev.pointerId); } catch {}
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+
+  wrap.querySelectorAll?.(".resizeHandle").forEach((el) => {
+    el.addEventListener("pointerdown", (ev) => startResize(ev, el.dataset.handle || "se"));
+  });
+  wrap.addEventListener("pointermove", onResizeMove);
+  wrap.addEventListener("pointerup", endResize);
+  wrap.addEventListener("pointercancel", endResize);
+
   // ---------- Buttons ----------
   btnReset.addEventListener("click", ()=>{
     w = initWFromControls();
@@ -1163,19 +1327,21 @@
     // wdot = -(1/2)(1-|w|^2) ζ^{-1} Z
     const oneMinus = Math.max(1e-9, 1 - norm2(w));
     const Zbody = rot(Z, -phi);
-    let wdot = scale(Zbody, -0.5*oneMinus);
+    const wdot0 = scale(Zbody, -0.5*oneMinus);
 
-    // time warp (pure visualization / finite-time-ish boundary approach)
-    wdot = scale(wdot, warpFactor(norm(w), ctrl.warpP));
+    // Apply the same time-warp to the full system (w and φ).
+    // When warpMul = 0, dynamics halt completely.
+    const timeScale = warpFactor(norm(w), ctrl.warpP) * ctrl.warpMul;
+    const dtEff = DT * timeScale;
 
     // noise in tangent approximation (Euclidean)
     if (viz.noise){
-      const driftMag = Math.max(1e-6, norm(wdot));
-      const sigma = driftMag / Math.max(0.5, ctrl.snr) + 0.0015;
-      const dW = scale(randn2(), sigma * Math.sqrt(DT));
-      w = add(w, add(scale(wdot, DT), dW));
+      const driftMag = Math.max(1e-6, norm(wdot0));
+      const sigma = driftMag / Math.max(0.5, ctrl.snr);
+      const dW = scale(randn2(), sigma * Math.sqrt(Math.abs(dtEff)));
+      w = add(w, add(scale(wdot0, dtEff), dW));
     } else {
-      w = add(w, scale(wdot, DT));
+      w = add(w, scale(wdot0, dtEff));
     }
     w = clampToDisk(w, 0.999995);
 
@@ -1183,7 +1349,7 @@
     // (ζ w = rot(w,phi))
     const zetaW = rot(w, phi);
     const precess = cross(zetaW, Z);
-    phi += (ctrl.omega - precess) * DT;
+    phi += (ctrl.omega - precess) * dtEff;
 
     // wrap phi for numerical hygiene
     if (phi > Math.PI) phi -= TAU;
@@ -1246,8 +1412,9 @@
         const prev = prevAngles[i];
         if (prev === null) continue;
         const delta = angleDelta(oscAngles[i], prev);
-        const speed = Math.min(1, Math.abs(delta) / oscStyle.flowScale);
-        if (speed < 0.05) continue;
+        const absDelta = Math.abs(delta);
+        if (absDelta < 1e-4) continue;
+        const speed = Math.min(1, absDelta / oscStyle.flowScale);
         const sign = delta >= 0 ? 1 : -1;
         const dir = oscDirs[i];
         const tan = scale(perp(dir), sign);
@@ -1255,7 +1422,7 @@
         const mid = {x: cx + dir.x * flowR, y: cy - dir.y * flowR};
         const dx = tan.x * len * 0.5;
         const dy = -tan.y * len * 0.5;
-        ctx.strokeStyle = `rgba(0,0,0,${0.15 + 0.55 * speed})`;
+        ctx.strokeStyle = `rgba(0,0,0,${0.08 + 0.62 * speed})`;
         ctx.beginPath();
         ctx.moveTo(mid.x - dx, mid.y - dy);
         ctx.lineTo(mid.x + dx, mid.y + dy);
@@ -1297,38 +1464,42 @@
 
     ctx.restore(); // end clip
 
+    const dotR = R + oscStyle.dotOffset;
+
+    // Oscillator radial rays (toggle hides rays only; dots remain)
     if (viz.oscTicks){
       ctx.save();
       ctx.lineWidth = 1.2;
       ctx.lineCap = "round";
-      ctx.strokeStyle = "rgba(0,0,0,0.40)";
-      ctx.fillStyle = "#000";
-      ctx.globalAlpha = 0.75;
-      const startR = R + oscStyle.tickGap;
-      const endR = R + oscStyle.tickGap + oscStyle.tickLength;
-      const dotR = R + oscStyle.dotOffset;
+      ctx.strokeStyle = "rgba(0,0,0,0.35)";
+      ctx.globalAlpha = 0.85;
       for (const u of oscDirs){
-        const p0 = {x: cx + u.x * startR, y: cy - u.y * startR};
-        const p1 = {x: cx + u.x * endR, y: cy - u.y * endR};
-        ctx.beginPath();
-        ctx.moveTo(p0.x,p0.y);
-        ctx.lineTo(p1.x,p1.y);
-        ctx.stroke();
-
         const dp = {x: cx + u.x * dotR, y: cy - u.y * dotR};
         ctx.beginPath();
-        ctx.arc(dp.x, dp.y, oscStyle.dotRadius, 0, TAU);
-        ctx.fill();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(dp.x, dp.y);
+        ctx.stroke();
       }
       ctx.restore();
     }
 
+    // Oscillator dots (always shown)
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.globalAlpha = 0.78;
+    for (const u of oscDirs){
+      const dp = {x: cx + u.x * dotR, y: cy - u.y * dotR};
+      ctx.beginPath();
+      ctx.arc(dp.x, dp.y, oscStyle.dotRadius, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+
     for (let i=0; i<oscAngles.length; i++) prevAngles[i] = oscAngles[i];
 
-    if (viz.run){
-      pushHistory(orderR, norm(w));
-    }
-    drawMetrics(orderR, norm(w));
+    const zn = norm(Z) / Math.max(1e-9, ctrl.K);
+    pushHistory(zn, norm(w));
+    drawMetrics(zn, norm(w));
 
     // boundary and rho handles
     if (viz.ray){
@@ -1368,14 +1539,7 @@
 
   // ---------- animation loop ----------
   function tick(){
-    if (viz.run) step();
-    else {
-      // draw frozen frame
-      const z = scale(rot(w, phi), -1);
-      const fd = fShrink(ctrl.d, norm(z));
-      const Z = scale(z, ctrl.K * fd);
-      draw(z, Z, fd);
-    }
+    step();
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
