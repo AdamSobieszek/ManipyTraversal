@@ -13,3 +13,5 @@
 *.pt
 *.0
 *.pyc
+*.png
+simulations/experiments/tensorboard/.DS_Store

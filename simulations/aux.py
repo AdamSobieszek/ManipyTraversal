@@ -495,9 +495,9 @@ class TrainingStatTracker(object):
         self.info_steps = []               # list[int]
         # histories (compute both metrics for both matrices)
         self.info_Q_lambda_hist = []       # list[float]  Q(Lambda)
-        self.info_Q_conf_hist = []         # list[float]  Q(Sigma)
+        self.info_Q_conf_hist = []         # list[float]  Q(mathbf p)
         self.info_deff_lambda_hist = []    # list[float]  d_eff(Lambda)
-        self.info_deff_conf_hist = []      # list[float]  d_eff(Sigma)
+        self.info_deff_conf_hist = []      # list[float]  d_eff(mathbf p^Tmathbf p)
 
     # ---------- window (micro-steps) ----------
     def _reset_window(self):
@@ -590,6 +590,7 @@ class TrainingStatTracker(object):
 
         Lambda is expected to be symmetric and nonnegative (squared dot products).
         Confusion prob is expected row-stochastic (rows sum to ~1 when counts exist).
+        For invariant comparisons, we use the symmetric Gram matrix G = Σ^T Σ.
         """
         if self.K is None:
             return
@@ -617,16 +618,18 @@ class TrainingStatTracker(object):
             tr2 = float(np.trace(A @ A))
             return float((tr * tr) / max(float(eps), tr2))
 
+        # Use a symmetric Gram matrix for confusion: G = S^T S (PSD).
+        G = S.T @ S
         Q_L = _Q(L)
-        Q_S = _Q(S)
+        Q_G = _Q(G)
         dL = _deff(L)
-        dS = _deff(S)
+        dG = _deff(G)
 
         self.info_steps.append(int(step_idx))
         self.info_Q_lambda_hist.append(Q_L)
-        self.info_Q_conf_hist.append(Q_S)
+        self.info_Q_conf_hist.append(Q_G)
         self.info_deff_lambda_hist.append(dL)
-        self.info_deff_conf_hist.append(dS)
+        self.info_deff_conf_hist.append(dG)
 
         if len(self.info_steps) > int(max_history):
             self.info_steps = self.info_steps[-int(max_history):]
@@ -688,7 +691,14 @@ class TrainingStatTracker(object):
         self.per_k_select_counts[true_k] += int(batch_size)
 
         # confusion row update (count predicted classes)
-        binc = np.bincount(preds, minlength=self.K).astype(np.int64)
+        preds = np.asarray(preds).reshape(-1)
+        if preds.dtype.kind not in "iu":
+            preds = preds.astype(np.int64, copy=False)
+        K = int(self.K)
+        valid = (preds >= 0) & (preds < K)
+        if not np.all(valid):
+            preds = preds[valid]
+        binc = np.bincount(preds, minlength=K).astype(np.int64)
         self.confusion[true_k, :] += binc
 
         # grad norm EMA (only for the MLP that received grads)
@@ -1007,6 +1017,7 @@ except Exception:  # pragma: no cover
 
 class ImageViz:
     """All image-creation helpers (moved out of Trainer)."""
+    _manifold_state = {}
 
     @staticmethod
     def to_uint01(x: torch.Tensor) -> torch.Tensor:
@@ -1296,7 +1307,13 @@ class ImageViz:
             raise ValueError(f"w2_kxk must match avg_dist_kxk, got {w2.shape} vs {avg.shape}")
         K = int(avg.shape[0])
 
-        fig, axs = plt.subplots(2, 2, figsize=(11, 8))
+        # Keep the heatmap row taller (square panels) and make the time-series row flatter.
+        fig, axs = plt.subplots(
+            2,
+            2,
+            figsize=(12, 11),
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
         ax00, ax01 = axs[0, 0], axs[0, 1]
         ax10, ax11 = axs[1, 0], axs[1, 1]
 
@@ -1305,12 +1322,14 @@ class ImageViz:
         ax00.set_xlabel("class j"); ax00.set_ylabel("class i")
         ax00.set_xticks(np.arange(K)); ax00.set_yticks(np.arange(K))
         fig.colorbar(im0, ax=ax00, fraction=0.046, pad=0.04)
+        ax00.set_box_aspect(1)
 
         im1 = ax01.imshow(w2, interpolation="nearest", aspect="auto", origin="lower")
         ax01.set_title("OT distance (W2)")
         ax01.set_xlabel("class j"); ax01.set_ylabel("class i")
         ax01.set_xticks(np.arange(K)); ax01.set_yticks(np.arange(K))
         fig.colorbar(im1, ax=ax01, fraction=0.046, pad=0.04)
+        ax01.set_box_aspect(1)
 
         xs = np.array(steps, dtype=np.int64).reshape(-1)
         y_w1 = np.array(w1_mean_hist, dtype=np.float32).reshape(-1)
@@ -1324,6 +1343,79 @@ class ImageViz:
         ax11.plot(xs, y_w2, linewidth=1.8)
         ax11.set_title("Mean Wasserstein-2 (off-diagonal) vs step")
         ax11.set_xlabel("opt step"); ax11.set_ylabel("mean W2")
+        ax11.grid(True, linewidth=0.3, alpha=0.4)
+
+        fig.suptitle(title)
+        fig.tight_layout()
+        return fig
+
+    # ----------------------------
+    # Bayesian/free-energy style panel (KL + KL/W2)
+    # ----------------------------
+    @staticmethod
+    def plot_pairwise_kl_free_energy_panel(
+        *,
+        kl_kxk: np.ndarray,
+        w2_kxk: np.ndarray,
+        steps: list[int] | np.ndarray,
+        kl_mean_hist: list[float] | np.ndarray,
+        ratio_mean_hist: list[float] | np.ndarray,
+        eps: float = 1e-8,
+        title: str = "Pairwise KL (entropic) + KL/W2 ratio with mean histories",
+    ):
+        """
+        2x2 panel:
+        - (0,0) heatmap: KL_eps between entropically smoothed point clouds
+        - (0,1) heatmap: KL_eps / W2_eps ratio
+        - (1,0) line: mean KL_eps over time
+        - (1,1) line: mean KL_eps / W2_eps over time
+        """
+        kl = np.array(kl_kxk, dtype=np.float32)
+        w2 = np.array(w2_kxk, dtype=np.float32)
+        if kl.ndim != 2 or kl.shape[0] != kl.shape[1]:
+            raise ValueError(f"kl_kxk must be square [K,K], got {kl.shape}")
+        if w2.shape != kl.shape:
+            raise ValueError(f"w2_kxk must match kl_kxk, got {w2.shape} vs {kl.shape}")
+        K = int(kl.shape[0])
+
+        denom = np.maximum(w2, float(eps))
+        ratio = kl / denom
+
+        fig, axs = plt.subplots(
+            2,
+            2,
+            figsize=(12, 8),
+            gridspec_kw={"height_ratios": [3, 4]},
+        )
+        ax00, ax01 = axs[0, 0], axs[0, 1]
+        ax10, ax11 = axs[1, 0], axs[1, 1]
+
+        im0 = ax00.imshow(kl, interpolation="nearest", aspect="auto", origin="lower")
+        ax00.set_title("KL_eps (entropic)")
+        ax00.set_xlabel("class j"); ax00.set_ylabel("class i")
+        ax00.set_xticks(np.arange(K)); ax00.set_yticks(np.arange(K))
+        fig.colorbar(im0, ax=ax00, fraction=0.046, pad=0.04)
+        ax00.set_box_aspect(1)
+
+        im1 = ax01.imshow(ratio, interpolation="nearest", aspect="auto", origin="lower")
+        ax01.set_title("KL_eps / W2_eps")
+        ax01.set_xlabel("class j"); ax01.set_ylabel("class i")
+        ax01.set_xticks(np.arange(K)); ax01.set_yticks(np.arange(K))
+        fig.colorbar(im1, ax=ax01, fraction=0.046, pad=0.04)
+        ax01.set_box_aspect(1)
+
+        xs = np.array(steps, dtype=np.int64).reshape(-1)
+        y_kl = np.array(kl_mean_hist, dtype=np.float32).reshape(-1)
+        y_ratio = np.array(ratio_mean_hist, dtype=np.float32).reshape(-1)
+
+        ax10.plot(xs, y_kl, linewidth=1.8)
+        ax10.set_title("Mean KL_eps (off-diagonal) vs step")
+        ax10.set_xlabel("opt step"); ax10.set_ylabel("mean KL")
+        ax10.grid(True, linewidth=0.3, alpha=0.4)
+
+        ax11.plot(xs, y_ratio, linewidth=1.8)
+        ax11.set_title("Mean KL_eps / W2_eps (off-diagonal) vs step")
+        ax11.set_xlabel("opt step"); ax11.set_ylabel("mean ratio")
         ax11.grid(True, linewidth=0.3, alpha=0.4)
 
         fig.suptitle(title)
@@ -1350,7 +1442,7 @@ class ImageViz:
         - (0,0) heatmap: Λ_ij = (v_i · v_j)^2
         - (0,1) heatmap: row-normalized confusion p(pred|true)
         - (1,0) line: Q(Λ) = det(Λ)^2 / det(Λ ⊙ Λ)
-        - (1,1) line: d_eff(Σ) = (tr Σ)^2 / tr(Σ^2)
+        - (1,1) line: d_eff(Λ) and d_eff(G) with G = Σ^T Σ
         """
         L = np.array(lambda_kxk, dtype=np.float32)
         C = np.array(conf_prob_kxk, dtype=np.float32)
@@ -1360,25 +1452,39 @@ class ImageViz:
             raise ValueError(f"conf_prob_kxk must match lambda_kxk, got {C.shape} vs {L.shape}")
         K = int(L.shape[0])
 
-        fig, axs = plt.subplots(2, 2, figsize=(14, 8))
-        ax00, ax01 = axs[0, 0], axs[0, 1]
-        ax10, ax11 = axs[1, 0], axs[1, 1]
+        # Set up gridspec with 2x2, upper row (row 0) subplots square, lower row (row 1) shorter
+        from matplotlib import gridspec
+
+        fig = plt.figure(figsize=(12, 8))
+        # GridSpec: make top row height much bigger than bottom
+        gs = gridspec.GridSpec(2, 2, height_ratios=[1.0, 0.38], figure=fig)
+        ax00 = fig.add_subplot(gs[0, 0])
+        ax01 = fig.add_subplot(gs[0, 1])
+        ax10 = fig.add_subplot(gs[1, 0])
+        ax11 = fig.add_subplot(gs[1, 1])
+
+        # Ensure the upper row subplots are square
+        ax00.set_box_aspect(1)
+        ax01.set_box_aspect(1)
+        # Lower row can be non-square ("shorter")
 
         # ticks: avoid unreadable plots when K is large
         stride = 1 if K <= 32 else max(1, K // 16)
         ticks = np.arange(0, K, stride, dtype=np.int64)
 
-        im0 = ax00.imshow(L, interpolation="nearest", aspect="auto", origin="lower")
+        im0 = ax00.imshow(L, interpolation="nearest", aspect="auto", origin="upper")
         ax00.set_title(r"$\Lambda_{ij} = (v_i \cdot v_j)^2$")
         ax00.set_xlabel("j (label)"); ax00.set_ylabel("i (label)")
         ax00.set_xticks(ticks); ax00.set_yticks(ticks)
         fig.colorbar(im0, ax=ax00, fraction=0.046, pad=0.04)
+        ax00.set_box_aspect(1)
 
-        im1 = ax01.imshow(C, interpolation="nearest", aspect="auto", origin="lower", vmin=0.0, vmax=1.0)
+        im1 = ax01.imshow(C, interpolation="nearest", aspect="auto", origin="upper", vmin=0.0, vmax=1.0)
         ax01.set_title(r"$p(\mathrm{pred}\mid \mathrm{true})$ (row-normalized)")
         ax01.set_xlabel("pred"); ax01.set_ylabel("true")
         ax01.set_xticks(ticks); ax01.set_yticks(ticks)
         fig.colorbar(im1, ax=ax01, fraction=0.046, pad=0.04)
+        ax01.set_box_aspect(1)
 
         xs = np.array(steps, dtype=np.int64).reshape(-1)
         yQ_L = np.array(Q_lambda_hist, dtype=np.float64).reshape(-1)
@@ -1387,7 +1493,7 @@ class ImageViz:
         yD_S = np.array(deff_conf_hist, dtype=np.float64).reshape(-1)
 
         ax10.plot(xs, yQ_L, linewidth=1.8, label="Q(Λ)")
-        ax10.plot(xs, yQ_S, linewidth=1.8, label="Q(Σ)")
+        ax10.plot(xs, yQ_S, linewidth=1.8, label="Q(ΣᵀΣ)")
         ax10.set_title(r"$\mathcal{Q}(\Lambda)=\det(\Lambda)^2/\det(\Lambda\odot\Lambda)$")
         ax10.set_xlabel("opt step"); ax10.set_ylabel("Q(Λ)")
         ax10.grid(True, linewidth=0.3, alpha=0.4)
@@ -1398,9 +1504,9 @@ class ImageViz:
         yD_Ln = yD_L / max(1.0, D_dim)
         yD_Sn = yD_S / max(1.0, D_dim)
         ax11.plot(xs, yD_Ln, linewidth=1.8, label=r"$\frac{1}{D}d_{\mathrm{eff}}(\Lambda)$")
-        ax11.plot(xs, yD_Sn, linewidth=1.8, label=r"$\frac{1}{D}d_{\mathrm{eff}}(\Sigma)$")
-        ax11.set_title(r"Effective dimension/dimension: $\frac{1}{D}d_{\mathrm{eff}}(\Sigma)=\frac{1}{D}(\mathrm{tr}\,\Sigma)^2/\mathrm{tr}(\Sigma^2)$")
-        ax11.set_xlabel("opt step"); ax11.set_ylabel(r"$\frac{1}{D}d_{\mathrm{eff}}(\Sigma)$")
+        ax11.plot(xs, yD_Sn, linewidth=1.8, label=r"$\frac{1}{D}d_{\mathrm{eff}}(\mathbf{p}^T\mathbf{p})$")
+        ax11.set_title(r"Effective dimension/dimension: $\frac{1}{D}d_{\mathrm{eff}}(A)=(\mathrm{tr}\,A)^2/\mathrm{tr}(A^2)$")
+        ax11.set_xlabel("opt step"); ax11.set_ylabel(r"$\frac{1}{D}d_{\mathrm{eff}}(\mathbf{p}^T\mathbf{p})$")
         ax11.grid(True, linewidth=0.3, alpha=0.4)
         ax11.set_ylim(0.0, 1.0)
         ax11.legend(loc="best", fontsize=9, frameon=False)
@@ -1445,8 +1551,17 @@ class ImageViz:
         preds = logits.argmax(dim=-1)          # [B*K]
         targets = torch.arange(K, device=preds.device).repeat(B)  # [B*K]
 
-        idx = targets * K + preds
-        counts = torch.bincount(idx, minlength=K * K).reshape(K, K).to(dtype=torch.float32)
+        # Guard against logits with extra classes: drop out-of-range preds.
+        valid = (preds >= 0) & (preds < K)
+        if not torch.all(valid):
+            preds = preds[valid]
+            targets = targets[valid]
+
+        if preds.numel() == 0:
+            counts = torch.zeros((K, K), device=logits.device, dtype=torch.float32)
+        else:
+            idx = targets * K + preds
+            counts = torch.bincount(idx, minlength=K * K).reshape(K, K).to(dtype=torch.float32)
         row_sums = counts.sum(dim=1, keepdim=True).clamp_min_(1.0)
         conf = (counts / row_sums).detach().cpu().numpy()  # [K,K]
         return lam, conf
@@ -1460,10 +1575,16 @@ class ImageViz:
         *,
         max_points_per_class: int = 64,
         random_state: int = 0,
+        state_key: str = "default",
+        tsne_n_iter: int = 1000,
+        tsne_n_iter_warm: int = 500,
+        align_prev: bool = True,
         title: str = "Final points: nonlinear 2D embeddings (colored by class k)",
     ):
         """
         Make a 1x3 panel of nonlinear/manifold embeddings of the FINAL points, colored by class k.
+        Uses a cached state per `state_key` to keep projections comparable across calls.
+        Subsampling uses fixed indices per run; Isomap/Spectral fall back to PCA if the kNN graph is disconnected.
 
         Important: we do NOT subtract the initial position; we embed the raw final points.
 
@@ -1484,14 +1605,30 @@ class ImageViz:
             raise ValueError(f"Expected z_bkd [B,K,D], got {tuple(z_bkd.shape)}")
         B, K, D = map(int, z_bkd.shape)
 
-        # subsample to max_points_per_class per class
+        # Stateful cache for stable, comparable projections across steps.
+        state = ImageViz._manifold_state.setdefault(str(state_key), {})
+        if state.get("B_raw") != B or state.get("K") != K or state.get("max_points") != int(max_points_per_class):
+            state.clear()
+            state["B_raw"] = B
+            state["K"] = K
+            state["max_points"] = int(max_points_per_class)
+
+        # subsample to max_points_per_class per class (fixed indices for stability)
         if B > int(max_points_per_class):
-            idx = torch.randperm(B, device=z_bkd.device)[: int(max_points_per_class)]
+            if state.get("subsample_idx") is None or state.get("subsample_B") != B:
+                rng = np.random.RandomState(int(random_state))
+                idx_np = rng.choice(B, size=int(max_points_per_class), replace=False)
+                idx_np = np.sort(idx_np)
+                state["subsample_idx"] = idx_np
+                state["subsample_B"] = B
+            idx = torch.as_tensor(state["subsample_idx"], device=z_bkd.device, dtype=torch.long)
             z_bkd = z_bkd.index_select(0, idx)
             B = int(z_bkd.shape[0])
 
         # Flatten to N x D and labels
-        X = z_bkd.detach().to(device="cpu", dtype=torch.float32).reshape(B * K, D).numpy()+np.random.randn(B * K,D)*1e-20
+        rng = np.random.RandomState(int(random_state))
+        X = z_bkd.detach().to(device="cpu").reshape(B * K, D).numpy().astype(np.float64)
+        X = X + rng.normal(loc=0.0, scale=1e-20, size=X.shape).astype(X.dtype, copy=False)
         labels = np.repeat(np.arange(K, dtype=np.int64), B)  # [K*B], blocks per k
 
         # local imports: keep core training lightweight unless plotting is enabled
@@ -1503,41 +1640,149 @@ class ImageViz:
         N = int(X.shape[0])
         n_neighbors = int(min(64, (N - 1)))
         perplexity = float(min(8.0, ((N - 1) / 3.0)))
+        state["N"] = N
+
+        def _is_valid_embedding(Y: np.ndarray) -> bool:
+            if Y is None:
+                return False
+            if not np.isfinite(Y).all():
+                return False
+            return float(np.nanmax(np.std(Y, axis=0))) > 1e-8
+
+        def _pca_fallback(X_in: np.ndarray) -> np.ndarray:
+            if X_in.shape[1] >= 2:
+                return X_in[:, :2].copy()
+            return np.pad(X_in, ((0, 0), (0, 2 - X_in.shape[1])))
+
+        def _align_embedding(Y: np.ndarray, Y_prev: np.ndarray) -> np.ndarray:
+            if (Y_prev is None) or (Y_prev.shape != Y.shape):
+                return Y
+            if not _is_valid_embedding(Y) or not _is_valid_embedding(Y_prev):
+                return Y
+            Yc = Y - Y.mean(axis=0, keepdims=True)
+            Pc = Y_prev - Y_prev.mean(axis=0, keepdims=True)
+            denom = float(np.sum(Yc * Yc))
+            if denom <= 1e-12:
+                return Y
+            M = Yc.T @ Pc
+            if not np.isfinite(M).all():
+                return Y
+            try:
+                U, _, Vt = np.linalg.svd(M, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return Y
+            R = U @ Vt
+            if np.linalg.det(R) < 0.0:
+                Vt[-1, :] *= -1.0
+                R = U @ Vt
+            scale = float(np.trace((Yc @ R).T @ Pc)) / max(1e-12, denom)
+            return (Yc @ R) * scale + Y_prev.mean(axis=0, keepdims=True)
+
+        # optional PCA pre-reduction for speed/stability
+        X_embed = X
+        if D > 64:
+            try:
+                from sklearn.decomposition import PCA
+                pca_dim = int(min(50, D, max(2, N - 1)))
+                X_embed = PCA(
+                    n_components=pca_dim,
+                    svd_solver="randomized",
+                    random_state=int(random_state),
+                ).fit_transform(X_embed)
+            except Exception:
+                X_embed = X
+
+        # pick a connected kNN graph size to avoid Isomap graph completion.
+        try:
+            from sklearn.neighbors import kneighbors_graph
+            from scipy.sparse.csgraph import connected_components
+
+            base_neighbors = int(min(N - 1, max(10, int(np.sqrt(N)))))
+            max_neighbors = int(min(N - 1, max(64, int(np.sqrt(N) * 3))))
+            k = max(2, base_neighbors)
+            n_components = None
+            graph_conn = None
+            while True:
+                graph_conn = kneighbors_graph(X_embed, n_neighbors=k, mode="connectivity", include_self=False)
+                n_components = int(connected_components(graph_conn, directed=False, return_labels=False))
+                if n_components <= 1 or k >= max_neighbors:
+                    break
+                k = min(max_neighbors, int(k * 1.5) + 1)
+            n_neighbors = k
+            can_graph = (n_components is not None) and (n_components <= 1)
+        except Exception:
+            graph_conn = None
+            n_components = None
+            can_graph = False
 
         # 3 embeddings
-        Y_tsne = TSNE(
+        prev_tsne = state.get("tsne") if align_prev else None
+        tsne_iters = max(250, int(tsne_n_iter))
+
+        tsne_model = TSNE(
             n_components=2,
             perplexity=perplexity,
             init="pca",
             learning_rate="auto",
+            max_iter=tsne_iters,
             random_state=int(random_state),
-        ).fit_transform(X)
+        )
+        Y_tsne = tsne_model.fit_transform(X_embed)
+        tsne_title = f"t-SNE (perplexity={perplexity:.1f})"
+        if not _is_valid_embedding(Y_tsne):
+            Y_tsne = _pca_fallback(X_embed)
+            tsne_title = f"t-SNE (fallback PCA, perplexity={perplexity:.1f})"
+        if align_prev and prev_tsne is not None:
+            Y_tsne = _align_embedding(Y_tsne, prev_tsne)
 
-        Y_isomap = Isomap(n_neighbors=n_neighbors//2, n_components=2).fit_transform(X)
+        isomap_title = f"Isomap (n_neighbors={n_neighbors})"
+        try:
+            if not can_graph:
+                raise RuntimeError("disconnected knn graph")
+            Y_isomap = Isomap(n_neighbors=n_neighbors, n_components=2).fit_transform(X_embed)
+            if not _is_valid_embedding(Y_isomap):
+                raise RuntimeError("isomap produced degenerate embedding")
+        except Exception:
+            # fallback: PCA projection to keep plot stable if Isomap is ill-posed
+            Y_isomap = _pca_fallback(X_embed)
+            isomap_title = f"Isomap (fallback PCA, n_neighbors={n_neighbors})"
 
-        Y_spec = SpectralEmbedding(
-            n_components=2,
-            n_neighbors=n_neighbors*2,
-            random_state=int(random_state),
-        ).fit_transform(X)
+        spec_title = f"SpectralEmbedding (n_neighbors={n_neighbors})"
+        try:
+            if not can_graph:
+                raise RuntimeError("disconnected knn graph")
+            if graph_conn is not None:
+                A = 0.5 * (graph_conn + graph_conn.T)
+                Y_spec = SpectralEmbedding(
+                    n_components=2,
+                    affinity="precomputed",
+                    random_state=int(random_state),
+                ).fit_transform(A)
+            else:
+                Y_spec = SpectralEmbedding(
+                    n_components=2,
+                    n_neighbors=n_neighbors,
+                    random_state=int(random_state),
+                ).fit_transform(X_embed)
+            if not _is_valid_embedding(Y_spec):
+                raise RuntimeError("spectral produced degenerate embedding")
+        except Exception:
+            Y_spec = _pca_fallback(X_embed)
+            spec_title = f"SpectralEmbedding (fallback PCA, n_neighbors={n_neighbors})"
+
+        if align_prev and state.get("isomap") is not None:
+            Y_isomap = _align_embedding(Y_isomap, state.get("isomap"))
+        if align_prev and state.get("spectral") is not None:
+            Y_spec = _align_embedding(Y_spec, state.get("spectral"))
+
+        state["tsne"] = Y_tsne.copy() if _is_valid_embedding(Y_tsne) else None
+        state["isomap"] = Y_isomap.copy() if _is_valid_embedding(Y_isomap) else None
+        state["spectral"] = Y_spec.copy() if _is_valid_embedding(Y_spec) else None
 
         fig, axs = plt.subplots(1, 3, figsize=(16, 5))
         cmap = plt.get_cmap("hsv", K)
 
         def _scatter(ax, Y, name: str):
-            Y_delta = Y - Y.mean(axis=0, keepdims=True)
-            Y_delta_abs = np.abs(Y_delta)
-            # Compute mode using scipy.stats.mode, fallback to median if not available
-            try:
-                from scipy.stats import mode as scipy_mode
-                Y_delta_abs_mode = scipy_mode(Y_delta_abs, axis=0, keepdims=True).mode
-                Y_delta_abs_mode = np.squeeze(Y_delta_abs_mode, axis=0)
-            except ImportError:
-                # Fallback: use median as a robust estimate if scipy not available
-                Y_delta_abs_mode = np.median(Y_delta_abs, axis=0)
-            Y_delta = Y_delta / Y_delta_abs_mode
-            Y_delta = np.tanh(Y_delta)
-
             for k in range(K):
                 m = (labels == k)
                 ax.scatter(Y[m, 0], Y[m, 1], s=8, alpha=0.75, color=cmap(k), label=str(k))
@@ -1545,9 +1790,9 @@ class ImageViz:
             ax.set_xticks([]); ax.set_yticks([])
             ax.grid(True, linewidth=0.25, alpha=0.25)
 
-        _scatter(axs[0], Y_tsne, f"t-SNE (perplexity={perplexity:.1f})")
-        _scatter(axs[1], Y_isomap, f"Isomap (n_neighbors={n_neighbors})")
-        _scatter(axs[2], Y_spec, f"SpectralEmbedding (n_neighbors={n_neighbors})")
+        _scatter(axs[0], Y_tsne, tsne_title)
+        _scatter(axs[1], Y_isomap, isomap_title)
+        _scatter(axs[2], Y_spec, spec_title)
 
         fig.suptitle(title)
         fig.tight_layout()
@@ -1592,7 +1837,7 @@ class ImageViz:
             support_sets.F.update_batchnorm = False
         try:
             for i in range(T):
-                # WavePDE implements _per_step(z_bkd, dt=..., direction=...)
+                # ModelPDE implements _per_step(z_bkd, dt=..., direction=...)
                 st, x_next, L_step, dt_used = support_sets._per_step(z_curr, dt=dt, direction=direction)  # noqa: SLF001
                 z_curr = x_next
                 out.append(z_curr)
@@ -1613,6 +1858,7 @@ class ImageViz:
         Args:
             traj_tkd: [T+1, K, D] or [B, T+1, K, D]
         """
+        
         if traj_tkd.dim() == 3:
             traj_btks = traj_tkd.unsqueeze(0)  # [1,T+1,K,D]
         elif traj_tkd.dim() == 4:
@@ -2217,6 +2463,7 @@ def tb_path_figs(
     """
     Log latent-path projection figures for a single starting point z_first.
     """
+    return
     traj_tkd = ImageViz.rollout_latent_paths(support_sets, z_first, dt_first)  # [T+1,K,D]
 
     fig1 = ImageViz.plot_spectral_projection_paths(traj_tkd)
@@ -2390,8 +2637,8 @@ def clip_accum_grads_(
     module,
     *,
     micro_idx: int,
-    acc_steps: int,
-    is_boundary: bool,
+    acc_steps: int =1,
+    is_boundary: bool =True,
     mode: str = "end",
     clip_end: float = 1.0,
     clip_step: float | None = None,      # defaults to clip_end/sqrt(acc_steps)

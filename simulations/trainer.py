@@ -492,10 +492,47 @@ class TrainerPotential(object):
                         max_points_per_class=getattr(self.params, "pairwise_max_points_per_class", None),
                         save_dir=frames_dir,
                     )
+                    embed_z_bkd = latent2_bk_det
+                    use_fixed_embed_batch = bool(getattr(self.params, "embedding_use_fixed_batch", True))
+                    if use_fixed_embed_batch:
+                        embed_B = int(min(B, int(getattr(self.params, "embedding_points_per_class", 64))))
+                        cache = getattr(self, "_embedding_cache", None)
+                        if cache is None or int(cache.get("B", -1)) != embed_B:
+                            z_embed = sample_z(embed_B, generator, self.params, self.device).detach()
+                            dt_embed = self.sample_dt(embed_B, half_range, total_opt_steps).detach()
+                            t_idx_embed = self.sample_t_idx(embed_B, target_step).detach()
+                            self._embedding_cache = {
+                                "B": int(embed_B),
+                                "z": z_embed,
+                                "dt": dt_embed,
+                                "t_idx": t_idx_embed,
+                            }
+                        else:
+                            z_embed = cache["z"]
+                            dt_embed = cache["dt"]
+                            t_idx_embed = cache["t_idx"]
+
+                        # Use eval mode to avoid stochastic noise in the visualization batch.
+                        with torch.enable_grad():
+                            was_training = bool(getattr(support_sets, "training", False))
+                            support_sets.eval()
+                            had_bn_flag = hasattr(getattr(support_sets, "F", None), "update_batchnorm")
+                            if had_bn_flag:
+                                prev_bn = bool(support_sets.F.update_batchnorm)
+                                support_sets.F.update_batchnorm = False
+                            try:
+                                _, _, embed_z_bkd, _, _ = support_sets(
+                                    z_embed, t_idx_embed, dt=dt_embed, direction=dt_embed
+                                )
+                            finally:
+                                if had_bn_flag:
+                                    support_sets.F.update_batchnorm = prev_bn
+                                support_sets.train(was_training)
+                        embed_z_bkd = embed_z_bkd.detach()
                     tb_final_point_embedding_figs(
                         self.tb_writer,
                         step_idx,
-                        z_bkd=latent2_bk_det,
+                        z_bkd=embed_z_bkd,
                         max_points_per_class=int(getattr(self.params, "embedding_points_per_class", 64)),
                         random_state=int(getattr(self.params, "embedding_random_state", 0)),
                         save_dir=frames_dir,

@@ -167,9 +167,9 @@ class SkipSliceEnergy(nn.Module):
         return (torch.zeros_like(x)*x).sum(dim=-1, keepdim=True)
 
 
-class WavePDE(nn.Module):
+class ModelPDE(nn.Module):
     """
-    K-parallel WavePDE powered by PDEState and modular PDE losses.
+    K-parallel ModelPDE powered by PDEState and modular PDE losses.
     """
     def __init__(
         self,

@@ -6,7 +6,7 @@ import sys
 import torch
 from aux import create_exp_dir
 from trainer import TrainerPotential
-from ModelPDE import WavePDE
+from ModelPDE import ModelPDE
 from reconstructor import Reconstructor
 from torch import nn
 
@@ -155,7 +155,7 @@ def main():
     print("  \\__Number of Timesteps : {}".format(args.num_support_timesteps))
     print("  \\__Support Vectors dim       : {}".format(G.dim_z))
 
-    S = WavePDE(
+    S = ModelPDE(
             num_support_sets=args.num_support_sets,
             num_support_timesteps=args.num_support_timesteps,
             support_vectors_dim=G.dim_z,
