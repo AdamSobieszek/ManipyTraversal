@@ -19,9 +19,9 @@ Please run [mnist_scratch.sh](https://github.com/AdamSobieszek/ManipyTraversal/b
 If you think the code is helpful to your research, please consider citing our paper:
 
 ```bibtex
-@article{sobieszek2026unreasonable,
+@article{sobieszek2026traversals,
   title={The unreasonable effectiveness of $\nabla^+$ Traversals in Generative Model Disentanglement},
-  author={Sobieszek and Siemi\k{a}tkowski},
+  author={Sobieszek, Adam, and Siemi\k{a}tkowski, Maciej and Song, Yue},
   journal={In preparation},
   year={2026}
 }
