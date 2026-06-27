@@ -86,7 +86,7 @@ class BB(PDELoss):
     """Benamou–Brenier kinetic energy: ||v||^2."""
     name = "bb"
     def _loss(self, st: PDEState) -> torch.Tensor:
-        return st.v("now").pow(2).sum(dim=-1, keepdim=True)
+        return 1/(st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + 1e-12)
 
 class UnitSpeed(PDELoss):
     """(<∇f, v> - 1)^2, with ∇f detached to avoid batch-coupled grads."""
@@ -158,7 +158,7 @@ class FConvex(PDELoss):
     """
     name = "fconvex"
     def _loss(self, st: PDEState) -> torch.Tensor:
-        q = st.f_laplace(probes=int(self.ctx.get("probes", 4)))  # [B,K,1]
+        q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
         margin = float(self.ctx.get("margin", 1e-3))
         return (margin - q).clamp_min(0.0).pow(2)
 
@@ -171,7 +171,6 @@ class DeltaY(PDELoss):
         return (dy - st.dt()).pow(2) - dy
 
 # -------- Gaussian-output nudges (distributional + functional) --------
-
 class GaussianKSD(PDELoss):
     r"""
     Kernel Stein discrepancy to N(0,1) for y=f(x). Optionally whiten per-k
@@ -188,14 +187,17 @@ class GaussianKSD(PDELoss):
         eps = float(self.ctx.get("eps", 1e-8))
         mean_correction = bool(self.ctx.get("mean_correction", True))
         bandwidth = self.ctx.get("bandwidth", None)
+        truncation  = getattr(st, 'truncation', 1.0)
 
         y = st.f()  # [B,K,1]
         z = y
         if mean_correction:
             with torch.no_grad():
-                running_mean = self.ctx.get("running_mean", torch.zeros_like(y[:1]))
-                running_mean.lerp_(y.mean(dim=0, keepdim=True), 0.95)
-            z = (y - running_mean)
+                current_mean = y.mean(dim=0, keepdim=True)
+                # running_mean = self.ctx.get("running_mean", torch.zeros_like(y[:1]))
+                # running_mean.lerp_(y.mean(dim=0, keepdim=True), 0.95)
+                # self.ctx["running_mean"] = running_mean
+            z = (y - current_mean)/st.f_m.running_output_std
 
         B, K, C = z.shape
         if B < 2:  # not enough pairs; return zeros
@@ -344,6 +346,31 @@ class GradGroupSecondMomentOrtho(PDELoss):
         gram = torch.einsum("bkd,bld->bkl", g, g)                      # [B,K,K]
         gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
         return gram.pow(2).sum(dim=-1, keepdim=True)                   # [B,K,1]
+
+class SignedGradGroupSecondMomentOrtho(PDELoss):
+    r"""
+    Signed group orthogonality via positive second-moment Gram off-diagonals.
+    """
+    name = "signed_g2orth"
+    def _loss(self, st: PDEState) -> torch.Tensor:
+        field = str(self.ctx.get("field", "f"))
+        when  = str(self.ctx.get("when", "now"))
+        normalize = bool(self.ctx.get("normalize", True))
+        eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
+
+        if field == "psi":
+            g = st.psi_grad(when)
+        elif field == "v":
+            g = st.v(when)
+        else:
+            g = st.f_grad(when)
+
+        if normalize:
+            g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
+
+        gram = torch.einsum("bkd,bld->bkl", g, g)                      # [B,K,K]
+        gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
+        return gram.clamp_min(0.0).pow(2).sum(dim=-1, keepdim=True)     # [B,K,1]
 
 class Poisson(PDELoss):
     r"""
