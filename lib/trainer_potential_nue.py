@@ -20,9 +20,9 @@ from .aux import (
     _pack_BK, _per_k_grad_norms, module_grad_norm,
     # new aux funcs
     tb_start,
-    sample_dt_legacy_uniform, sample_dt_chi_temp,
     batch_acc_from_logits, entropy_from_logits, collect_wave_stats,
-    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images,
+    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images,clip_accum_grads_, update_dual_confusion_,
+    tb_path_figs, tb_information_matrix_figs, tb_pairwise_distance_figs,
 )
 
 DTYPE = torch.float32
@@ -86,6 +86,7 @@ class TrainerPotential(object):
 
         # rotating image logger
         self.img_logger: Optional[ImageLogger] = None
+        
 
     # ------------------------ small helpers ------------------------
     def _write_stats_json(self):
@@ -116,7 +117,7 @@ class TrainerPotential(object):
     def _maybe_init_image_logger(self, reconstructor):
         if not self.tensorboard:
             self.img_logger = None
-            return
+            return  
         enable_images = bool(getattr(self.params, "enable_images", True))
         if not enable_images:
             self.img_logger = None
@@ -134,34 +135,10 @@ class TrainerPotential(object):
         else:
             print("#. checkpoint found, skipping contrastive pretraining.")
 
-    # ------------------------ dt + t_idx sampling (toggleable) ------------------------
     @torch.no_grad()
     def sample_dt(self, B: int, half_range: int, total_opt_steps: int) -> torch.Tensor:
-        mode = str(getattr(self.params, "dt_mode", "legacy_uniform")).lower()
-
-        if mode in {"legacy", "legacy_uniform", "uniform"}:
-            return sample_dt_legacy_uniform(B, self.device, half_range)
-
-        # chi-temp mode (rewritten sampling)
-        temp_start = float(getattr(self.params, "dt_temp_start", 1.0))
-        temp_end = float(getattr(self.params, "dt_temp_end", 0.05))
-        schedule = str(getattr(self.params, "dt_temp_schedule", "cosine"))
-        anneal_fraction = float(getattr(self.params, "dt_temp_anneal_fraction", 1.0))
-        clip_max = float(getattr(self.params, "dt_clip_max", 5.0))
-
-        step = int(self.stat_tracker.global_opt_step)
-        return sample_dt_chi_temp(
-            B, self.device,
-            step=step,
-            total_opt_steps=int(total_opt_steps),
-            half_range=int(half_range),
-            temp_start=temp_start,
-            temp_end=temp_end,
-            schedule=schedule,
-            anneal_fraction=anneal_fraction,
-            clip_max=clip_max,
-            dtype=DTYPE,
-        )
+        from .aux import sample_dt as sample_dt_util
+        return sample_dt_util(self, B, half_range, total_opt_steps, dtype=DTYPE)
 
     @torch.no_grad()
     def sample_t_idx(self, B: int, target_step: int) -> torch.Tensor:
@@ -178,6 +155,10 @@ class TrainerPotential(object):
         One forward for all K in parallel.
         Optional: only materialize img*_bk if need_images=True (for TB logging).
         """
+        # self.params.lambda_pde = (self.params.lambda_pde)*0.9995+0.5 *0.0005
+        #  TODO REMOVE
+
+
         potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
         B, K, D = latent1_bk.shape
 
@@ -195,13 +176,20 @@ class TrainerPotential(object):
        
         img2 = generator(lat2_flat)
 
-        uv = lambda a,b: (2*a-b, b)
+        def uv(a,b,with_g=False, sign=1):
+            "Whitened coordinates (u,v*):=(z^*-v, z+v)"
+            with torch.no_grad() if not with_g else torch.enable_grad():
+                return (2*a-b, b) if sign>0 else (b, 2*a-b)
 
-        logits, magnitudes = reconstructor(*uv(img1, img2))   # [B*K, K]
-        logits0, magnitudes0 = reconstructor(*uv(img0, img1))
+        logits0, magnitudes0 = reconstructor(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
+        _logits0, _magnitudes0 = reconstructor(*uv(img0, img1, with_g=False, sign=-1))
+
+
+        logits, magnitudes = reconstructor(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
+        _logits, _magnitudes = reconstructor(*uv(img1, img2, with_g=True, sign=-1))
 
         mse_loss = torch.zeros(1, device=self.device)
-        cls_loss = self.cross_entropy(logits, targets) + self.cross_entropy(logits0, targets)
+        cls_loss = self.cross_entropy((logits-_logits)/2, targets) + self.cross_entropy((logits0-_logits0)/2, targets)
 
         loss = (
             self.params.lambda_cls * cls_loss
@@ -233,7 +221,9 @@ class TrainerPotential(object):
             "step2_norm": float(d2.item()),
             "mse_loss": float(mse_loss.detach()),
         }
-        return loss_dict, logits.detach(), targets, potential_preds.detach(), img1_bk, img2_bk
+        
+        latents_out = latent2_bk.detach()
+        return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
 
     # ------------------------ checkpoint utils ------------------------
     def get_starting_iteration(self, support_sets, reconstructor,
@@ -289,7 +279,7 @@ class TrainerPotential(object):
         support_sets_optim = build_adamw(
             [
                 {"params": support_sets.PSI.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
-                {"params": support_sets.F.parameters(), "weight_decay": 0.25, "lr": self.params.support_set_lr},
+                {"params": support_sets.F.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
                 {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
             ],
             lr=self.params.support_set_lr,
@@ -431,7 +421,7 @@ class TrainerPotential(object):
             dt = self.sample_dt(B, half_range, total_opt_steps)
             t_idx = self.sample_t_idx(B, target_step)
 
-            loss_dict, logits_det, targets, potential_preds_det, img1_bk, img2_bk = self.loss_allK(
+            loss_dict, logits_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(
                 support_sets, generator, reconstructor,
                 z, t_idx, dt,
                 acc_denominator=acc_steps,
@@ -465,23 +455,35 @@ class TrainerPotential(object):
                             grad_norm_selected_mlp=(per_k_gn[k] if per_k_gn is not None else None),
                         )
 
-            # ===== optimizer step @ boundary =====
-            if is_boundary:
-                if do_gradnorm:
-                    tb_grad_norms(self.tb_writer, step_idx, support_sets, reconstructor)
+            # ===== recognizer optimizer step @ each micro-step =====
 
-                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=1.0)
+            if do_gradnorm:
+                tb_grad_norms(self.tb_writer, step_idx, support_sets=support_sets, reconstructor=reconstructor)
+
+
+            clip_accum_grads_(support_sets, micro_idx=micro_idx,acc_steps=acc_steps,
+                is_boundary=is_boundary,
+                mode=str(getattr(self.params, "support_clip_mode", "delta_prophet")),
+                clip_end=float(getattr(self.params, "support_clip_end", 1.0)),
+                clip_step=getattr(self.params, "support_clip_step", None),          # used by "delta" (ignored by delta_prophet)
+                alpha=float(getattr(self.params, "support_clip_alpha", 3.0)),       # delta_prophet cap = alpha * ||delta_1||
+                clip_final=getattr(self.params, "support_clip_final", None),        # defaults to clip_end inside util
+            )
+            torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=2.0)
+
+            reconstructor_optim.step()
+            reconstructor_optim.zero_grad(set_to_none=True)
+            # ===== support sets optimizer step @ boundary =====
+            if is_boundary:
+                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=2.0)
 
                 support_sets_optim.step()
-                reconstructor_optim.step()
                 support_sets_optim.zero_grad(set_to_none=True)
-                reconstructor_optim.zero_grad(set_to_none=True)
 
                 sched_support.step()
                 sched_recon.step()
 
-                self.params.z_truncation = init_truncation * 0.95 + 0.05 * 1.0
+                # self.params.z_truncation = init_truncation * 0.95 + 0.05 * 1.0
                 self.stat_tracker.set_lrs(sched_support.get_last_lr()[0], sched_recon.get_last_lr()[0])
 
                 win_means = self.stat_tracker.close_window()
@@ -508,6 +510,45 @@ class TrainerPotential(object):
                         )
                     if do_figs and enable_analytics:
                         tb_figs(self.tb_writer, step_idx, self.stat_tracker, int(self.K), int(self.params.log_freq))
+                                # ===== optional figures (latent-path projections etc.) =====
+                    if do_figs:
+                        save_frames = bool(getattr(self.params, "save_plot_frames", True))
+                        frames_dir = osp.join(self.wip_dir, "plot_frames") if save_frames else None
+                        # tb_figs(self.tb_writer, step_idx, self.stat_tracker, K=int(self.K), log_freq=int(self.params.log_freq))
+                        tb_path_figs(
+                            self.tb_writer,
+                            step_idx,
+                            support_sets=support_sets,
+                            z_first=z[:16],
+                            dt_first=dt[:16] / dt[:16],
+                            save_dir=frames_dir,
+                        )
+                        # Information/Confusion panel: use the same batch we already sampled (up to 64 points).
+                        z_info = z[: min(int(z.shape[0]), 64)]
+                        dt_info = dt[: min(int(dt.shape[0]), 64)]
+                        # tb_information_matrix_figs(
+                        #     self.tb_writer,
+                        #     step_idx,
+                        #     stat_tracker=self.stat_tracker,
+                        #     support_sets=support_sets,
+                        #     reconstructor=reconstructor,
+                        #     z_bd=z_info,
+                        #     dt=dt_info,
+                        #     save_dir=frames_dir,
+                        # )
+                        # if latent2_bk_det is not None:
+                        #     tb_pairwise_distance_figs(
+                        #         self.tb_writer,
+                        #         step_idx,
+                        #         stat_tracker=self.stat_tracker,
+                        #         z_bkd=latent2_bk_det,
+                        #         solver=str(getattr(self.params, "pairwise_ot_solver", "sinkhorn")),
+                        #         reg=float(getattr(self.params, "pairwise_ot_reg", 5e-2)),
+                        #         ot_numItermax=int(getattr(self.params, "pairwise_ot_iters", 5_000)),
+                        #         max_points_per_class=getattr(self.params, "pairwise_max_points_per_class", None),
+                        #         save_dir=frames_dir,
+                        #     )
+
 
                 # timing + finalize
                 step_dt = time.time() - iter_t0
